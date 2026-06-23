@@ -17,6 +17,7 @@ from .llm import LLMClient
 from .memory import NarrativeMemory
 from .prompt import build_turn_prompt
 from .registry import ToolRegistry
+from .reporting import NullReporter, Reporter
 
 
 @dataclass
@@ -52,12 +53,12 @@ class RunResult:
 
 class RalphAgent:
     def __init__(self, client: LLMClient, registry: ToolRegistry,
-                 system_prompt: str, config: Config, on_step=None):
+                 system_prompt: str, config: Config, reporter: Reporter | None = None):
         self._client = client
         self._registry = registry
         self._system = system_prompt
         self._cfg = config
-        self._on_step = on_step          # optional callback(Step) for live logging
+        self._reporter = reporter or NullReporter()
 
     def run(self, task: str) -> RunResult:
         memory = NarrativeMemory()
@@ -65,8 +66,13 @@ class RalphAgent:
         schema = self._registry.action_schema()
 
         for i in range(1, self._cfg.max_steps + 1):
+            self._reporter.turn_start(i)
             user = build_turn_prompt(task, memory.render())
-            decision = self._client.decide(self._system, user, schema)
+            decision = self._client.decide(
+                self._system, user, schema,
+                on_reason=self._reporter.reasoning_token,
+                on_action=self._reporter.action_token,
+            )
             tool_name, args, parse_error = self._parse(decision.action_json)
 
             if parse_error:
@@ -113,5 +119,4 @@ class RalphAgent:
 
     def _emit(self, step: Step, result: RunResult) -> None:
         result.steps.append(step)
-        if self._on_step:
-            self._on_step(step)
+        self._reporter.step_result(step)

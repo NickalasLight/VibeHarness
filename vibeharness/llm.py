@@ -6,6 +6,8 @@ vLLM structural-tag idea to Ollama:
   phase 1 - free reasoning, stopped at </think>  (discarded by the caller)
   phase 2 - raw continuation prefilled past </think>, constrained by a JSON
             schema via Ollama's `format` field -> a guaranteed-valid action.
+
+Both phases stream token-by-token so callers can render generation live.
 """
 from __future__ import annotations
 
@@ -13,19 +15,25 @@ import json
 import urllib.request
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from typing import Callable
 
 from .config import Config
+
+# A sink for streamed tokens; receives each chunk of text as it is generated.
+TokenSink = Callable[[str], None]
 
 
 @dataclass(frozen=True)
 class Decision:
-    reasoning: str        # phase-1 text (kept only for logging/inspection)
+    reasoning: str        # phase-1 text (discarded by the agent, kept for logs)
     action_json: str      # phase-2 constrained JSON (the actual action)
 
 
 class LLMClient(ABC):
     @abstractmethod
-    def decide(self, system: str, user: str, action_schema: dict) -> Decision:
+    def decide(self, system: str, user: str, action_schema: dict,
+               on_reason: TokenSink | None = None,
+               on_action: TokenSink | None = None) -> Decision:
         ...
 
 
@@ -33,39 +41,62 @@ class OllamaClient(LLMClient):
     def __init__(self, config: Config):
         self._cfg = config
 
-    # ---- public ----
-    def decide(self, system: str, user: str, action_schema: dict) -> Decision:
-        reasoning = self._reason(system, user)
-        action = self._act(system, user, reasoning, action_schema)
+    def decide(self, system: str, user: str, action_schema: dict,
+               on_reason: TokenSink | None = None,
+               on_action: TokenSink | None = None) -> Decision:
+        reasoning = self._reason(system, user, on_reason)
+        action = self._act(system, user, reasoning, action_schema, on_action)
         return Decision(reasoning=reasoning, action_json=action)
 
     # ---- phase 1: free reasoning, stop at </think> ----
-    def _reason(self, system: str, user: str) -> str:
-        data = self._post("/api/chat", {
+    def _reason(self, system: str, user: str, on_token: TokenSink | None) -> str:
+        return self._stream("/api/chat", {
             "model": self._cfg.model,
-            "stream": False,
             "messages": [
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ],
             "options": {**self._options(), "num_predict": self._cfg.reason_tokens,
                         "stop": ["</think>"]},
-        })
-        return data["message"]["content"]
+        }, on_token)
 
     # ---- phase 2: constrained action via raw continuation ----
-    def _act(self, system: str, user: str, reasoning: str, action_schema: dict) -> str:
+    def _act(self, system: str, user: str, reasoning: str, action_schema: dict,
+             on_token: TokenSink | None) -> str:
         prompt = self._render_chatml(system, user) + self._continue_after_reasoning(reasoning)
-        data = self._post("/api/generate", {
+        text = self._stream("/api/generate", {
             "model": self._cfg.model,
-            "stream": False,
             "raw": True,
             "prompt": prompt,
             "format": action_schema,
             "options": {**self._options(), "num_predict": self._cfg.action_tokens,
                         "stop": ["<|im_end|>"]},
-        })
-        return data["response"].strip()
+        }, on_token)
+        return text.strip()
+
+    # ---- streaming transport ----
+    def _stream(self, path: str, payload: dict, on_token: TokenSink | None) -> str:
+        req = urllib.request.Request(
+            self._cfg.ollama_url + path,
+            data=json.dumps({**payload, "stream": True}).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        parts: list[str] = []
+        with urllib.request.urlopen(req, timeout=self._cfg.request_timeout) as resp:
+            for raw in resp:
+                line = raw.decode("utf-8").strip()
+                if not line:
+                    continue
+                obj = json.loads(line)
+                chunk = (obj.get("message", {}).get("content")
+                         if "message" in obj else obj.get("response", ""))
+                if chunk:
+                    parts.append(chunk)
+                    if on_token:
+                        on_token(chunk)
+                if obj.get("done"):
+                    break
+        return "".join(parts)
 
     # ---- helpers ----
     def _options(self) -> dict:
@@ -84,19 +115,10 @@ class OllamaClient(LLMClient):
 
     @staticmethod
     def _continue_after_reasoning(reasoning: str) -> str:
-        """Re-open the assistant turn at the point right after </think>, so the
-        constrained JSON is generated as the post-reasoning answer."""
+        """Re-open the assistant turn right after </think> so the constrained
+        JSON is generated as the post-reasoning answer."""
         if "<think>" in reasoning and "</think>" not in reasoning:
             return f"{reasoning}</think>\n"
         if not reasoning.strip():
-            return ""           # model produced no reasoning; just constrain directly
+            return ""
         return f"{reasoning}\n"
-
-    def _post(self, path: str, payload: dict) -> dict:
-        req = urllib.request.Request(
-            self._cfg.ollama_url + path,
-            data=json.dumps(payload).encode(),
-            headers={"Content-Type": "application/json"},
-        )
-        with urllib.request.urlopen(req, timeout=self._cfg.request_timeout) as resp:
-            return json.loads(resp.read())
