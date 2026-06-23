@@ -50,12 +50,22 @@ run.py           CLI
 ```
 
 ## Usage
-```bash
-# requires Ollama running with a `vibethinker` model (Q8_0 GGUF), GPU via OLLAMA_VULKAN=0
-python run.py "Create notes.txt containing 'hello hello hello', then read it back to verify."
-python run.py --print-system          # inspect the generated system prompt
-python run.py --temp 0.3 --max-steps 12 "List the workspace and tell me what's there."
+
+`vibe` runs the agent **in your current terminal directory** (like a basic coding
+agent) and streams each turn live. Requires Ollama running with a `vibethinker`
+model (Q8_0 GGUF); GPU is forced via `OLLAMA_VULKAN=0`.
+
+```powershell
+cd C:\some\project
+vibe "Create notes.txt containing 'hello hello hello', then read it back to verify."
+vibe --temp 1.0 --max-steps 12 "List this folder and summarize what's here."
+vibe --print-system "x"          # inspect the generated system prompt
 ```
+
+`bin\vibe.cmd` is added to the User PATH, so `vibe` works in **both PowerShell and
+CMD** (open a new terminal after install so the PATH is picked up). You can also
+run it directly: `python run.py "<task>"`.
+
 Transcripts are saved to `runs/` (timestamped, never overwritten).
 
 No third-party dependencies — standard library only.
