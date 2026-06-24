@@ -157,11 +157,27 @@ successfully handled and tells the model to pick a fillable/clickable ref from t
 in that list. Uses data the guard already tracks (`handled_refs`). Suite **551 passed**. Commit:
 `feat(#125): actionable anti-loop steer (lists handled refs)`.
 
-### Iteration 8 — IN PROGRESS
-Re-run with actionable steering. Watching for: when steered, does the model now pick UNHANDLED
-fillable refs and fill more unique fields? If it still spins / variance dominates, that confirms
-the model-planning ceiling and the next step is to document it honestly + consider a stuck-detector
-to stop unproductive spinning (rather than more micro-fixes with diminishing returns).
+### Iteration 8 — DONE (task bi1dp8y7f) — actionable steer recovered fills; combobox is the real harness gap
+Actionable steering helped: **7 unique fields filled** (First, Last, Email, Phone, Street, Apt,
+City) — back up from iter 7's 3. But still 66 failure-repeat steers and **no step-2 advance**:
+the model never operates the State combobox and never clicks Continue/Next. Conclusion after 8
+runs: the 3B model reliably fills ~5-8 simple text inputs but cannot operate the custom combobox
+or navigate the 8-step wizard (model-planning ceiling, with run-to-run variance). All PRIMARY
+goals (GPU generation on the RTX 3080, clean tool-call encoding, proper single-phase generation,
+real browser automation) are MET.
+
+**Fix applied (genuine harness gap, not model-bound — `web.py`):** `select_option` now drives a
+CUSTOM combobox. The native Playwright `select` fails on a `<div role="listbox">` ("Element is
+not a <select>"); on that specific failure the tool now CLICKS the trigger to open the list and
+clicks the option matching `value` (`find_option_ref_by_text`: exact→startswith→substring). If no
+auto-match, it leaves the list OPEN so the options appear in the next snapshot for the model to
+click — strictly better than the old hard failure. +3 matcher tests; web suite 64, full suite 552.
+Commit: `feat(#125): select_option drives custom comboboxes (open + click option)`.
+
+### Iteration 9 — IN PROGRESS
+Re-run with combobox support. Watching for: does select_option on the State field now open the
+list / select TX (or at least open it so the model can click the option)? Any progress past the
+State field. (Multi-step nav remains a model-ceiling limit, documented separately.)
 
 ## Current status
-RUNNING iteration 8 (3-min cap, max-steps 0). Awaiting completion notification.
+RUNNING iteration 9 (3-min cap, max-steps 0). Awaiting completion notification.

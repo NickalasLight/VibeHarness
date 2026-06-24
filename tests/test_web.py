@@ -837,5 +837,31 @@ class WebToolsetGuidanceRecoveryTest(unittest.TestCase):
         self.assertIn("not open", guidance)
 
 
+class FindOptionRefTest(unittest.TestCase):
+    """#125: match an OPEN custom-combobox option by its visible text (combobox fallback)."""
+
+    SNAP = (
+        '- combobox "State" [ref=e82]\n'
+        '- listbox [ref=e90]:\n'
+        '  - option "Alabama" [ref=e91]\n'
+        '  - option "Texas" [ref=e92]\n'
+        '  - option "TX" [ref=e93]\n'
+    )
+
+    def test_exact_match_wins_over_substring(self):
+        from vibeharness.web import find_option_ref_by_text
+        self.assertEqual(find_option_ref_by_text(self.SNAP, "TX"), "e93")
+
+    def test_case_insensitive_and_startswith(self):
+        from vibeharness.web import find_option_ref_by_text
+        self.assertEqual(find_option_ref_by_text(self.SNAP, "texas"), "e92")
+        self.assertEqual(find_option_ref_by_text(self.SNAP, "Tex"), "e92")
+
+    def test_no_match_returns_none(self):
+        from vibeharness.web import find_option_ref_by_text
+        self.assertIsNone(find_option_ref_by_text(self.SNAP, "Wyoming"))
+        self.assertIsNone(find_option_ref_by_text(self.SNAP, ""))
+
+
 if __name__ == "__main__":
     unittest.main()

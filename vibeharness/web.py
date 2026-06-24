@@ -114,6 +114,44 @@ def normalize_ref(target: str) -> str | None:
     return None
 
 
+# An ARIA line for a selectable option in an OPEN custom listbox/menu: a selectable
+# role + a quoted accessible name. Used by the select_option combobox fallback (#125).
+_OPTION_LINE_RE = re.compile(
+    r'\b(?:option|menuitem|menuitemradio|menuitemcheckbox|listitem|treeitem|radio)\b'
+    r'\s+"(?P<name>(?:[^"\\]|\\.)*)"',
+    re.IGNORECASE,
+)
+
+
+def find_option_ref_by_text(snapshot: str, value: str) -> str | None:
+    """Find the ref of an OPEN-listbox option whose visible text matches ``value``.
+
+    Matching is tolerant, in priority order: exact (case-insensitive) -> startswith ->
+    substring. Returns the bare ref (e.g. ``e90``) or ``None`` if nothing matches (the
+    caller then leaves the dropdown OPEN so the model can pick the option from the next
+    snapshot). Used by :class:`SelectOptionTool` to drive a custom `<div role="listbox">`
+    combobox that Playwright's native ``select`` cannot operate (#125)."""
+    value_l = (value or "").strip().lower()
+    if not value_l:
+        return None
+    exact = starts = contains = None
+    for line in (snapshot or "").splitlines():
+        m = _OPTION_LINE_RE.search(line)
+        if not m:
+            continue
+        mr = re.search(r"ref=(e\d+)", line)
+        if not mr:
+            continue
+        ref, name = mr.group(1), m.group("name").replace('\\"', '"').strip().lower()
+        if name == value_l:
+            exact = exact or ref
+        elif name.startswith(value_l):
+            starts = starts or ref
+        elif value_l in name:
+            contains = contains or ref
+    return exact or starts or contains
+
+
 def output_signals_no_match(output: str) -> bool:
     """True when playwright-cli's (exit-0) output text indicates the action hit no
     element — a ref/selector that resolved to nothing. The CLI reports these as an
@@ -662,7 +700,8 @@ class PressKeyTool(_WebTool):
 
 class SelectOptionTool(_WebTool):
     name = "select_option"
-    description = "Choose an option in a <select> dropdown. " + _REF_NOTE
+    description = ("Choose an option in a dropdown — a native <select> OR a custom "
+                   "listbox/combobox. " + _REF_NOTE)
     _verb = "selected an option in"
     _required = ("target", "value")
     _validate_target = True
@@ -677,6 +716,52 @@ class SelectOptionTool(_WebTool):
 
     def _build(self, args):
         return ["select", args["target"], args["value"]]
+
+    def run(self, args: dict) -> ToolResult:
+        # Try the native <select> path first (the base behaviour).
+        result = super().run(args)
+        if result.ok:
+            return result
+        # FALLBACK (#125): a CUSTOM combobox (<div role="listbox">) is not a native
+        # <select>, so Playwright's `select` fails ("Element is not a <select> element")
+        # and the discrete subtools alone never reach the (closed) options. Detect that
+        # specific failure and drive the combobox the human way: click the trigger to
+        # OPEN it, then click the option whose text matches `value`. If the option can't
+        # be auto-matched, we still leave the list OPEN so its options appear in the next
+        # snapshot for the model to click — strictly better than the old hard failure.
+        obs = (result.observation or "").lower()
+        if "not a <select>" in obs or "is not a select" in obs or "<select> element" in obs:
+            combo = self._select_via_combobox(args["target"], args["value"])
+            if combo is not None:
+                return combo
+        return result
+
+    def _select_via_combobox(self, target: str, value: str) -> ToolResult | None:
+        """Open a custom combobox by clicking ``target`` and click the matching option.
+
+        Returns a :class:`ToolResult`, or ``None`` to fall back to the original error
+        (e.g. the trigger click itself failed for a non-combobox reason)."""
+        ok, out = self._cli.run("click", target)
+        if not ok and output_signals_session_closed(out):
+            return ToolResult(False, f"you tried to open the '{target}' dropdown but the browser "
+                              f"session is closed; call `open_browser`, then `goto` your URL.")
+        if not ok or output_signals_no_match(out):
+            return None  # couldn't even open it -> let the native error stand
+        snapshot = capture_page_snapshot_raw(self._cli)
+        ref = find_option_ref_by_text(snapshot, value)
+        if ref is None:
+            # Opened but no auto-match: leave it open and tell the model to click the option.
+            return ToolResult(True, f"you opened the '{target}' dropdown (it is a custom combobox, "
+                              f"not a native <select>). Its options are now shown in the page "
+                              f"snapshot — click the one matching '{value}' by its ref.")
+        ok2, out2 = self._cli.run("click", ref)
+        if ok2 and output_signals_no_match(out2):
+            ok2 = False
+        if not ok2:
+            return ToolResult(False, f"you opened the '{target}' dropdown but clicking the '{value}' "
+                              f"option ({ref}) failed: {self._trim(out2)}")
+        return ToolResult(True, f"you selected '{value}' in the '{target}' combobox (opened it and "
+                          f"clicked option {ref}). Result:\n{self._trim(out2)}")
 
 
 class CheckTool(_WebTool):
