@@ -9,3 +9,4 @@ workspace/*
 *.egg-info/
 build/
 dist/
+bench_results/
