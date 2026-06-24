@@ -111,7 +111,8 @@ class RalphAgent:
     def __init__(self, client: LLMClient, registry: ToolRegistry, system_prompt: str,
                  config: Config, validator: Validator, reporter: Reporter | None = None,
                  system_prompt_provider: Callable[[], str] | None = None,
-                 codec: ToolCallCodec | None = None):
+                 codec: ToolCallCodec | None = None,
+                 validator_context_provider: Callable[[str], str] | None = None):
         self._client = client
         self._registry = registry
         self._system = system_prompt
@@ -122,6 +123,11 @@ class RalphAgent:
         # each turn to regenerate the system prompt (e.g. with a fresh workspace
         # tree); when None, the static system_prompt above is reused every turn.
         self._system_provider = system_prompt_provider
+        # Optional per-turn provider of the TOOL-LESS main system prompt fed to the
+        # validator (issue #57): the task + workspace + live page snapshot the main
+        # agent had, WITHOUT tool descriptions / format instructions. When None, the
+        # validator falls back to seeing only the action history (no page context).
+        self._validator_context_provider = validator_context_provider
         # Cached arity of the provider (does it accept the per-turn user message?).
         # Resolved lazily on first use so the inspection happens once per run.
         self._provider_wants_user: bool | None = None
@@ -186,7 +192,7 @@ class RalphAgent:
                                                   ok=False), memory)
                     for tool_name, args in actions:
                         if tool_name == "validate":
-                            self._validate(task, args, turn, memory, result)
+                            self._validate(args, turn, memory, result, user)
                             if result.finished:
                                 break
                             continue
@@ -235,6 +241,21 @@ class RalphAgent:
             self._provider_wants_user = _accepts_one_positional(provider)
         return provider(user) if self._provider_wants_user else provider()
 
+    def _validator_context(self, user: str) -> str:
+        """The tool-less main system prompt to hand the validator (issue #57).
+
+        Reuses the same per-turn rendering as the main prompt — task + workspace +
+        the already-#43-budgeted live page snapshot — but with the tool descriptions
+        and format instructions stripped. The ``user`` message is forwarded so the
+        snapshot is budgeted against the same full message. When no provider is wired
+        (e.g. unit tests / fs runs), returns "" so the validator simply sees the
+        action history with no page context.
+        """
+        provider = self._validator_context_provider
+        if provider is None:
+            return ""
+        return provider(user)
+
     # ---- per-turn generation, bounded by a wall-clock budget ----
     def _decide(self, system: str, user: str, constraint) -> Decision | None:
         """Run one turn's blocking decide() call.
@@ -276,12 +297,17 @@ class RalphAgent:
         return box["decision"]
 
     # ---- validation ----
-    def _validate(self, task: str, args: dict, turn: Turn, memory: NarrativeMemory,
-                  result: RunResult) -> None:
+    def _validate(self, args: dict, turn: Turn, memory: NarrativeMemory,
+                  result: RunResult, user: str = "") -> None:
+        # `validate` takes NO args (issue #57); the validator no longer reads a
+        # self-reported summary. It is fed the SAME context the main agent had — the
+        # tool-less main system prompt (task + workspace + live page snapshot) — plus
+        # the action history, and judges purely from that.
         self._reporter.note("validating — checking the task against a validator…")
         self._reporter.validator_start()
+        context = self._validator_context(user)
         verdict = self._validator.validate(
-            task, memory.render(), args.get("summary", ""),
+            context, memory.render(),
             on_reason=self._reporter.validator_reasoning_token,
             on_action=self._reporter.validator_verdict_token,
         )
