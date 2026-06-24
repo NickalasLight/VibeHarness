@@ -59,12 +59,38 @@ baseline), `max_steps=15`. Same harness, same codec, same tasks; only `--model` 
 > through the model's native trained format helps is the #36 question — see Section C.)
 
 <!-- BENCH_RESULTS -->
-_Results table inserted below once both runs complete (see `bench_results/`)._
+> **RUN STATUS — INCOMPLETE (benchmark crashed/interrupted).** The file-op sweep did not
+> finish in this session. The base run and a parallel sweep attempt both died early — the
+> run logs contain only the `=== codec: json ===` header and, for the base run, a single
+> completed task before the process was lost. **No full base-vs-mythos scorecard was
+> captured.** Recorded honestly rather than fabricated; re-running the sweep is the first
+> follow-up for #36 (see C.4).
 
-**Metrics captured per run:** pass rate (deterministic `check` per task), total turns
-(turn efficiency), total wall-clock seconds, and — from saved transcripts in
-`bench_results/*_transcripts/` — tool-call success and format adherence (did the model emit
-parseable actions in the codec's wire format).
+**What WAS captured (partial):**
+
+| model | task | result | turns | time |
+|---|---|---|---|---|
+| base `vibethinker` (json codec) | 1. create_file | **PASS** (`greeting.txt` exact text) | 1 | 43.29s |
+| base `vibethinker` | 2–10 | not reached (run lost) | — | — |
+| `mythos_fast` Q6_K | 1–10 | **not run** (process died before this model's sweep) | — | — |
+
+The only datapoint: base VibeThinker solves the simplest file-op task in a single turn
+(~43s) under the `json` codec — its normal baseline. **No comparative conclusion** about
+mythos_fast vs base on file-ops can be drawn from this session; deferred to the #36 re-run.
+
+**Re-run command (for #36 — run SEQUENTIALLY; the 8 GB card holds one model at a time and
+`OLLAMA_MAX_LOADED_MODELS=1` evicts the previous):**
+```
+python -m benchmarks.runner --codec json   --model vibethinker                         --json-out base.json   --transcript-dir base_tx
+python -m benchmarks.runner --codec hermes  --model hf.co/Shadow0482/mythos_fast:Q6_K   --json-out mythos.json --transcript-dir mythos_tx
+```
+The `hermes` codec referenced here was IMPLEMENTED on this branch (commit
+`mythos_fast #105: hermes codec + <tools> seam`) per the Section C spec — it now exists and
+is the default codec, so the re-run can A/B `json` vs `hermes` directly.
+
+**Metrics to capture:** pass rate (deterministic `check`), total turns (turn efficiency),
+wall-clock seconds, and from saved transcripts — tool-call success and format adherence (did
+the model emit parseable actions in the codec's wire format).
 
 ### A.3 Deferred: ashley WEB task
 
@@ -236,6 +262,15 @@ schema-constrained) that is NOT its native trained dialect (`<tool_call>{"name",
 ---
 
 ## Section C — Conversion recommendation (the #36 spec)
+
+> **STATUS:** this spec was **IMPLEMENTED on this branch** in commit
+> `mythos_fast #105: hermes codec + <tools> seam` — `vibeharness/codecs/hermes_codec.py`
+> (the new `hermes` codec emitting `<tool_call>{"name","arguments"}</tool_call>`),
+> `registry.tools_block(style="hermes")` (the OpenAI-nested `<tools>` block), a
+> `ToolCallCodec.tool_definitions()` seam in `SystemPromptBuilder`, and `config.py` defaults
+> realigned (model → `hf.co/Shadow0482/mythos_fast:Q6_K`, codec → `hermes`). The spec below
+> is the design of record; the remaining open item is the empirical A/B (C.4), which is
+> blocked on the crashed benchmark re-run.
 
 ### C.1 Does an existing codec match? — NO
 
