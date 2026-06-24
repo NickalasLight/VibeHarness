@@ -164,6 +164,11 @@ class RalphAgent:
         # and to pick an UNHANDLED ref from the snapshot, instead of cycling among the same
         # few. Targets the "can't find the next field" failure mode.
         handled_refs: set[str] = set()
+        # Escalating block pressure: count how many times any blocked action on the same
+        # TARGET has fired. When this reaches 3, we emit a HARD STOP that names the exact
+        # alternative call (select_option / click / evaluate) so a low-capability model
+        # that ignores soft warnings is forced to see the concrete fix every turn.
+        target_block_counts: dict[str, int] = {}
 
         # max_steps <= 0 means run until validation passes.
         turns = (itertools.count(1) if self._cfg.max_steps <= 0
@@ -251,15 +256,37 @@ class RalphAgent:
                                        f"corrected value instead. Otherwise move to the NEXT "
                                        f"unfilled field or click Next/Continue/Submit.")
                             else:
-                                obs = (f"WARNING: you already attempted {tool_name} on "
-                                       f"'{target}' (value: '{value}') and it FAILED. "
-                                       f"That element may be a dropdown, combobox, date picker, "
-                                       f"file upload, or other non-text component that does not "
-                                       f"accept a direct fill. Try a different approach: "
-                                       f"use select_option to choose from a list, click '{target}' "
-                                       f"to open it first, use evaluate to inspect what kind of "
-                                       f"element it is, or use press_key after clicking it. "
-                                       f"Do NOT call {tool_name} on '{target}' again.")
+                                # Escalating pressure for failure loops on the same target.
+                                count = target_block_counts.get(target, 0) + 1
+                                target_block_counts[target] = count
+                                if count >= 3:
+                                    obs = (
+                                        f"HARD STOP: {tool_name}('{target}') has been blocked "
+                                        f"{count} times. Text-input tools (fill/type/press_key) "
+                                        f"will NEVER work on this element. You are REQUIRED to "
+                                        f"use one of these RIGHT NOW:\n"
+                                        f"  • select_option(target='{target}', value='{value}') "
+                                        f"— if it is a native <select> or custom dropdown\n"
+                                        f"  • click(target='{target}') — to open a custom "
+                                        f"combobox, then click the matching option from the "
+                                        f"updated snapshot\n"
+                                        f"  • evaluate(expression='el => el.tagName + \" \" + "
+                                        f"(el.getAttribute(\"role\")||el.type)', target='{target}') "
+                                        f"— to inspect the element type before choosing\n"
+                                        f"Do NOT call {tool_name} on '{target}' again. "
+                                        f"Pick one of the three options above NOW."
+                                    )
+                                else:
+                                    obs = (f"WARNING: you already attempted {tool_name} on "
+                                           f"'{target}' (value: '{value}') and it FAILED. "
+                                           f"That element may be a dropdown, combobox, date "
+                                           f"picker, file upload, or other non-text component "
+                                           f"that does not accept a direct fill. Try a different "
+                                           f"approach: use select_option to choose from a list, "
+                                           f"click '{target}' to open it first, use evaluate to "
+                                           f"inspect what kind of element it is, or use "
+                                           f"press_key after clicking it. "
+                                           f"Do NOT call {tool_name} on '{target}' again.")
                             if handled_refs:
                                 obs += (" You have already successfully handled these refs: "
                                         f"{', '.join(sorted(handled_refs))} — pick a fillable/"

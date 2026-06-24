@@ -26,17 +26,21 @@ _THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
 
 _SYSTEM = (
     "You are an expert web-form automation observer. "
-    "You watch an AI agent filling a job-application form and give it precise, investigative advice.\n\n"
+    "You watch an AI agent filling a job-application form and give it precise, actionable advice.\n\n"
+    "The full task description (including ALL expected field values such as State, Country, "
+    "phone, address, etc.) is provided in the user message below under 'TASK'. "
+    "You have full visibility into what values SHOULD be entered — use them when advising.\n\n"
     "ADVICE PRINCIPLES:\n"
-    "1. Observe before concluding. Do not assume you know why something failed — "
-    "ask the agent to investigate first using evaluate or screenshot to confirm the element type.\n"
-    "2. Reason from evidence. Cite specific turn numbers, tool names, element refs, "
-    "or observed output when making a diagnosis.\n"
-    "3. Prioritise the next concrete action. After any investigation, name the next tool "
-    "and target the agent should use — don't leave it open-ended.\n"
-    "4. Distinguish stuck from done. Check whether fields already filled still need attention "
-    "or whether the agent should move on to unfilled fields or page navigation.\n"
-    "5. Be concise. 2-5 plain-English sentences. No JSON, no code blocks, no bullet lists. "
+    "1. Be concrete and specific. When you recommend a tool call, write it out exactly: "
+    "e.g. 'call select_option(target=\"e65\", value=\"TX\")' or "
+    "'call evaluate(expression=\"el => el.tagName\", target=\"e65\")'. "
+    "Never leave the agent guessing at the tool name, ref, or value.\n"
+    "2. Observe before concluding. Do not assume why something failed — "
+    "recommend evaluate or click to confirm the element type first if uncertain.\n"
+    "3. Reason from evidence. Cite turn numbers, tool names, refs, and error text.\n"
+    "4. Distinguish stuck from done. If fields are already filled, direct the agent "
+    "to the next UNFILLED field or page navigation, not backward.\n"
+    "5. Be concise. 3-6 plain-English sentences. No JSON, no code blocks, no bullet lists. "
     "Speak directly to the agent as 'you'."
 )
 
@@ -154,6 +158,8 @@ class VibeThinkerAdvisor:
         advice = _TOOL_CALL_RE.sub("", advice).strip()
         if not advice:
             advice = "(no advice generated)"
-        print(f"[advisor] hint: {advice[:120]}{'...' if len(advice) > 120 else ''}",
-              flush=True)
+        # Display up to 500 chars so the operator can read the advice; the FULL text
+        # is what gets injected into the base agent's user message (no truncation there).
+        display = advice[:500] + ("…" if len(advice) > 500 else "")
+        print(f"[advisor] hint (full text sent to agent):\n{display}", flush=True)
         return advice
