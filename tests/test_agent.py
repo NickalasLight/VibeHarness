@@ -9,7 +9,24 @@ from vibeharness.filesystem import FileSystem
 from vibeharness.fs_tools import build_default_tools
 from vibeharness.llm import Decision, LLMClient
 from vibeharness.registry import ToolRegistry
+from vibeharness.reporting import NullReporter
 from vibeharness.validation import Validator, Verdict
+
+
+class RecordingReporter(NullReporter):
+    """Captures the validator-stream hooks the agent drives."""
+
+    def __init__(self):
+        self.events = []
+
+    def validator_start(self):
+        self.events.append(("start", None))
+
+    def validator_reasoning_token(self, text):
+        self.events.append(("reason", text))
+
+    def validator_verdict_token(self, text):
+        self.events.append(("verdict", text))
 
 
 class FakeLLMClient(LLMClient):
@@ -32,8 +49,13 @@ class FakeValidator(Validator):
         self._passed, self._reason = passed, reason
         self.calls = []
 
-    def validate(self, task, history, claim):
+    def validate(self, task, history, claim, on_reason=None, on_action=None):
         self.calls.append({"task": task, "history": history, "claim": claim})
+        # Stream a little so a reporter observing the validator can be exercised.
+        if on_reason:
+            on_reason("judging")
+        if on_action:
+            on_action('{"verdict":"pass"}')
         return Verdict(self._passed, self._reason)
 
 
@@ -52,10 +74,10 @@ class AgentLoopTest(unittest.TestCase):
     def p(self, name):
         return os.path.join(self.dir, name)
 
-    def _agent(self, actions, validator=None, max_steps=10):
+    def _agent(self, actions, validator=None, max_steps=10, reporter=None):
         client = FakeLLMClient(actions)
         return RalphAgent(client, self.registry, "SYSTEM", Config(max_steps=max_steps),
-                          validator or FakeValidator(passed=True))
+                          validator or FakeValidator(passed=True), reporter=reporter)
 
     def test_sequential_turns_then_validate_passes(self):
         actions = [
@@ -142,6 +164,15 @@ class AgentLoopTest(unittest.TestCase):
         seen = []
         self._agent([VALIDATE]).run("t", on_turn=lambda r: seen.append(len(r.turns)))
         self.assertEqual(seen, [1])   # one turn, checkpointed once
+
+    def test_validator_stream_reaches_reporter(self):
+        reporter = RecordingReporter()
+        self._agent([VALIDATE], reporter=reporter).run("t")
+        # the agent emitted the start marker, then forwarded the validator's
+        # streamed reasoning and verdict tokens to the reporter.
+        self.assertEqual(reporter.events[0], ("start", None))
+        self.assertIn(("reason", "judging"), reporter.events)
+        self.assertIn(("verdict", '{"verdict":"pass"}'), reporter.events)
 
     def test_transcript_and_to_dict(self):
         result = self._agent([VALIDATE]).run("t")

@@ -35,7 +35,7 @@ class _ScriptedClient(LLMClient):
 
 
 class _PassValidator(Validator):
-    def validate(self, task, history, claim):
+    def validate(self, task, history, claim, on_reason=None, on_action=None):
         return Verdict(True, "looks complete")
 
 
