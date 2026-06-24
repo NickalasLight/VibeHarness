@@ -16,7 +16,7 @@ from datetime import datetime
 from pathlib import Path
 
 from .agent import RalphAgent
-from .codec import UnknownCodec, get_codec
+from .codec import UnknownCodec, available_codecs, get_codec
 from .config import Config
 from .filesystem import FileSystem, FileSystemError
 from .llm import OllamaClient, OllamaUnavailable
@@ -35,6 +35,7 @@ examples:
   vibe "create a README and fill in a project overview"
   vibe --temp 1.0 "draft notes.txt"        run once at a different temperature
   vibe --max-steps 30 "refactor this dir"  allow more steps for a big task
+  vibe "task" --codec tagged_json          use a different tool-call wire format
 
 manage persistent defaults (saved to ~/.vibeharness/settings.json):
   vibe --set temp 0.5                      change the default temperature
@@ -57,6 +58,9 @@ current default temperature: {saved_temp}
                    help="sampling temperature for this run only")
     p.add_argument("--model", default=None, metavar="NAME",
                    help="Ollama model name for this run only")
+    p.add_argument("--codec", default=None, metavar="CODEC",
+                   help="tool-call wire format for this run only; one of: "
+                        f"{', '.join(available_codecs())} (default: {Config.codec})")
     p.add_argument("--max-steps", type=int, default=None, metavar="N",
                    help="max turns for this run only (0 = unlimited, until finish)")
     p.add_argument("--max-actions-per-turn", type=int, default=None, metavar="N",
@@ -85,6 +89,16 @@ def selected_toolset_names(args: argparse.Namespace) -> list[str]:
     return names or ["fs"]
 
 
+def codec_error(name: str) -> str | None:
+    """Return a user-facing error if ``name`` is not an installed codec, else None.
+
+    Centralised so the per-run flag and tests share one validation rule.
+    """
+    if name in available_codecs():
+        return None
+    return f"error: unknown codec '{name}'. Available: {', '.join(available_codecs())}"
+
+
 def resolve_config(args: argparse.Namespace) -> Config:
     """Config defaults < saved settings < CLI flags (only those provided)."""
     cfg = Settings.apply(Config())
@@ -93,6 +107,8 @@ def resolve_config(args: argparse.Namespace) -> Config:
         overrides["temperature"] = args.temp
     if args.model is not None:
         overrides["model"] = args.model
+    if getattr(args, "codec", None) is not None:
+        overrides["codec"] = args.codec
     if args.max_steps is not None:
         overrides["max_steps"] = args.max_steps
     if getattr(args, "max_actions_per_turn", None) is not None:
@@ -144,6 +160,11 @@ def run_agent(args: argparse.Namespace) -> int:
     else:
         task = " ".join(args.task)
     config = resolve_config(args)
+    # Validate the (possibly overridden) codec before any model work.
+    err = codec_error(config.codec)
+    if err is not None:
+        print(err)
+        return 2
     catalog = default_catalog()
     names = selected_toolset_names(args)
 
