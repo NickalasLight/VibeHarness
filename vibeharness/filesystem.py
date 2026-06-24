@@ -204,6 +204,11 @@ class FileSystem:
         ``max_depth`` and emits at most ``max_entries`` lines total, appending
         ``… (N more)`` when either cap truncates the listing. Kept deliberately
         terse — it is refreshed into the system prompt every turn.
+
+        Hidden (dot-prefixed) files and directories — ``.vibe``, ``.git``,
+        ``.playwright-cli``, nested ``.foo/``, … — are EXCLUDED at every level.
+        They are harness/tooling artifacts (the ``.vibe`` diagnostics dir grows
+        every turn) that only bloat and pollute the per-turn prompt.
         """
         root = self.resolve(path)
         if not os.path.isdir(root):
@@ -216,6 +221,9 @@ class FileSystem:
                 names = os.listdir(base)
             except OSError:
                 return
+            # Drop dot-prefixed entries (both dirs and files) at every level, so
+            # nested hidden dirs are pruned too.
+            names = [n for n in names if not n.startswith(".")]
             dirs = sorted(n for n in names if os.path.isdir(os.path.join(base, n)))
             files = sorted(n for n in names if not os.path.isdir(os.path.join(base, n)))
             for d in dirs:

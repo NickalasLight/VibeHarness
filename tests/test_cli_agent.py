@@ -14,6 +14,7 @@ from contextlib import redirect_stdout
 
 from vibeharness import cli
 from vibeharness.config import Config
+from vibeharness.filesystem import FileSystem
 from vibeharness.prompt import SystemPromptBuilder
 from vibeharness.toolset import agent_default_toolsets, default_catalog
 
@@ -83,6 +84,52 @@ class AgentPromptGuidanceTest(unittest.TestCase):
         prompt = _system_prompt_for(cli.selected_toolset_names(args))
         self.assertIn("live snapshot", prompt)   # web
         self.assertIn("create_file", prompt)     # fs
+
+
+class WorkspaceSectionFsGateTest(unittest.TestCase):
+    """The ``# Workspace`` tree is injected ONLY for fs-toolset agents (issue #45).
+
+    Builds the assembled per-turn system prompt through the REAL seam:
+    ``make_render_workspace`` (the fs-gate) → ``make_system_prompt_provider`` →
+    ``SystemPromptBuilder.build`` (which omits empty sections). No model required.
+    """
+
+    def _assembled_prompt(self, names: list[str]) -> str:
+        catalog = default_catalog()
+        toolsets = catalog.select(names)
+        config = Config()
+        builder = SystemPromptBuilder(
+            catalog.build_registry(toolsets, config),
+            guidance=SystemPromptBuilder.assemble_guidance(toolsets))
+        fs = FileSystem()
+        render_workspace = cli.make_render_workspace(fs, names)
+        # No web snapshot provider → the provider degrades to the workspace-only
+        # refresh, which is exactly the path the gate controls.
+        provider = cli.make_system_prompt_provider(
+            builder, config, "a task", render_workspace,
+            raw_snapshot_provider=None, logger=None)
+        return provider("a user turn")
+
+    def test_agent_fs_includes_workspace_section(self):
+        prompt = self._assembled_prompt(["fs"])
+        self.assertIn("# Workspace", prompt)
+
+    def test_agent_web_omits_workspace_section(self):
+        prompt = self._assembled_prompt(["web"])
+        self.assertNotIn("# Workspace", prompt)
+
+    def test_fs_plus_web_includes_workspace_section(self):
+        prompt = self._assembled_prompt(["web", "fs"])
+        self.assertIn("# Workspace", prompt)
+
+    def test_render_workspace_empty_without_fs(self):
+        render = cli.make_render_workspace(FileSystem(), ["web"])
+        self.assertEqual(render(), "")
+
+    def test_render_workspace_nonempty_with_fs(self):
+        render = cli.make_render_workspace(FileSystem(), ["fs"])
+        out = render()
+        self.assertIn("Working directory:", out)
 
 
 class AgentValidationTest(unittest.TestCase):

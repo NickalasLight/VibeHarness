@@ -272,6 +272,34 @@ def run_agent(args: argparse.Namespace) -> int:
         lock.release()
 
 
+def make_render_workspace(fs, names):
+    """Build the per-turn ``# Workspace`` tree renderer, gated on the fs toolset.
+
+    The workspace directory tree is only meaningful to an agent that can touch the
+    filesystem. A web-only worker (no ``fs`` tools) gets an EMPTY string, so the
+    builder omits the ``# Workspace`` section entirely (mirroring the page/guidance
+    empty-section behaviour) — the file tree is irrelevant noise competing with the
+    worker's live page snapshot + tool guidance. When ``fs`` IS active (``fs``, or
+    ``fs``+``web``, …) it renders the cwd tree as before (now minus hidden folders).
+
+    Scanning ``Path.cwd()`` each call (rather than a cached tree) is what makes newly
+    written files appear next turn.
+    """
+    fs_active = "fs" in names
+
+    def render_workspace() -> str:
+        if not fs_active:
+            return ""
+        cwd = Path.cwd()
+        try:
+            tree = fs.tree(str(cwd))
+        except FileSystemError as e:
+            tree = f"(could not list: {e})"
+        return f"Working directory: {cwd}\n{tree}"
+
+    return render_workspace
+
+
 def make_system_prompt_provider(builder, config, task, render_workspace,
                                 raw_snapshot_provider, logger=None):
     """Build the per-turn system-prompt provider with the DYNAMIC snapshot budget (#43).
@@ -356,13 +384,10 @@ def _run_locked(args, task, config, registry, codec, names, workdir, logger,
         guidance=SystemPromptBuilder.assemble_guidance(toolsets))
     fs = FileSystem()
 
-    def render_workspace() -> str:
-        cwd = Path.cwd()
-        try:
-            tree = fs.tree(str(cwd))
-        except FileSystemError as e:
-            tree = f"(could not list: {e})"
-        return f"Working directory: {cwd}\n{tree}"
+    # Per-turn "# Workspace" renderer, gated on whether the fs toolset is active:
+    # a web-only worker gets "" (no section); fs / fs+web render the cwd tree
+    # (now minus hidden folders). See make_render_workspace.
+    render_workspace = make_render_workspace(fs, names)
 
     # When the web toolset is active, auto-inject a FRESH page snapshot into the
     # per-turn system prompt (issue #24). The provider captures from the run's
