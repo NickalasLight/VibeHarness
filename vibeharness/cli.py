@@ -339,7 +339,8 @@ def make_render_workspace(fs, names):
 
 
 def make_system_prompt_provider(builder, config, task, render_workspace,
-                                raw_snapshot_provider, logger=None):
+                                raw_snapshot_provider, logger=None,
+                                include_tool_guidance=True):
     """Build the per-turn system-prompt provider with the DYNAMIC snapshot budget (#43).
 
     Returns a callable taking the per-turn ``user`` message (RalphAgent passes it so
@@ -355,11 +356,18 @@ def make_system_prompt_provider(builder, config, task, render_workspace,
     When no snapshot provider is wired (web inactive), this degrades to the original
     workspace-only refresh — no page section, no budgeting work.
 
+    Issue #57: ``include_tool_guidance`` is threaded through to every ``builder.build``
+    call so the SAME function can produce the TOOL-LESS variant fed to the validator —
+    identical task/workspace/page rendering and identical snapshot budgeting, just
+    without the tool descriptions / format-instruction block. The budget is computed
+    against the same ``rest`` text either way, so the snapshot trims to fit num_ctx.
+
     Per-turn diagnostic logging (issue #37): when a ``logger`` is given, each turn we
     dump the COMPLETE raw snapshot (ground-truth size, BEFORE budgeting) and the EXACT
     system prompt injected into the model into the run's .vibe diagnostics folder. This
     is the single per-turn seam, so it captures exactly what the model saw. All logging
-    is guarded so a dump failure can never break the turn.
+    is guarded so a dump failure can never break the turn. The tool-less validator
+    variant does NOT dump (logger left None) so it never double-counts a turn.
     """
     turn_counter = itertools.count(1)
 
@@ -377,12 +385,14 @@ def make_system_prompt_provider(builder, config, task, render_workspace,
         raw = raw_snapshot_provider() if raw_snapshot_provider is not None else None
         if not raw:
             # No live page this turn: render no page section (issue #24 behaviour).
-            prompt = builder.build(task, workspace=workspace, page="")
+            prompt = builder.build(task, workspace=workspace, page="",
+                                   include_tool_guidance=include_tool_guidance)
             _dump(prompt, raw or None)
             return prompt
         # The "rest" of the message: system prompt with NO page section + the user
         # turn message. We measure this to learn how much room the snapshot has.
-        rest_system = builder.build(task, workspace=workspace, page="")
+        rest_system = builder.build(task, workspace=workspace, page="",
+                                    include_tool_guidance=include_tool_guidance)
         rest_text = rest_system + user
         budget = compute_snapshot_budget(config, rest_text)
         if budget.overflow:
@@ -395,11 +405,13 @@ def make_system_prompt_provider(builder, config, task, render_workspace,
                 f"turn to stay within num_ctx ({config.num_ctx}).",
                 file=sys.stderr,
             )
-            prompt = builder.build(task, workspace=workspace, page="")
+            prompt = builder.build(task, workspace=workspace, page="",
+                                   include_tool_guidance=include_tool_guidance)
             _dump(prompt, raw)
             return prompt
         page = render_budgeted_snapshot(raw, budget.budget_chars)
-        prompt = builder.build(task, workspace=workspace, page=page)
+        prompt = builder.build(task, workspace=workspace, page=page,
+                               include_tool_guidance=include_tool_guidance)
         _dump(prompt, raw)
         return prompt
     return provider
@@ -443,9 +455,17 @@ def _run_locked(args, task, config, registry, codec, names, workdir, logger,
     # logger, performs #37's per-turn diagnostic dump (raw snapshot + injected prompt).
     system_prompt_provider = make_system_prompt_provider(
         builder, config, task, render_workspace, raw_snapshot_provider, logger)
+    # Issue #57: a TOOL-LESS twin of the same per-turn prompt to feed the validator —
+    # task + workspace + the same #43-budgeted page snapshot, but with the tool
+    # descriptions / format-instruction block stripped, so the validator sees the real
+    # context the agent had (no self-claim). No logger here so it never double-dumps a
+    # turn's diagnostics.
+    validator_context_provider = make_system_prompt_provider(
+        builder, config, task, render_workspace, raw_snapshot_provider,
+        logger=None, include_tool_guidance=False)
     agent = RalphAgent(client, registry, system_prompt, config, validator,
                        reporter=reporter, system_prompt_provider=system_prompt_provider,
-                       codec=codec)
+                       codec=codec, validator_context_provider=validator_context_provider)
 
     checkpoint = lambda res: _safe_log(logger, task, config, res)   # stream log each turn
     # Write an initial log at run START (before turn 1). on_turn fires only AFTER a

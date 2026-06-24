@@ -47,7 +47,7 @@ class StreamingLogTest(unittest.TestCase):
             workspace = Path(d)
             registry = ToolRegistry(build_default_tools(FileSystem(), 1000))
             # 3 working turns, then validate (passes) -> 4 turns total
-            actions = [ls(d), ls(d), ls(d), {"tool": "validate", "args": {"summary": "done"}}]
+            actions = [ls(d), ls(d), ls(d), {"tool": "validate", "args": {}}]
             agent = RalphAgent(_ScriptedClient(actions), registry, "SYS",
                                Config(max_steps=10), _PassValidator())
             logger = RunLogger(workspace, datetime(2026, 1, 1, 0, 0, 0))

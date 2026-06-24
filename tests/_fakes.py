@@ -73,8 +73,8 @@ class FakeValidator(Validator):
         self._stream = stream
         self.calls = []
 
-    def validate(self, task, history, claim, on_reason=None, on_action=None):
-        self.calls.append({"task": task, "history": history, "claim": claim})
+    def validate(self, context, history, on_reason=None, on_action=None):
+        self.calls.append({"context": context, "history": history})
         if self._stream:
             if on_reason:
                 on_reason("judging")

@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from .codec import DecodeConstraint
 from .config import Config
 from .llm import LLMClient, TokenSink
-from .tools import Param, Tool, ToolResult
+from .tools import Tool, ToolResult
 from .toolset import Toolset
 
 VALIDATOR_SYSTEM = """\
@@ -26,18 +26,26 @@ You are a strict validation agent. Another agent has been working to complete a 
 user's task using tools. Your job is to decide whether it has FULLY and CORRECTLY \
 completed that task, judging only from the evidence you are given.
 
-You receive:
+You receive the EXACT context the working agent had:
 - the ORIGINAL TASK the user asked for,
-- a plain-English account of every action the agent took and what each returned,
-- the agent's own claim that it is finished.
+- a snapshot of its workspace and, when it was driving a browser, a live snapshot \
+of the CURRENT page (the `# Current page (live snapshot)` section),
+- a plain-English account of every action the agent took and what each returned.
+
+There is NO self-claim of completion: do not look for one and do not take any \
+agent's word for it. Judge the task ONLY against the page snapshot and the action \
+history above.
 
 Rules:
-- Judge ONLY from the account. Do not assume a step happened unless the account \
-shows it succeeding. Treat errors, skipped steps, and unverified claims as incomplete.
+- Judge ONLY from the provided snapshot and action history. Do not assume a step \
+happened unless the history shows it succeeding. Treat errors, skipped steps, and \
+unverified actions as incomplete.
 - Be strict but fair. If ANY required part of the task is missing, not done, or not \
-supported by the account, the verdict is "fail".
+supported by the snapshot/history, the verdict is "fail".
 - When you fail it, state specifically what is missing or wrong so the agent knows \
-exactly what to do next.
+exactly what to do next. Steer it toward acting on elements that ACTUALLY EXIST in \
+the page snapshot — refer to real refs/text visible in the snapshot, and never tell \
+it to target guessed or invented selectors that are not present there.
 
 Output exactly one JSON object: {"verdict": "pass" or "fail", "reason": "<1-3 sentences>"}.
 """
@@ -59,19 +67,29 @@ class Verdict:
     reasoning: str = ""   # the validator's private reasoning (kept for the log)
 
 
-def build_validator_prompt(task: str, history: str, claim: str) -> str:
+def build_validator_prompt(main_system_prompt_minus_tools: str, history: str) -> str:
+    """Build the validator's USER message (issue #57).
+
+    The validator no longer gets a self-reported summary. Instead it receives the
+    SAME context the main agent had: the main agent's latest system prompt WITH the
+    tool descriptions / format-instructions stripped (so it keeps the task, the
+    workspace, and the `# Current page (live snapshot)` section), followed by the
+    action history. ``main_system_prompt_minus_tools`` is produced by
+    ``SystemPromptBuilder.build(..., include_tool_guidance=False)``.
+    """
+    context = (main_system_prompt_minus_tools or "").strip()
     return (
-        f"# Original task\n{task}\n\n"
+        f"{context}\n\n---\n\n"
         f"# Account of what the agent did\n{history}\n\n"
-        f"# The agent's completion claim\n{claim or '(the agent gave no summary)'}\n\n"
-        f"# Your verdict\nDecide whether the original task is fully and correctly "
-        f"complete. Respond with one JSON object: a verdict of pass or fail and a reason."
+        f"# Your verdict\nDecide whether the task above is fully and correctly "
+        f"complete, judging ONLY from the page snapshot and the action history. "
+        f"Respond with one JSON object: a verdict of pass or fail and a reason."
     )
 
 
 class Validator(ABC):
     @abstractmethod
-    def validate(self, task: str, history: str, claim: str,
+    def validate(self, main_system_prompt_minus_tools: str, history: str,
                  on_reason: "TokenSink | None" = None,
                  on_action: "TokenSink | None" = None) -> Verdict:
         ...
@@ -92,10 +110,10 @@ class LLMValidator(Validator):
         self._logger = logger
         self._config = config
 
-    def validate(self, task: str, history: str, claim: str,
+    def validate(self, main_system_prompt_minus_tools: str, history: str,
                  on_reason: "TokenSink | None" = None,
                  on_action: "TokenSink | None" = None) -> Verdict:
-        user = build_validator_prompt(task, history, claim)
+        user = build_validator_prompt(main_system_prompt_minus_tools, history)
         decision = self._client.decide(
             VALIDATOR_SYSTEM, user, DecodeConstraint(json_schema=VERDICT_SCHEMA),
             on_reason=on_reason, on_action=on_action)
@@ -106,21 +124,23 @@ class LLMValidator(Validator):
         except json.JSONDecodeError:
             verdict = Verdict(False, "validator output could not be parsed; treating as incomplete.",
                               decision.reasoning)
-        self._log(task, history, claim, verdict)
+        self._log(main_system_prompt_minus_tools, history, verdict)
         return verdict
 
-    def _log(self, task: str, history: str, claim: str, verdict: Verdict) -> None:
+    def _log(self, context: str, history: str, verdict: Verdict) -> None:
         """Hand this invocation to the run logger (best-effort; never throws).
 
         Mirrors the #37 diagnostics contract: the logger's own write is already
         guarded, and this wrapper guards the call site too so even a missing/odd
-        logger can never break the verdict the agent depends on.
+        logger can never break the verdict the agent depends on. Issue #57: the
+        logged ``context`` is now the richer tool-less main prompt (task + workspace
+        + page snapshot) the validator actually judged from — no self-claim.
         """
         if self._logger is None:
             return
         try:
             self._logger.log_validator(
-                task=task, history=history, claim=claim,
+                context=context, history=history,
                 reasoning=verdict.reasoning, passed=verdict.passed,
                 reason=verdict.reason, config=self._config)
         except Exception:
@@ -139,8 +159,11 @@ class ValidateTool(Tool):
 
     @property
     def parameters(self):
-        return [Param("summary", "string",
-                      "Brief summary of what you accomplished and why the task is complete.")]
+        # `validate` takes NO arguments (issue #57). The validator no longer reads a
+        # self-reported summary; it judges from the page snapshot + action history it
+        # is fed directly. An empty parameter list yields a call-schema whose `args`
+        # is an empty object, so a no-arg `validate` call is accepted.
+        return []
 
     def run(self, args: dict) -> ToolResult:
         return ToolResult(True, "validation requested.")
