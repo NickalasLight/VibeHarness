@@ -34,7 +34,9 @@ class Config:
     observation_char_limit: int = 12000  # truncate big tool outputs in the narrative
 
     # backend
+    backend: str = "ollama"           # "ollama" or "llamacpp"
     ollama_url: str = "http://127.0.0.1:11434"
+    llamacpp_url: str = "http://127.0.0.1:8080"
     request_timeout: int = 600
 
     # web toolset (Playwright Agent CLI)
