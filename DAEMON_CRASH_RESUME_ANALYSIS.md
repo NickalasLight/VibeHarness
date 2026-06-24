@@ -5,6 +5,20 @@ ONLY** — this document does not modify `vibeharness/web.py`. The immediate cau
 being fixed in parallel by #101/#75; this is the broader ground-truth + the
 clean-resume design that informs and composes with those fixes.
 
+> **STATUS (implemented in `fix/browser-daemon-dies`, closing #101 + #75):** the
+> Part D clean-resume design has been built. `PlaywrightCli.run` is now self-healing
+> (detect daemon-death signature → reap/reopen with the run's `open_flags` →
+> re-navigate to the tracked `last_url` → retry once, bounded by `SessionState`),
+> snapshots are death-tolerant (resume-free `snapshot()` seam), and an agent-callable
+> `open_browser` tool plus updated `system_guidance` give the model an explicit
+> recovery lever. See `vibeharness/web.py` (`SessionState`, `PlaywrightCli.run/
+> _resume/_run_once`, `OpenBrowserTool`) and `tests/test_web.py`. NOTE on root cause:
+> live experiments on Windows showed the per-command `taskkill /F /T` does NOT in
+> fact reach the detached/unref'd daemon (it survives every per-command tree-kill),
+> so the dominant real-world trigger is the SHARED `vibe` session being stopped by a
+> concurrent run's teardown/atexit (or an external reaper) — the self-healing resume
+> makes the session survive ANY of these causes regardless.
+
 **Goal:** explain WHY the `@playwright/cli` daemon dies during sustained automation,
 and design a CLEAN RESUME mechanism so a run that loses its daemon re-opens and
 re-navigates instead of stalling forever in the dead-end "browser 'vibe' is not
