@@ -7,24 +7,36 @@ from dataclasses import dataclass
 class Config:
     # model / sampling
     # ISSUE #123 / branch beta_qwen3coder (ISOLATED): the default model on this line is
-    # a ~3B Qwen2.5-Coder, paired with the `hermes` codec below so the harness speaks
-    # the model's native trained dialect. (On `beta` the default is "vibethinker" +
-    # "json"; this branch never merges back, so these defaults stay local to it.)
+    # a ~3-4B Qwen3 dense model, paired with the `hermes` codec below so the harness
+    # speaks the model's native trained dialect. (On `beta` the default is "vibethinker"
+    # + "json"; this branch never merges back, so these defaults stay local to it.)
     #
-    # ⚠️ 3B-PARITY NOTE: there is NO dense ~3B *Qwen3-Coder* model — the entire
-    # Qwen3-Coder line is MoE (smallest is 30B-A3B: 30B total / 3B ACTIVE; then
-    # 80B-A3B "Next"; then 480B-A35B). Using any of those breaks apples-to-apples
-    # parity with VibeThinker-3B (a 3B DENSE model) and won't fit the 8 GB card. So
-    # this branch uses the closest true ~3B DENSE coder: Qwen2.5-Coder-3B-Instruct
-    # (1.9 GB at Q4_K_M; same Qwen2.5/Hermes tool dialect; VibeThinker itself derives
-    # from Qwen2.5-(Coder-)3B, so this is the cleanest 3B-for-3B substitute). The
-    # Qwen3-Coder discrepancy is flagged in QWEN3CODER_ANALYSIS.md and
-    # QWEN3CODER_DIVERGENCE.md. Swap the tag here if/when a dense ~3B Qwen3-Coder ships.
-    model: str = "qwen2.5-coder:3b-instruct"
+    # ISSUE #140 (qwen3:4b upgrade — analysis #139): upgraded from
+    # qwen2.5-coder:3b-instruct to qwen3:4b. Ground truth (live on RTX 3080 8GB, CUDA
+    # 13.3; see qwen3_upgrade_analysis.md):
+    #   - There is NO dense `qwen3:3b` (the Qwen3 dense line is 0.6B/1.7B/4B/8B/...; the
+    #     Qwen3-Coder line is MoE-only). `qwen3:4b` (4.0B dense, Q4_K_M, Apache-2.0) is
+    #     the nearest dense peer to VibeThinker-3B and the cleanest 3B-class substitute.
+    #     A 4.0B-vs-3.0B parity caveat is flagged in QWEN3CODER_DIVERGENCE.md.
+    #   - Qwen3's tool-call dialect is byte-compatible with the hermes codec (verified —
+    #     ZERO codec changes). Ollama now returns STRUCTURED message.tool_calls for
+    #     Qwen3 (qwen2.5-coder returned null+text), so the native_tools path (PR #136)
+    #     becomes the primary, more-robust route.
+    #   - Thinking is ON by default and Ollama routes it to message.thinking, leaving
+    #     content clean. Do NOT disable thinking (think:false leaks reasoning into
+    #     content and breaks the content-only parse fallback).
+    # Sampling is tuned to the Qwen3 model card (see action_temperature / top_k below).
+    model: str = "qwen3:4b"
     temperature: float = 0.3          # phase-1 reasoning temperature (some diversity helps)
-    action_temperature: float = 0.0   # phase-2 action: greedy, for verbatim string fidelity
-    top_p: float = 0.95
-    top_k: int = 0
+    # ISSUE #140: Qwen3 explicitly FORBIDS greedy decoding (its model card warns greedy
+    # causes endless repetition / degraded output). The previous 0.0 (greedy, chosen for
+    # verbatim string fidelity on the non-thinking qwen2.5-coder) is off-policy for Qwen3.
+    # 0.6 is Qwen3's baked thinking-mode default — the recommended action temperature.
+    action_temperature: float = 0.6   # phase-2 action: Qwen3 forbids greedy (was 0.0) — #140
+    top_p: float = 0.95               # matches Qwen3 baked default
+    # ISSUE #140: Qwen3 recommends top_k=20 (its baked default); 0 (disabled) is
+    # off-distribution for Qwen3 and was only inherited from the qwen2.5-coder setup.
+    top_k: int = 20                   # Qwen3 recommendation (was 0) — #140
     num_gpu: int = 99                 # force full GPU offload (NVIDIA via CUDA)
 
     # loop
@@ -95,12 +107,20 @@ class Config:
     # fixed num_ctx on EVERY request (see OllamaClient._options) means only ONE
     # runner shape is ever requested, so at most one runner exists.
     #
-    # 32768 is chosen as the largest of the observed auto-fit sizes — it has actually
-    # loaded on this card, so it is known-fittable, and it is large enough that a
-    # heavy real page still fits: the worst-case YouTube watch snapshot (~45k chars
-    # ≈ ~11k tokens at 4 chars/token) plus the prompt and output reservation stays
-    # well under 32768. If 32768 proves unstable in live runs, drop to 16384 (also
-    # an observed-fitting size) — both keep the single-runner invariant.
+    # ISSUE #140 (qwen3:4b upgrade — analysis #139): num_ctx confirmed safe at 32768
+    # with OLLAMA_FLASH_ATTENTION=1.
+    # Live VRAM on the RTX 3080 8GB (CUDA 13.3; see qwen3_upgrade_analysis.md):
+    #     qwen3:4b @ num_ctx=32768, no flash attn  -> 7266 MiB (tight on 8 GB + Chrome)
+    #     qwen3:4b @ num_ctx=32768, FLASH_ATTENTION -> ~4360-5086 MiB (safe)
+    #     qwen3:4b @ num_ctx=16384, no flash attn  -> 5038 MiB
+    # RESOLUTION: OLLAMA_FLASH_ATTENTION=1 is now set (User env var). With flash
+    # attention the 32768 context fits safely and the input_budget is restored to the
+    # same 23552 tokens the qwen2.5-coder:3b-instruct runs used. Dropping to 16384
+    # would shrink the input budget to 7168 tokens — too small for an 8-page form
+    # requiring 15-40 turns of context (system prompt alone is ~3000 tokens). The
+    # single-runner invariant (#77) is preserved: 32768 is an observed auto-fit size.
+    # NOTE: OLLAMA_FLASH_ATTENTION=1 must be set BEFORE Ollama starts (it reads the
+    # env at startup). Restart Ollama if the env var was just set.
     num_ctx: int = 32768
     # ISSUE #92 (token rebalance): the output reservation
     # (reason_tokens + action_tokens) is subtracted from num_ctx before anything else

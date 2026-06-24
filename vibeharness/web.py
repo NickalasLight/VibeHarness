@@ -28,6 +28,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 import uuid
 from typing import Callable
 
@@ -308,6 +309,28 @@ def _extract_ref_lines(refs: list[str], snapshot: str) -> list[str]:
     return results[:20]
 
 
+def _interactable_ref_lines(snapshot: str, limit: int = 40) -> list[str]:
+    """Return concise 'eN: <role> "<label>"' lines for each interactable control.
+
+    Filters the snapshot to lines carrying an interactable role (textbox, button,
+    combobox, …) AND a ref, so an error message can show the model the REAL fields and
+    buttons on the current page instead of a meaningless dump of every ref. Used by the
+    invalid-target guard so a model that guessed a non-existent ref (iter-1: e208/e209
+    after a page advanced) is shown the actual refs to choose from."""
+    out: list[str] = []
+    for line in (snapshot or "").splitlines():
+        low = line.lower()
+        if not any(role in low for role in _INTERACTABLE_ROLES):
+            continue
+        m = re.search(r"\[ref=(e\d+)\]", line)
+        if not m:
+            continue
+        out.append(f"{m.group(1)}: {line.strip().lstrip('- ')[:90]}")
+        if len(out) >= limit:
+            break
+    return out
+
+
 def _check_dom_delta(cli: "PlaywrightCli", before_snapshot: str,
                      result: "ToolResult") -> "ToolResult":
     """Append a DOM-change summary to ``result`` when new elements appeared.
@@ -325,6 +348,25 @@ def _check_dom_delta(cli: "PlaywrightCli", before_snapshot: str,
     new_refs = _diff_snapshot_refs(before_snapshot, after)
     if not new_refs:
         return result
+    # PAGE-ADVANCE detection (iter-2): a wizard Continue/Back click swaps the ENTIRE step
+    # — most old refs vanish and a fresh batch appears. Distinguish that from a small
+    # in-place change (a dropdown opening, an inline error). When the page substantially
+    # turned over, say so explicitly and list the new step's INTERACTABLE controls, so the
+    # model re-reads the new refs instead of guessing sequential ones (iter-1: e208/e209
+    # invented after Continue advanced the form).
+    before_set = set(re.findall(r"\[ref=(e\d+)\]", before_snapshot or ""))
+    after_set = set(re.findall(r"\[ref=(e\d+)\]", after))
+    gone = before_set - after_set
+    page_changed = bool(before_set) and len(gone) >= max(5, len(before_set) // 2)
+    if page_changed:
+        controls = _interactable_ref_lines(after)
+        delta_msg = (
+            "\n\nPAGE CHANGED: this click loaded a NEW page/step — the previous refs are "
+            "GONE and the refs below are the ONLY valid ones now. Do NOT reuse or increment "
+            "old refs; read these fresh refs and act on them:\n"
+            + "\n".join(f"  {line}" for line in controls[:40])
+        )
+        return ToolResult(result.ok, (result.observation or "") + delta_msg)
     new_lines = _extract_ref_lines(new_refs, after)
     delta_msg = (
         f"\n\nDOM CHANGE DETECTED: {len(new_refs)} new element(s) appeared:\n"
@@ -790,13 +832,25 @@ class _WebTool(Tool):
         refs = parse_snapshot_refs(snapshot)
         if ref is not None and ref in refs:
             return None  # valid ref present on the page
-        available = ", ".join(sorted(refs, key=lambda r: int(r[1:]))) or "(none)"
+        # Prefer to show the INTERACTABLE controls (textbox/button/combobox/…) with their
+        # labels rather than the raw ref dump — a small model that guessed a sequential ref
+        # (iter-1: clicked e208/e209/e210 that never existed after a page advance) needs to
+        # see the REAL field/button refs on the now-current page, not "e1..e999". Falls back
+        # to the full ref list only when no interactable line could be extracted.
+        interactable = _interactable_ref_lines(snapshot)
+        if interactable:
+            avail_desc = "Interactable elements on the CURRENT page:\n" + "\n".join(
+                f"  {ln}" for ln in interactable)
+        else:
+            avail_desc = ("Available refs on the current page: "
+                          + (", ".join(sorted(refs, key=lambda r: int(r[1:]))) or "(none)"))
         return ToolResult(
             False,
-            f"you tried to {self._verb} '{target}' but that is not a valid target: "
-            f"you must pass the ref of an element shown in the current page snapshot "
-            f"(e.g. 'e163'), and never guess a CSS selector, class or id. "
-            f"Available refs on the current page: {available}.",
+            f"you tried to {self._verb} '{target}' but '{target}' does NOT exist on the "
+            f"current page. The page snapshot changed (a Continue/Back click loads a NEW "
+            f"step whose refs are completely DIFFERENT) — refs are NOT sequential and you "
+            f"must NEVER guess or increment them (e.g. e208 -> e209). READ the live page "
+            f"snapshot above and copy a ref EXACTLY as shown.\n" + avail_desc,
         )
 
     def _trim(self, text: str) -> str:
@@ -831,6 +885,13 @@ class GotoTool(_WebTool):
         return ["goto", args["url"]]
 
 
+# A wizard "go to the PREVIOUS step" control — matched on its accessible name. Clicking
+# it abandons the current step's progress, so for a forward fill-and-submit task it is
+# almost always a mistake (iter-2: the model clicked "← Back" instead of setting the date,
+# bouncing page2->page1 and oscillating forever).
+_BACK_BUTTON_RE = re.compile(r'button\s+"[^"]*\b(?:back|previous|prev)\b[^"]*"', re.IGNORECASE)
+
+
 class ClickTool(_WebTool):
     name = "click"
     description = "Click an element (a link, button, checkbox, …). " + _REF_NOTE
@@ -846,6 +907,30 @@ class ClickTool(_WebTool):
 
     def _build(self, args):
         return ["click", args["target"]]
+
+    def run(self, args: dict) -> ToolResult:
+        # BACK-BUTTON GUARD (iter-2): block a click on the wizard "← Back"/"Previous"
+        # control. The task is forward-only (fill every step, then Continue/Submit); going
+        # back discards the current step and caused a page2->page1->page2 oscillation when
+        # the model used Back instead of filling the date and clicking Continue. Steer it to
+        # the right action (set any remaining field — especially the date picker — then click
+        # Continue). Fail open if we can't read the snapshot.
+        target = normalize_ref(args.get("target", "") or "")
+        if target is not None:
+            snap = capture_page_snapshot_raw(self._cli) or ""
+            for line in snap.splitlines():
+                if f"[ref={target}]" in line and _BACK_BUTTON_RE.search(line):
+                    date_ref = SelectOptionTool._find_date_combobox_ref(snap)
+                    date_hint = (f" If the 'Earliest available start date' is not set yet, "
+                                 f"call select_option(target='{date_ref}', "
+                                 f"value='2026-07-21') first." if date_ref else "")
+                    return ToolResult(
+                        False,
+                        f"I did NOT click '{target}' — it is the BACK/Previous button, which "
+                        f"would discard this step's progress and send you to an earlier step. "
+                        f"Do not go back. Instead, fill any remaining required field on THIS "
+                        f"step, then click the 'Continue →' button to advance.{date_hint}")
+        return super().run(args)
 
 
 class FillTool(_WebTool):
@@ -968,6 +1053,28 @@ class SelectOptionTool(_WebTool):
     def run(self, args: dict) -> ToolResult:
         # Capture DOM before the action so we can detect new elements afterward.
         before = capture_page_snapshot_raw(self._cli) or ""
+        # ISO-DATE TARGET GUARD (iter-2): when the value is an ISO date the model means to
+        # drive a DATE PICKER. If the targeted ref is NOT the date field (a stale/shifted
+        # ref pointing at the Back button or another combobox — refs shift after each
+        # combobox interaction), clicking it would navigate away (iter-1: clicked "← Back",
+        # bounced to page 1) and wreck the run. Verify the target's own snapshot line looks
+        # like a date field; if not, point the model at the REAL date field's ref instead of
+        # acting on the wrong element.
+        if _ISO_DATE_RE.match(args.get("value") or ""):
+            misfire = self._guard_date_target(args.get("target", ""), before)
+            if misfire is not None:
+                return misfire
+        # PLAIN-BUTTON GUARD (iter-2): the model sometimes calls select_option on a real
+        # <button> (e.g. "Continue →"/"Submit") instead of click. The custom-combobox
+        # fallback would then just CLICK the button — which "works" once but records the
+        # button as a successful select_option; the anti-loop guard then BLOCKS every later
+        # select_option on the next page's Continue button (same signature), so the form
+        # gets stuck (iter-2: stuck on Step 2 re-emitting select_option e81). A button is
+        # NOT a dropdown: steer the model to use click, and do NOT act, so nothing is
+        # recorded and the model switches tools.
+        btn = self._target_is_plain_button(args.get("target", ""), before)
+        if btn is not None:
+            return btn
         # Try the native <select> path first (the base behaviour).
         result = self._run_impl(args)
         if result.ok:
@@ -986,6 +1093,104 @@ class SelectOptionTool(_WebTool):
                 return _check_dom_delta(self._cli, before, combo)
         return result
 
+    # How many times to re-snapshot (and how long to wait between) while a freshly
+    # opened custom popup renders its content. ~5 × 0.4s ≈ 2s, well under the per-tool
+    # timeout, covers the observed open animation/portal-mount delay (iter-2).
+    _POPUP_SETTLE_TRIES = 5
+    _POPUP_SETTLE_DELAY = 0.4
+
+    def _await_popup(self, value: str) -> str:
+        """Re-snapshot until a just-opened popup's content appears, then return it.
+
+        A custom combobox/date-picker mounts its listbox or calendar dialog AFTER the
+        trigger click (React portal + open animation), so the immediate snapshot can be
+        the pre-open page. Poll a few times until the snapshot shows EITHER a calendar
+        header (date path) OR a matching option / any open listbox (option path); return
+        the last snapshot read once content is detected or the budget is spent. Always
+        returns a string (never blocks indefinitely)."""
+        want_date = bool(_ISO_DATE_RE.match(value or ""))
+        snapshot = capture_page_snapshot_raw(self._cli)
+        for _ in range(self._POPUP_SETTLE_TRIES):
+            if want_date and calendar_view_month(snapshot) is not None:
+                return snapshot
+            if not want_date and (
+                    find_option_ref_by_text(snapshot, value) is not None
+                    or _OPTION_LINE_RE.search(snapshot or "")):
+                return snapshot
+            time.sleep(self._POPUP_SETTLE_DELAY)
+            snapshot = capture_page_snapshot_raw(self._cli)
+        return snapshot
+
+    def _guard_date_target(self, target: str, snapshot: str) -> "ToolResult | None":
+        """Reject a date select_option whose target is NOT a date field (iter-2).
+
+        Returns a steering :class:`ToolResult` when ``target`` does not look like the
+        page's date field (so we DON'T click the wrong element — e.g. the Back button —
+        and navigate away), or ``None`` to let the normal date path proceed. Identifies
+        the date field by scanning the snapshot for a combobox whose accessible name
+        mentions 'date'. If the target IS that combobox we proceed; otherwise we name the
+        correct ref. Fails OPEN (returns None) if no date combobox can be found, so a
+        page with an unusual date markup is not blocked."""
+        ref = normalize_ref(target)
+        date_ref = self._find_date_combobox_ref(snapshot)
+        if date_ref is None:
+            return None  # can't identify a date field -> don't block
+        if ref == date_ref:
+            return None  # targeting the real date field -> proceed
+        # Is the model's chosen target plausibly a date field by its own line?
+        for line in (snapshot or "").splitlines():
+            if ref and f"[ref={ref}]" in line and "date" in line.lower():
+                return None  # the target's own label says 'date' -> trust it
+        return ToolResult(
+            False,
+            f"'{target}' is NOT the date field, so I did not click it (clicking the wrong "
+            f"element here can navigate the form backwards). The date picker on this page is "
+            f"'{date_ref}'. Call select_option(target='{date_ref}', value='<yyyy-mm-dd>') — "
+            f"the harness will open the calendar and pick the day for you. Re-read the live "
+            f"snapshot and use '{date_ref}' for the date.",
+        )
+
+    @staticmethod
+    def _target_is_plain_button(target: str, snapshot: str) -> "ToolResult | None":
+        """Steer to `click` when ``target`` is a plain <button> (not a dropdown).
+
+        Returns a steering :class:`ToolResult` when the target's snapshot line is a button
+        WITHOUT any combobox/listbox/select affordance (a real action button like
+        "Continue →"/"Submit"), so select_option does not accidentally click it and poison
+        the anti-loop guard (iter-2). Returns ``None`` (proceed) for combobox-buttons
+        (`button` lines that ALSO say combobox/listbox/haspopup) and when the target can't
+        be found (fail open)."""
+        ref = normalize_ref(target)
+        if ref is None:
+            return None
+        for line in (snapshot or "").splitlines():
+            if f"[ref={ref}]" not in line:
+                continue
+            low = line.lower()
+            if "button" not in low:
+                return None  # not a button line -> let normal path handle it
+            # A combobox/listbox rendered as a button IS a dropdown -> proceed normally.
+            if any(k in low for k in ("combobox", "listbox", "haspopup", "select", "expanded")):
+                return None
+            return ToolResult(
+                False,
+                f"'{target}' is a BUTTON, not a dropdown — select_option does not apply. "
+                f"Use click(target='{target}') to press it. If this is the "
+                f"Continue/Next/Submit button, click it to advance to the next step.",
+            )
+        return None  # target not in snapshot -> fail open
+
+    @staticmethod
+    def _find_date_combobox_ref(snapshot: str) -> str | None:
+        """Ref of the combobox whose accessible name mentions 'date' (the date picker)."""
+        for line in (snapshot or "").splitlines():
+            low = line.lower()
+            if "combobox" in low and "date" in low:
+                m = re.search(r"\[ref=(e\d+)\]", line)
+                if m:
+                    return m.group(1)
+        return None
+
     def _select_via_combobox(self, target: str, value: str) -> ToolResult | None:
         """Open a custom combobox by clicking ``target`` and click the matching option.
 
@@ -997,7 +1202,14 @@ class SelectOptionTool(_WebTool):
                               f"session is closed; call `open_browser`, then `goto` your URL.")
         if not ok or output_signals_no_match(out):
             return None  # couldn't even open it -> let the native error stand
-        snapshot = capture_page_snapshot_raw(self._cli)
+        # SETTLE-RETRY (iter-2 fix): a custom popup (listbox OR calendar dialog) renders/
+        # animates ASYNCHRONOUSLY after the trigger click. The FIRST snapshot taken
+        # immediately after the click frequently shows the page WITHOUT the popup yet — so
+        # calendar_view_month()/find_option_ref_by_text() both return nothing, the calendar
+        # branch is skipped, and the date/option is never set (iter-1 blocker: page 2 date
+        # never set -> form stuck on Step 2/8). Re-snapshot a few times until the popup's
+        # content (a calendar header OR a matching option) actually appears.
+        snapshot = self._await_popup(value)
         # CALENDAR date picker (iter-1): a DatePicker opens a calendar dialog, not a list of
         # options. A 3B model cannot blindly navigate from the default month to the target by
         # clicking month-nav arrows, so drive it deterministically here: parse the requested
@@ -1057,15 +1269,30 @@ class SelectOptionTool(_WebTool):
             if nav is None:
                 return None  # unexpected markup -> let caller fall back
             self._cli.run("click", nav)
-            # Re-read the calendar header after the nav click to get the new view.
-            snap = capture_page_snapshot_raw(self._cli)
-            view = calendar_view_month(snap)
+            # Re-read the calendar header after the nav click to get the new view. The
+            # month label updates ASYNCHRONOUSLY, so poll briefly until it actually moves
+            # off (cur_y, cur_m) — otherwise a too-fast re-read sees the OLD month and the
+            # loop double-steps or stalls (iter-2: calendar nav race).
+            prev_y, prev_m = cur_y, cur_m
+            view = None
+            for _ in range(4):
+                snap = capture_page_snapshot_raw(self._cli)
+                view = calendar_view_month(snap)
+                if view is not None and view != (prev_y, prev_m):
+                    break
+                time.sleep(0.15)
             if view is None:
                 break
             cur_y, cur_m = view
-        # Now click the day cell carrying the exact ISO date.
-        snap = capture_page_snapshot_raw(self._cli)
-        day_ref = find_day_button_ref(snap, iso_date)
+        # Now click the day cell carrying the exact ISO date. Poll briefly in case the
+        # final month grid is still rendering.
+        day_ref = None
+        for _ in range(4):
+            snap = capture_page_snapshot_raw(self._cli)
+            day_ref = find_day_button_ref(snap, iso_date)
+            if day_ref is not None:
+                break
+            time.sleep(0.15)
         if day_ref is None:
             return ToolResult(True, f"you opened the '{target}' date picker and navigated to "
                               f"{iso_date[:7]}. Click the day cell whose label is exactly "

@@ -659,10 +659,17 @@ class RalphAgent:
     # escalating failure-loop pressure below can fire after 3 genuine repeats) but we do NOT
     # block the FIRST repeat: the page may have changed and the action may now succeed.
     _SOFT_REPEAT_TOOLS = frozenset({"click", "upload"})
-    # Max identical re-runs allowed for a soft-repeat tool before it is steered. 2 covers the
-    # real recovery case (re-click Continue/Submit after the first click was validation-blocked)
-    # while stopping a no-op click (e.g. on a heading) from looping forever.
-    _SOFT_REPEAT_LIMIT = 2
+    # Max identical re-runs allowed for a soft-repeat tool before it is steered. Raised
+    # 2 -> 12 (iter-2): a NUMBER-STEPPER (the spinbutton +/- buttons on the Experience step)
+    # CANNOT be filled (Playwright: "Element is not an <input>") — the ONLY way to set
+    # "9 years" is to click the Increase button 9 times, so a tight limit of 2 made those
+    # scored fields unreachable (iter-2: the model looped clicking e630/e636 and never got
+    # past 2). 12 lets a realistic stepper value be reached (and matches max_actions_per_turn
+    # so a full increment batch can run in one turn) while still bounding a genuinely useless
+    # click loop (e.g. clicking a heading) to 12 reps — well within a run. True FAILURE loops
+    # (ok=False, e.g. re-clicking an invalid ref) are caught separately and faster by the
+    # escalating target_block_counts HARD STOP below, independent of this limit.
+    _SOFT_REPEAT_LIMIT = 12
 
     def _action_signature(self, tool_name: str | None, args: dict) -> str | None:
         """A stable signature for an executed action, or ``None`` if this tool is exempt

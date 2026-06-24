@@ -180,11 +180,13 @@ class AgentLoopTest(unittest.TestCase):
 
         tool = ClickTool()
         registry = ToolRegistry([tool])
-        # Emit the SAME click many times; it must be capped at 1 + _SOFT_REPEAT_LIMIT runs.
-        actions = [{"tool": "click", "args": {"target": "e35"}} for _ in range(8)]
+        # Emit the SAME click MORE times than the limit; it must be capped at
+        # 1 + _SOFT_REPEAT_LIMIT runs (first run + the bounded soft repeats).
+        n = RalphAgent._SOFT_REPEAT_LIMIT + 4
+        actions = [{"tool": "click", "args": {"target": "e35"}} for _ in range(n)]
         actions.append(VALIDATE)
         client = FakeLLMClient(actions)
-        agent = RalphAgent(client, registry, "SYS", Config(max_steps=12),
+        agent = RalphAgent(client, registry, "SYS", Config(max_steps=n + 2),
                            FakeValidator(passed=True))
         agent.run("loop heading")
         self.assertEqual(tool.calls, 1 + RalphAgent._SOFT_REPEAT_LIMIT)

@@ -68,6 +68,10 @@ class NumCtxPinnedTest(unittest.TestCase):
     def test_default_num_ctx_is_pinned_to_a_gpu_fitting_value(self):
         # #77: pinned to one value that actually fits the 8 GB GPU (was 131072,
         # which the GPU never delivered -> varying auto-fit sizes -> stacked runners).
+        # #140: kept at 32768 for the qwen3:4b upgrade — confirmed safe with
+        # OLLAMA_FLASH_ATTENTION=1 (~4360-5086 MiB on the RTX 3080 8GB vs 7266 MiB without
+        # flash attention). 32768 is an observed-fitting auto-fit size, so the
+        # single-runner invariant holds and the input budget stays at 23552 tokens.
         self.assertEqual(Config().num_ctx, 32768)
 
     def test_default_keep_alive_is_constant_string(self):
