@@ -316,18 +316,24 @@ class EndToEndProviderTest(unittest.TestCase):
 
 class PinnedNumCtxFitsHeavyPageTest(unittest.TestCase):
     """ISSUE #77 interaction with #43: lowering the default num_ctx 131072 -> 32768
-    shrinks the dynamic snapshot budget. That is a CORRECTION (the 131072 window was
-    never actually delivered by the 8 GB GPU). Confirm the DEFAULT config still leaves
-    real room and a representative heavy page still fits whole."""
+    shrinks the dynamic snapshot budget. ISSUE #92 then REBALANCES the output
+    reservation (reason 2048->4096, action 16384->4096) so the input budget grows
+    from 13312 to 23552 tokens. Confirm the DEFAULT config leaves real room and a
+    representative heavy page still fits whole alongside a realistic prompt+history."""
 
     def test_default_num_ctx_is_the_pinned_value(self):
         self.assertEqual(Config().num_ctx, 32768)
 
+    def test_default_output_reservation_is_rebalanced(self):
+        # ISSUE #92: reason and action tokens are both 4096 now (were 2048 / 16384).
+        self.assertEqual(Config().reason_tokens, 4096)
+        self.assertEqual(Config().action_tokens, 4096)
+
     def test_default_input_budget_is_positive_and_sane(self):
-        # 32768 - (2048 + 16384) - 1024 = 13312 input tokens after the output
-        # reservation and safety margin: positive, with thousands of tokens for the
-        # prompt + a snapshot.
-        self.assertEqual(input_budget_tokens(Config()), 13_312)
+        # ISSUE #92: 32768 - (4096 + 4096) - 1024 = 23552 input tokens after the
+        # rebalanced output reservation and safety margin — nearly 2x the old 13312,
+        # with plenty of room for the prompt + a heavy snapshot + several turns.
+        self.assertEqual(input_budget_tokens(Config()), 23_552)
 
     def test_heavy_youtube_snapshot_fits_under_default(self):
         # The diagnosed worst case: a ~45k-char YouTube watch ARIA snapshot ≈ ~11k
@@ -342,6 +348,35 @@ class PinnedNumCtxFitsHeavyPageTest(unittest.TestCase):
         rendered = render_budgeted_snapshot(heavy_snapshot, b.budget_chars)
         self.assertEqual(rendered, heavy_snapshot)   # whole, no truncation marker
         self.assertNotIn("truncated", rendered)
+
+    def test_realistic_multistep_turn_has_headroom(self):
+        # ISSUE #92 net goal: a heavy ~11k-token page snapshot PLUS a realistic
+        # ~2-3k-token system prompt PLUS several turns of accumulated history all fit
+        # in ONE turn without dropping the snapshot. Model it concretely at 4 chars/
+        # token defaults:
+        #   - heavy page snapshot: ~45k chars (~11k tokens)
+        #   - realistic system prompt (web toolset docs etc.): ~12k chars (~3k tokens)
+        #   - several turns of narrative history: ~16k chars (~4k tokens)
+        # rest = prompt + history = ~28k chars (~7k tokens); snapshot must still fit.
+        cfg = Config()
+        prompt_chars = 12_000
+        history_chars = 16_000
+        rest = "p" * (prompt_chars + history_chars)   # ~28k chars ≈ 7k tokens
+        heavy_snapshot = "s" * 45_000                 # ~11k tokens
+        b = compute_snapshot_budget(cfg, rest)
+        self.assertFalse(b.overflow)
+        # The full snapshot survives — the whole turn is ~18k tokens, well inside the
+        # 23552-token input budget, so nothing is trimmed.
+        self.assertGreaterEqual(
+            b.budget_chars, len(heavy_snapshot),
+            msg="heavy page + realistic prompt + history no longer fit under #92 defaults")
+        rendered = render_budgeted_snapshot(heavy_snapshot, b.budget_chars)
+        self.assertEqual(rendered, heavy_snapshot)    # whole, no truncation marker
+        self.assertNotIn("truncated", rendered)
+        # And there is still spare budget left over after the snapshot — real headroom.
+        spare_tokens = b.snapshot_budget_tokens - estimate_tokens(heavy_snapshot, 4.0)
+        self.assertGreater(spare_tokens, 0,
+                           msg="no spare input budget after heavy snapshot — #92 goal unmet")
 
 
 if __name__ == "__main__":
