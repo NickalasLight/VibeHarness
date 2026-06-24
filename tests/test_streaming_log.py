@@ -14,15 +14,30 @@ import unittest
 from datetime import datetime
 from pathlib import Path
 
-from vibeharness.agent import RalphAgent
+from vibeharness.agent import RalphAgent, RunResult
 from vibeharness.config import Config
 from vibeharness.filesystem import FileSystem
 from vibeharness.fs_tools import build_default_tools
 from vibeharness.registry import ToolRegistry
 from vibeharness.runlog import RunLogger
+from vibeharness.tools import Tool, ToolResult
 
 from tests._fakes import FakeLLMClient as _ScriptedClient
 from tests._fakes import FakeValidator as _PassValidator
+
+
+class _BoomTool(Tool):
+    """Raises an unexpected error mid-turn (models the #16 interruption)."""
+
+    name = "boom"
+    description = "raises mid-turn"
+
+    @property
+    def parameters(self):
+        return []
+
+    def run(self, args) -> ToolResult:
+        raise RuntimeError("kaboom from a tool mid-turn")
 
 
 class StreamingLogTest(unittest.TestCase):
@@ -89,6 +104,38 @@ class StreamingLogTest(unittest.TestCase):
             data = json.loads(logger.json_path.read_text(encoding="utf-8"))
             self.assertFalse(data["finished"])
             self.assertEqual(len(data["turns"]), 1)
+
+    def test_unexpected_mid_turn_crash_still_flushes_completed_actions(self):
+        # #16: a turn does one real action, then an UNEXPECTED tool error aborts the
+        # turn before its normal end-of-turn on_turn fires. Mirroring the CLI run
+        # path (seed log at start + on_turn checkpoint each turn), the real .vibe log
+        # on disk must still contain that turn's completed action — not just the seed.
+        # Pre-fix, agent.run raised before on_turn fired and the action was dropped.
+        ls = lambda d: {"tool": "list_directory", "args": {"path": d}}
+        with tempfile.TemporaryDirectory() as d:
+            workspace = Path(d)
+            registry = ToolRegistry(build_default_tools(FileSystem(), 1000) + [_BoomTool()])
+            actions = [[ls(d), {"tool": "boom", "args": {}}]]  # success then crash, one turn
+            agent = RalphAgent(_ScriptedClient(actions), registry, "SYS",
+                               Config(max_steps=5), _PassValidator())
+            logger = RunLogger(workspace, datetime(2026, 1, 1, 0, 0, 0))
+
+            # seed log at run start, exactly like the CLI does
+            logger.write("demo", Config(), RunResult(task="demo"))
+            checkpoint = lambda res: logger.write("demo", Config(), res)
+
+            with self.assertRaises(RuntimeError):
+                agent.run("demo", on_turn=checkpoint)
+
+            # the real on-disk log holds the interrupted turn's completed action
+            data = json.loads(logger.json_path.read_text(encoding="utf-8"))
+            self.assertFalse(data["finished"])
+            self.assertEqual(len(data["turns"]), 1)
+            tools_on_disk = [a["tool"] for a in data["turns"][0]["actions"]]
+            self.assertIn("list_directory", tools_on_disk)   # the completed action survived
+            # the markdown transcript reflects it too
+            md = logger.json_path.with_suffix(".md").read_text(encoding="utf-8")
+            self.assertIn("list_directory", md)
 
 
 if __name__ == "__main__":

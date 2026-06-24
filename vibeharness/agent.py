@@ -115,46 +115,70 @@ class RalphAgent:
                  else range(1, self._cfg.max_steps + 1))
         for i in turns:
             self._reporter.turn_start(i)
-            system = self._system_provider() if self._system_provider else self._system
-            user = build_turn_prompt(task, memory.render(), self._codec.turn_action_hint())
-            decision = self._decide(system, user, constraint)
-            if decision is None:
-                # The turn exceeded its wall-clock generation budget. Record a
-                # failed turn so the abort is observable, then end gracefully.
-                budget = self._cfg.turn_timeout_seconds
-                reason = (f"turn {i} exceeded the {budget}s generation budget; aborting")
-                turn = Turn(index=i, reasoning="", raw_action="")
+            # The turn's Turn object is created as soon as we have a decision, but a
+            # mid-turn crash can strike before/after that. Track it so the failsafe
+            # below can attach the failure to the right (possibly already-appended)
+            # turn and never lose the actions that already completed this turn.
+            turn: Turn | None = None
+            try:
+                system = self._system_provider() if self._system_provider else self._system
+                user = build_turn_prompt(task, memory.render(), self._codec.turn_action_hint())
+                decision = self._decide(system, user, constraint)
+                if decision is None:
+                    # The turn exceeded its wall-clock generation budget. Record a
+                    # failed turn so the abort is observable, then end gracefully.
+                    budget = self._cfg.turn_timeout_seconds
+                    reason = (f"turn {i} exceeded the {budget}s generation budget; aborting")
+                    turn = Turn(index=i, reasoning="", raw_action="")
+                    result.turns.append(turn)
+                    self._record(turn, Action(None, {}, reason, ok=False), memory)
+                    result.stop_reason = reason
+                    if on_turn is not None:
+                        on_turn(result)
+                    break
+
+                turn = Turn(index=i, reasoning=decision.reasoning, raw_action=decision.action_json)
                 result.turns.append(turn)
+
+                actions, error = self._codec.parse(decision.action_json)
+                if error is not None:
+                    self._record(turn, Action(None, {}, f"your last response was invalid and "
+                                              f"could not be run: {error}.", ok=False), memory)
+                else:
+                    # Defensive guard: even if a batch slips past the schema cap, only the
+                    # first `limit` actions run. Record a brief note so the model knows.
+                    if limit > 0 and len(actions) > limit:
+                        dropped = len(actions) - limit
+                        actions = actions[:limit]
+                        self._record(turn, Action(None, {}, f"you emitted more than the "
+                                                  f"per-turn limit of {limit} actions; only the "
+                                                  f"first {limit} were run ({dropped} ignored).",
+                                                  ok=False), memory)
+                    for tool_name, args in actions:
+                        if tool_name == "validate":
+                            self._validate(task, args, turn, memory, result)
+                            if result.finished:
+                                break
+                            continue
+                        self._record(turn, self._execute(tool_name, args), memory)
+            except BaseException as exc:
+                # Failsafe: any unexpected mid-turn error (an uncaught tool/validator/
+                # decode exception, a KeyboardInterrupt, …) must NOT discard the work
+                # already done this turn. Tool-level errors are still caught and
+                # recorded as before; this only fires for genuinely unexpected ones.
+                # Record the failure on the current turn (creating one if the crash
+                # struck before the Turn was appended), flush the partial result via
+                # on_turn so it reaches disk, then re-raise so the caller still sees
+                # the crash and exit codes are unchanged.
+                if turn is None:
+                    turn = Turn(index=i, reasoning="", raw_action="")
+                    result.turns.append(turn)
+                reason = f"turn {i} aborted by an unexpected error: {type(exc).__name__}: {exc}"
                 self._record(turn, Action(None, {}, reason, ok=False), memory)
                 result.stop_reason = reason
                 if on_turn is not None:
                     on_turn(result)
-                break
-
-            turn = Turn(index=i, reasoning=decision.reasoning, raw_action=decision.action_json)
-            result.turns.append(turn)
-
-            actions, error = self._codec.parse(decision.action_json)
-            if error is not None:
-                self._record(turn, Action(None, {}, f"your last response was invalid and "
-                                          f"could not be run: {error}.", ok=False), memory)
-            else:
-                # Defensive guard: even if a batch slips past the schema cap, only the
-                # first `limit` actions run. Record a brief note so the model knows.
-                if limit > 0 and len(actions) > limit:
-                    dropped = len(actions) - limit
-                    actions = actions[:limit]
-                    self._record(turn, Action(None, {}, f"you emitted more than the "
-                                              f"per-turn limit of {limit} actions; only the "
-                                              f"first {limit} were run ({dropped} ignored).",
-                                              ok=False), memory)
-                for tool_name, args in actions:
-                    if tool_name == "validate":
-                        self._validate(task, args, turn, memory, result)
-                        if result.finished:
-                            break
-                        continue
-                    self._record(turn, self._execute(tool_name, args), memory)
+                raise
 
             if on_turn is not None:          # stream the log after every turn
                 on_turn(result)
