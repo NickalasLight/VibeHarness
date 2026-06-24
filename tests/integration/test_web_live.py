@@ -131,11 +131,13 @@ class WebToolsetPrereqTest(unittest.TestCase):
 
     def test_toolset_creates_the_discrete_subtools(self):
         names = [t.name for t in WebToolset().create_tools(Config())]
-        # The monolithic browse + the snapshot tool are gone; discrete tools remain.
+        # The monolithic browse, the snapshot tool, and the evaluate/JS tool are
+        # gone (#67); the remaining discrete tools are present.
         self.assertNotIn("browse", names)
         self.assertNotIn("snapshot", names)
+        self.assertNotIn("evaluate", names)
         for expected in ("goto", "click", "fill", "type", "press_key",
-                         "select_option", "hover", "navigate_back", "evaluate"):
+                         "select_option", "hover", "navigate_back"):
             self.assertIn(expected, names)
 
 

@@ -2,7 +2,9 @@
 
 The monolithic ``browse(action=...)`` tool was split into one first-class Tool per
 playwright-cli operation (goto, click, fill, type, press_key, select_option, …) and
-the agent-facing ``snapshot`` tool was removed entirely. The arg-mapping happy paths
+the agent-facing ``snapshot`` tool was removed entirely. The ``evaluate`` (run-JS)
+tool was also removed (issue #67) so the limited agent can never execute arbitrary
+JavaScript. The arg-mapping happy paths
 are proven end to end in tests/integration/test_web_live.py; what remains here are the
 pure-unit paths a live browser can't cheaply force: the missing-required-param guard,
 the CLI->argv mapping (against a recorder, since there is no single dispatcher to
@@ -18,7 +20,7 @@ from vibeharness.config import Config
 from vibeharness.web import (
     PlaywrightCli, WebToolset,
     GotoTool, ClickTool, FillTool, TypeTool, PressKeyTool, SelectOptionTool,
-    CheckTool, UncheckTool, HoverTool, DragTool, UploadTool, EvaluateTool,
+    CheckTool, UncheckTool, HoverTool, DragTool, UploadTool,
     ScreenshotTool, NavigateBackTool, NavigateForwardTool, ReloadTool,
     _WEB_TOOL_CLASSES,
 )
@@ -89,11 +91,6 @@ class SubtoolMappingTest(unittest.TestCase):
         tool.run({"file": "/tmp/cv.pdf"})
         self.assertEqual(cli.calls, [["upload", "/tmp/cv.pdf"]])
 
-    def test_evaluate_maps_to_eval(self):
-        tool, cli = self._make(EvaluateTool)
-        tool.run({"expression": "() => document.title"})
-        self.assertEqual(cli.calls, [["eval", "() => document.title"]])
-
     def test_navigate_back_forward_reload_map_through(self):
         for cls, expect in ((NavigateBackTool, ["go-back"]),
                             (NavigateForwardTool, ["go-forward"]),
@@ -129,15 +126,15 @@ class SubtoolMappingTest(unittest.TestCase):
         res = tool.run({"url": "https://example.com"})
         self.assertIn("truncated", res.observation)
 
-    def test_failed_eval_surfaces_as_error_observation(self):
-        # A null/throwing eval (CLI exits non-zero) must come back as a normal
-        # ok=False observation the agent can adapt to — not a hang (issue #4).
-        tool = EvaluateTool(FakeCli(ok=False, output="Error: Cannot read properties of null"),
-                            observation_limit=1000)
-        res = tool.run({"expression": "() => document.querySelector('video').play()"})
+    def test_failed_action_surfaces_as_error_observation(self):
+        # A failing CLI action (exits non-zero) must come back as a normal ok=False
+        # observation the agent can adapt to — not a hang (issue #4).
+        tool = ClickTool(FakeCli(ok=False, output="Error: element not found"),
+                         observation_limit=1000)
+        res = tool.run({"target": "e404"})
         self.assertFalse(res.ok)
         self.assertIn("failed", res.observation)
-        self.assertIn("null", res.observation)
+        self.assertIn("not found", res.observation)
 
 
 class SubtoolSchemaTest(unittest.TestCase):
@@ -188,7 +185,7 @@ class TimeoutTest(unittest.TestCase):
         # instead it must return promptly with a clear timeout error.
         cli = _SleepCli(timeout=1, sleep_seconds=30)
         start = time.monotonic()
-        ok, out = cli.run("eval", "() => null")
+        ok, out = cli.run("goto", "https://example.com")
         elapsed = time.monotonic() - start
 
         self.assertFalse(ok)
@@ -201,13 +198,13 @@ class TimeoutTest(unittest.TestCase):
         # The agent only ever sees a ToolResult; assert the timeout becomes a
         # clear ok=False observation naming the action, so the agent can adapt.
         cli = _SleepCli(timeout=1, sleep_seconds=30)
-        tool = EvaluateTool(cli, observation_limit=1000)
+        tool = GotoTool(cli, observation_limit=1000)
         start = time.monotonic()
-        res = tool.run({"expression": "() => document.querySelector('video').play()"})
+        res = tool.run({"url": "https://example.com"})
         elapsed = time.monotonic() - start
 
         self.assertFalse(res.ok)
-        self.assertIn("evaluated JavaScript on", res.observation)  # the 'evaluate' verb
+        self.assertIn("navigated to", res.observation)  # the 'goto' verb
         self.assertIn("timed out after 1s", res.observation)
         self.assertLess(elapsed, 15, "web tool hung past its timeout (issue #4)")
 
@@ -231,7 +228,7 @@ class TimeoutTest(unittest.TestCase):
         orig = web_mod.subprocess.Popen
         web_mod.subprocess.Popen = lambda *a, **k: FakeProc()
         try:
-            ok, out = cli.run("eval", "() => null")
+            ok, out = cli.run("goto", "https://example.com")
         finally:
             web_mod.subprocess.Popen = orig
         self.assertFalse(ok)
