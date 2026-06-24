@@ -185,4 +185,10 @@ class Config:
     # fill/…) keep working unchanged. This is an A/B SEAM, not a replacement: set False
     # (default) to inject the raw ARIA snapshot exactly as before. Budgeting/diagnostics
     # are unchanged — only the text fed into the page section differs.
-    web_snapshot_prose: bool = False
+    #
+    # ISSUE #125 (beta_qwen3coder): default TRUE. Iter 3 showed qwen2.5-coder:3b-instruct
+    # could not reliably pick input refs from the RAW ARIA tree — it looped on a
+    # hallucinated ref, clicked headings, and tried to `fill` a label <div> (e42) instead
+    # of the input. The pruned, ref-keyed prose (one line per interactable, with fillable
+    # affordances per #70) is exactly what a small model needs to map field -> correct ref.
+    web_snapshot_prose: bool = True

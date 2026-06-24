@@ -179,8 +179,10 @@ class TestRobustness(unittest.TestCase):
 
 
 class TestConfigSeam(unittest.TestCase):
-    def test_default_off(self):
-        self.assertFalse(Config().web_snapshot_prose)
+    def test_default_on_for_this_branch(self):
+        # beta_qwen3coder default is True (#125 iter 3): the small instruct model needs
+        # the pruned ref-keyed prose to pick input refs reliably. (On beta/mythos: False.)
+        self.assertTrue(Config().web_snapshot_prose)
 
     def test_provider_applies_transform_when_enabled(self):
         # Reproduce cli.py's seam: wrapping a raw provider with the transform when the
@@ -191,8 +193,8 @@ class TestConfigSeam(unittest.TestCase):
         out = wrapped()
         self.assertIn("OPEN IN FRONT", out)
         self.assertIn("[e1300] button", out)
-        # and OFF leaves raw ARIA untouched
-        cfg_off = Config()
+        # and OFF (explicit) leaves raw ARIA untouched
+        cfg_off = Config(web_snapshot_prose=False)
         unwrapped = (lambda: aria_yaml_to_prose(raw_provider())) if cfg_off.web_snapshot_prose else raw_provider
         self.assertEqual(unwrapped(), _CONSENT)
 

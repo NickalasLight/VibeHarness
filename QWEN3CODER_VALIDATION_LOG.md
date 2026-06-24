@@ -79,10 +79,25 @@ call and the codec parses the tool call from it; no discarded duplicate. `llm.py
 two-phase preserved for VibeThinker/mythos. Full suite **548 passed**. Commit: `fix(#125):
 single-phase generation for non-thinking instruct model`.
 
-### Iteration 3 — IN PROGRESS
-Re-run with single-phase. Watching for: no wasted phase-1 call; full per-turn throughput; does
-the model now self-recover on the State combobox (click-open then click TX)? If it still loops
-on `select_option`, the NEXT fix is combobox handling (click-based selection / guidance).
+### Iteration 3 — DONE (task bqas38w7b) — single-phase works; new issue = ref comprehension
+**Single-phase confirmed:** exactly ONE action/turn now, no discarded phase-1 call (turns 1-2
+nailed `open_browser`→`goto`). But the model **burned ~10 turns on wrong refs**: hallucinated
+`e163` (×5 identical failing clicks), clicked headings `e34`/`e35`, then tried to `fill` the
+last-name **label** `e42` (a `<div>`, not the input). It only landed First name="Jason" once
+(turn 13). Root cause: from the RAW ARIA tree it can't tell input refs from label/wrapper refs.
+(Two-phase iter 2 stumbled onto right refs via the prefill; single-phase exposes the underlying
+snapshot-comprehension weakness — the transport change is still correct.)
+
+**Fix applied:** `Config.web_snapshot_prose=True` (branch default). The auto-injected page
+snapshot now uses the deterministic WebArena-style ARIA→prose transform (#64) — pruned, one
+ref-keyed line per interactable, with fillable affordances (#70) — which small models map to
+the correct ref far more reliably. Updated 2 prose tests to the branch default; suite **548
+passed**. Commit: `fix(#125): default web_snapshot_prose=True for ref comprehension`.
+
+### Iteration 4 — IN PROGRESS
+Re-run with prose snapshot. Watching for: fewer wasted/looped turns; correct input refs chosen
+(input not label); more fields filled per turn; progress toward Next/step 2. Still pending:
+custom State combobox handling (select_option fails on the div-listbox).
 
 ## Current status
-RUNNING iteration 3 (3-min cap). Awaiting completion notification.
+RUNNING iteration 4 (3-min cap). Awaiting completion notification.
