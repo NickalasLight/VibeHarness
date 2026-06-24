@@ -16,8 +16,10 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
 from .codec import DecodeConstraint
+from .config import Config
 from .llm import LLMClient, TokenSink
 from .tools import Param, Tool, ToolResult
+from .toolset import Toolset
 
 VALIDATOR_SYSTEM = """\
 You are a strict validation agent. Another agent has been working to complete a \
@@ -114,3 +116,36 @@ class ValidateTool(Tool):
 
     def run(self, args: dict) -> ToolResult:
         return ToolResult(True, "validation requested.")
+
+
+class ValidatorToolset(Toolset):
+    """The validator declared as a first-class agent type — exactly like the web/fs
+    toolsets (issue #31).
+
+    This unifies *declaration only*: the validator's PROMPT and its verdict TOOL are
+    now exposed through the same per-agent-type framework (``system_guidance`` from
+    #19 + the toolset catalog from #22), so ``--agent validator`` and ``--list-agents``
+    discover it like any other agent.
+
+    EXECUTION is intentionally unchanged: validation still runs as a SINGLE-SHOT
+    pass/fail verdict via :class:`LLMValidator.validate`, which uses ``VALIDATOR_SYSTEM``
+    directly — it is NOT routed through the main agent's multi-turn tool loop. The
+    ``system_guidance`` here returns that very same ``VALIDATOR_SYSTEM`` text so the
+    prompt lives in one place and the declaration cannot drift from what actually runs.
+    """
+    name = "validator"
+    description = ("Review another agent's completed work and return a strict "
+                   "single-shot pass/fail verdict (the `validate` tool).")
+
+    def system_guidance(self) -> str | None:
+        # The validator's own system prompt, surfaced through the #19 mechanism.
+        # The SAME constant drives LLMValidator.validate, so the framework
+        # declaration and the live single-shot execution share one source of truth.
+        return VALIDATOR_SYSTEM
+
+    def create_tools(self, config: Config) -> list[Tool]:
+        # The verdict tool. `validate` is also the core tool injected into every
+        # registry by ToolsetCatalog.build_registry, so declaring it here makes the
+        # validator's toolset explicit/consistent with web/fs without changing what
+        # tools any registry ends up holding (the catalog de-duplicates by name).
+        return [ValidateTool()]
