@@ -32,6 +32,25 @@ vibe "Create a CHANGELOG.md and seed it with an Unreleased section."
 
 > **Status:** working prototype. VibeThinker-3B is a math/reasoning specialist and is *not* tuned for tool use, so treat this as a research toy for studying small-model agentic behaviour — not a production agent.
 
+> **⚙️ Branch `beta_qwen3coder` (issue #123).** This branch replaces VibeThinker-3B with a
+> **~3B Qwen-Coder** model end to end and defaults to the **`hermes`** tool-call codec
+> (the native Qwen2.5 `<tool_call>{"name","arguments"}` + bare `<tools>` schema format,
+> ground-truthed from the model's chat template — see
+> [`QWEN3CODER_ANALYSIS.md`](./QWEN3CODER_ANALYSIS.md)).
+>
+> **⚠️ 3B-parity caveat — there is no dense ~3B *Qwen3-Coder*.** The Qwen3-Coder line is
+> MoE-only (smallest is 30B-A3B = 30B total / 3B *active*, then 80B-A3B "Next", then
+> 480B-A35B), which breaks apples-to-apples parity with the 3B-**dense** VibeThinker-3B
+> and won't fit an 8 GB GPU. So this branch uses the closest true ~3B dense coder,
+> **`qwen2.5-coder:3b-instruct`** (VibeThinker itself derives from Qwen2.5-(Coder-)3B), as
+> a documented, flagged substitute — never a silent swap. Pull it with:
+> ```bash
+> ollama pull qwen2.5-coder:3b-instruct   # ~1.9 GB (Q4_K_M), fits 8 GB GPU
+> ```
+> Governance + protected divergences: [`QWEN3CODER_DIVERGENCE.md`](./QWEN3CODER_DIVERGENCE.md).
+> Sync is one-way `beta → beta_qwen3coder` only (CLAUDE.md §6). Live end-to-end validation
+> is tracked in **#125**.
+
 ---
 
 ## Quickstart
@@ -39,11 +58,12 @@ vibe "Create a CHANGELOG.md and seed it with an Unreleased section."
 Install everything (requires [Ollama](https://ollama.com/download) and Python ≥ 3.10):
 
 ```bash
-# 1. Install Ollama from https://ollama.com/download, then pull + register the model
-ollama pull hf.co/mradermacher/VibeThinker-3B-GGUF:Q8_0
+# 1. Install Ollama from https://ollama.com/download, then pull the model.
+#    Branch beta_qwen3coder default (#123): a ~3B Qwen2.5-Coder (used directly from the
+#    Ollama library — no `ollama create` needed; config.py points the harness at this tag).
+ollama pull qwen2.5-coder:3b-instruct
 git clone https://github.com/NickalasLight/VibeHarness.git
 cd VibeHarness
-ollama create vibethinker -f Modelfile
 
 # 2. Install the harness (creates the `vibe` command)
 pip install -e .
@@ -85,14 +105,22 @@ ollama --version
 ollama serve        # usually already running as a background service / tray app
 ```
 
-### 3. The `vibethinker` model
-VibeThinker ships as safetensors; Ollama needs GGUF. Pull a community GGUF and register it under the name `vibethinker` using the included [`Modelfile`](./Modelfile):
+### 3. The model — `qwen2.5-coder:3b-instruct` (branch `beta_qwen3coder`, #123)
+This branch swaps VibeThinker-3B for a **~3B Qwen2.5-Coder**, available directly as an
+official Ollama library tag (no GGUF registration needed — `config.py` points the harness
+straight at the tag):
 ```bash
-ollama pull hf.co/mradermacher/VibeThinker-3B-GGUF:Q8_0
-ollama create vibethinker -f Modelfile
-ollama run vibethinker "hi"      # quick sanity check
+ollama pull qwen2.5-coder:3b-instruct      # ~1.9 GB (Q4_K_M), 32K ctx, fits 8 GB GPU
+ollama run qwen2.5-coder:3b-instruct "hi"  # quick sanity check
 ```
-The `Modelfile` only points at the weights — the harness sets all sampling parameters per request.
+**Why not literally "Qwen3-Coder"?** There is **no dense ~3B Qwen3-Coder** — that line is
+MoE-only (smallest 30B-A3B; then 80B-A3B "Next"; then 480B-A35B), which breaks
+apples-to-apples parity with the 3B-dense VibeThinker-3B and won't fit an 8 GB card.
+`qwen2.5-coder:3b-instruct` is the closest true ~3B **dense** coder (VibeThinker itself
+derives from Qwen2.5-(Coder-)3B). This is a documented, flagged substitute — see
+[`QWEN3CODER_ANALYSIS.md`](./QWEN3CODER_ANALYSIS.md) §A. The optional
+[`Modelfile`](./Modelfile) only points at the weights — the harness sets all sampling
+parameters per request.
 
 ### Hardware
 The Q8_0 quant of this 3B model needs **~3.5 GB of VRAM** (or runs on CPU, just slower). Any modern GPU with ≥4 GB, or a CPU with ≥8 GB RAM, is fine. The default context window is large (`num_ctx = 131072`); on an 8 GB card the KV overflow spills to system RAM, so it fills more slowly but does not OOM.

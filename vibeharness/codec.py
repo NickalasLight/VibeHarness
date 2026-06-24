@@ -61,6 +61,18 @@ class ToolCallCodec(ABC):
         codec so the end-of-turn nudge matches this codec's wire format."""
         return "Respond in the exact format described above."
 
+    def tool_definitions(self, registry: "ToolRegistry") -> str | None:
+        """The tool-definition block this codec wants in the system prompt, or
+        ``None`` to use the registry's default Markdown ``docs()`` (issue #105).
+
+        Most codecs return ``None`` — the Markdown tool docs are codec-agnostic.
+        A codec whose model was fine-tuned to read tool definitions in a specific
+        wire shape (e.g. the Hermes ``<tools>`` function-schema block) overrides this
+        and returns that block, built from the registry. The :class:`SystemPromptBuilder`
+        substitutes it for the Markdown docs when present, keeping the rendering choice
+        codec-local (open/closed: no edits to the prompt builder per new format)."""
+        return None
+
     @abstractmethod
     def constraint(self, registry: "ToolRegistry", max_actions: int) -> DecodeConstraint:
         """The decode-time constraint for the action phase (may be unconstrained)."""

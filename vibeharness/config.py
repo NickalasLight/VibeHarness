@@ -6,7 +6,21 @@ from dataclasses import dataclass
 @dataclass(frozen=True)
 class Config:
     # model / sampling
-    model: str = "vibethinker"
+    # ISSUE #123 / branch beta_qwen3coder (ISOLATED): the default model on this line is
+    # a ~3B Qwen2.5-Coder, paired with the `hermes` codec below so the harness speaks
+    # the model's native trained dialect. (On `beta` the default is "vibethinker" +
+    # "json"; this branch never merges back, so these defaults stay local to it.)
+    #
+    # ⚠️ 3B-PARITY NOTE: there is NO dense ~3B *Qwen3-Coder* model — the entire
+    # Qwen3-Coder line is MoE (smallest is 30B-A3B: 30B total / 3B ACTIVE; then
+    # 80B-A3B "Next"; then 480B-A35B). Using any of those breaks apples-to-apples
+    # parity with VibeThinker-3B (a 3B DENSE model) and won't fit the 8 GB card. So
+    # this branch uses the closest true ~3B DENSE coder: Qwen2.5-Coder-3B-Instruct
+    # (1.9 GB at Q4_K_M; same Qwen2.5/Hermes tool dialect; VibeThinker itself derives
+    # from Qwen2.5-(Coder-)3B, so this is the cleanest 3B-for-3B substitute). The
+    # Qwen3-Coder discrepancy is flagged in QWEN3CODER_ANALYSIS.md and
+    # QWEN3CODER_DIVERGENCE.md. Swap the tag here if/when a dense ~3B Qwen3-Coder ships.
+    model: str = "qwen2.5-coder:3b-instruct"
     temperature: float = 0.3          # phase-1 reasoning temperature (some diversity helps)
     action_temperature: float = 0.0   # phase-2 action: greedy, for verbatim string fidelity
     top_p: float = 0.95
@@ -30,7 +44,12 @@ class Config:
 
     # tool-call wire format (see vibeharness.codec.get_codec). "json" is the
     # decode-constrained baseline; other codecs add alternative formats.
-    codec: str = "json"
+    # ISSUE #123 (beta_qwen3coder): default to "hermes" — the native Qwen2.5 / Hermes
+    # <tool_call>{"name","arguments"} format + bare <tools> function-schema definitions
+    # that Qwen2.5-Coder reads (ground-truthed from the model's tokenizer_config.json
+    # chat template; see QWEN3CODER_ANALYSIS.md), so the harness aligns to the model's
+    # trained dialect. On `beta` this default is "json".
+    codec: str = "hermes"
 
     # context + per-turn token budgets.
     # num_ctx is the whole window (system prompt + history + generation share it).
@@ -75,8 +94,17 @@ class Config:
     # input_budget = 32768 - 8192 - 1024 = 23552 tokens (was 13312) — a ~11k-token
     # snapshot + a realistic ~2-3k-token system prompt + several k of history all fit
     # without dropping the snapshot. See tests/test_snapshot_budget.py.
-    reason_tokens: int = 4096         # phase 1 (free reasoning, discarded) — see #92
-    action_tokens: int = 4096         # phase 2 (constrained JSON action) — see #92
+    #
+    # ISSUE #123 (beta_qwen3coder) NOTE: unlike VibeThinker, Qwen2.5-Coder-3B-Instruct
+    # is NOT a long-chain reasoning model — it does not emit verbose <think> chains by
+    # default, so phase-1 typically returns quickly (well under 4096). We KEEP 4096 as a
+    # harmless ceiling (the input-budget math is identical to beta, so all snapshot/budget
+    # tests carry over unchanged); it is a cap, not a target. If a future run shows the
+    # model never reasons at length, this can be lowered to reclaim input budget without
+    # affecting correctness. The action reservation is unchanged — phase-2 emits the
+    # compact <tool_call> blocks (a few hundred tokens), so 4096 has ~10x headroom.
+    reason_tokens: int = 4096         # phase 1 (free reasoning, discarded) — see #92/#123
+    action_tokens: int = 4096         # phase 2 (codec action; unconstrained for hermes) — #92
 
     # observation rendering
     observation_char_limit: int = 12000  # truncate big tool outputs in the narrative

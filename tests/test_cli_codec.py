@@ -80,6 +80,35 @@ class CodecCliExitTest(unittest.TestCase):
         self.assertIn("Available:", out)
 
 
+class PrintSystemCodecTest(unittest.TestCase):
+    """--print-system renders with the CONFIGURED codec, not a hardcoded default
+    (issue #123): on beta_qwen3coder the default codec is `hermes`, so the printed
+    prompt must show the <tools>/<tool_call> format the model actually receives."""
+
+    def _print_system(self, *extra):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = cli.main(["--print-system", *extra])
+        self.assertEqual(rc, 0)
+        return buf.getvalue()
+
+    def test_default_config_codec_is_reflected(self):
+        out = self._print_system()
+        if Config().codec == "hermes":
+            # branch default: the hermes <tools>/<tool_call> format is rendered
+            self.assertIn("<tools>", out)
+            self.assertIn("<tool_call>", out)
+            self.assertIn('"name"', out)
+        else:
+            # beta default (json): the JSON-array action format is rendered
+            self.assertIn('{"tool":', out.replace(" ", ""))
+
+    def test_codec_override_is_honoured(self):
+        out = self._print_system("--codec", "json")
+        # json codec describes a JSON array of {"tool","args"}; no <tools> block
+        self.assertNotIn("<tools>", out)
+
+
 class CodecHelpTest(unittest.TestCase):
     def test_help_mentions_codec_and_lists_json(self):
         parser = cli.build_parser()

@@ -609,8 +609,21 @@ def main(argv: list[str] | None = None) -> int:
         except KeyError as e:
             print(f"error: unknown toolset {e}. Available: {', '.join(catalog.names())}")
             return 2
+        # Render with the CONFIGURED codec (issue #123): on this branch the default codec
+        # is `hermes`, so --print-system must show the actual <tools>/<tool_call> prompt the
+        # model receives, not the json-codec default the SystemPromptBuilder would otherwise
+        # fall back to. Honour an explicit --codec override too. (On `beta`, where the
+        # default is `json`, this is a no-op.)
+        cfg = Config()
+        codec_name = args.codec or cfg.codec
+        try:
+            codec = get_codec(codec_name)
+        except UnknownCodec as e:
+            print(f"error: {e}")
+            return 2
         print(SystemPromptBuilder(
-            catalog.build_registry(toolsets, Config()),
+            catalog.build_registry(toolsets, cfg),
+            cfg.max_actions_per_turn, codec,
             guidance=SystemPromptBuilder.assemble_guidance(toolsets)).build())
         return 0
     if not args.task and not args.task_file:
