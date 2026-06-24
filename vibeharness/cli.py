@@ -15,7 +15,7 @@ from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 
-from .agent import RalphAgent
+from .agent import RalphAgent, RunResult
 from .codec import UnknownCodec, available_codecs, get_codec
 from .config import Config
 from .filesystem import FileSystem, FileSystemError
@@ -224,6 +224,12 @@ def run_agent(args: argparse.Namespace) -> int:
     started = datetime.now()
     logger = RunLogger(workdir, started)
     checkpoint = lambda res: _safe_log(logger, task, config, res)   # stream log each turn
+    # Write an initial log at run START (before turn 1). on_turn fires only AFTER a
+    # turn completes, so without this a turn that hangs or raises mid-way would leave
+    # NO log at all. Creating the .vibe/ folder + a seed log up front guarantees a
+    # run always leaves a trace, however early it dies.
+    _safe_log(logger, task, config, RunResult(task=task))
+    print(f" log: {logger.json_path}")
 
     for ts in toolsets:
         ts.setup(config)
@@ -231,7 +237,7 @@ def run_agent(args: argparse.Namespace) -> int:
         result = agent.run(task, on_turn=checkpoint)
     except OllamaUnavailable as e:
         print(f"\nerror: {e}", file=sys.stderr)
-        return 1
+        return 1   # the start/streamed log on disk already holds the last known state
     finally:
         for ts in reversed(toolsets):
             try:
@@ -241,15 +247,18 @@ def run_agent(args: argparse.Namespace) -> int:
 
     reporter.run_end(result)
     _safe_log(logger, task, config, result)   # final write
-    print(f" log: {logger.json_path}")
     return 0 if result.finished else 2
 
 
 def _safe_log(logger: RunLogger, task: str, config: Config, result) -> None:
+    """Write the run log without ever aborting the run — but never *silently*: a
+    write failure is surfaced as a warning so a missing .vibe log is diagnosable
+    instead of vanishing (the old bare ``except: pass`` hid real UnicodeEncodeErrors)."""
     try:
         logger.write(task, config, result)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"\nwarning: could not write run log to {logger.json_path} "
+              f"({type(e).__name__}: {e})", file=sys.stderr)
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -52,6 +52,34 @@ class RunLoggerTest(unittest.TestCase):
         data = json.loads(p2.read_text(encoding="utf-8"))
         self.assertTrue(data["finished"])   # reflects the latest state
 
+    def test_defensive_unicode_does_not_crash_the_write(self):
+        # A transcript/observation carrying lone surrogates + astral chars (the kind
+        # a browser snapshot can produce) must NOT raise UnicodeEncodeError; the log
+        # is still written. This is the real failure the old silent _safe_log hid.
+        nasty = "snapshot \udce9 \udfff \U0001f600 café"   # lone surrogates + emoji + accent
+        turn = Turn(index=1, reasoning=f"<think>{nasty}</think>",
+                    raw_action='[{"tool":"read_file","args":{"path":"x"}}]')
+        turn.actions.append(Action("read_file", {"path": "x"},
+                                   f"you read the page: {nasty}", ok=True))
+        result = RunResult(task=nasty, turns=[turn], finished=False)
+        logger = RunLogger(self.workspace, STAMP)
+        path = logger.write(nasty, Config(), result)   # must not raise
+        self.assertTrue(path.exists())
+        self.assertTrue(path.with_suffix(".md").exists())
+        self.assertIn("snapshot", path.with_suffix(".md").read_text(encoding="utf-8"))
+
+    def test_empty_result_writes_a_valid_start_log(self):
+        # The CLI writes a seed log at run START with a zero-turn RunResult, so a run
+        # that hangs/raises during turn 1 still leaves a trace. That seed must be a
+        # valid, parseable log.
+        path = RunLogger(self.workspace, STAMP).write("seed task", Config(),
+                                                      RunResult(task="seed task"))
+        self.assertTrue(path.exists())
+        data = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(data["task"], "seed task")
+        self.assertEqual(data["turns"], [])
+        self.assertFalse(data["finished"])
+
 
 if __name__ == "__main__":
     unittest.main()
