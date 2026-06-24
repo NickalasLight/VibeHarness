@@ -28,7 +28,7 @@ from .settings import Settings, settable_keys
 from .snapshot_budget import compute_snapshot_budget, render_budgeted_snapshot
 from .toolset import ToolsetCatalog, agent_default_toolsets, default_catalog
 from .validation import LLMValidator
-from .web import make_raw_snapshot_provider, make_snapshot_provider
+from .web import make_raw_snapshot_provider
 
 
 def build_parser() -> argparse.ArgumentParser:

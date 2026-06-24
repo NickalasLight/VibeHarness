@@ -212,6 +212,27 @@ class AgentLoopTest(unittest.TestCase):
         self.assertEqual(client.systems, ["SYS-1", "SYS-2", "SYS-3"])
         self.assertNotIn("STATIC-SYS", client.systems)
 
+    def test_one_arg_provider_receives_user_message(self):
+        # Issue #43: a provider that accepts the per-turn user message is called WITH
+        # it (so it can budget the page snapshot against the full message), while the
+        # zero-arg legacy provider above still works. The agent detects the arity.
+        client = RecordingLLMClient([{"tool": "list_directory", "args": {"path": self.dir}}])
+        seen_users = []
+
+        def provider(user):
+            seen_users.append(user)
+            return "SYS-WITH-USER"
+
+        agent = RalphAgent(client, self.registry, "STATIC-SYS",
+                           Config(max_steps=1), FakeValidator(passed=True),
+                           system_prompt_provider=provider)
+        agent.run("my-task")
+        # The provider was handed the exact per-turn user message the model also saw.
+        self.assertEqual(len(seen_users), 1)
+        self.assertEqual(seen_users[0], client.users[0])
+        self.assertIn("my-task", seen_users[0])
+        self.assertEqual(client.systems, ["SYS-WITH-USER"])
+
     def test_transcript_and_to_dict(self):
         result = self._agent([VALIDATE]).run("t")
         text = result.transcript()
