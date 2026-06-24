@@ -334,6 +334,30 @@ class CalendarHelperTest(unittest.TestCase):
         self.assertIsNone(find_nav_button_ref(self.SNAP, "Next decade"))
 
 
+class ValidationAlertTest(unittest.TestCase):
+    """iter-2 fix: a rejected Continue click leaves `alert` nodes in the snapshot; the
+    harness must surface them so the model fixes the named fields instead of re-clicking
+    Continue blindly (iter-2 turns 16-19 wasted 4 Continue clicks on Step 2)."""
+
+    SNAP = (
+        '- alert [ref=e189]: Invalid enum value. Expected \'Onsite\' | \'Hybrid\' | \'Remote\', received \'\'\n'
+        '- alert [ref=e190]: Please choose a valid date\n'
+        '- button "Continue →" [ref=e81] [cursor=pointer]\n'
+    )
+
+    def test_extracts_alert_text(self):
+        from vibeharness.web import _extract_validation_alerts
+        alerts = _extract_validation_alerts(self.SNAP)
+        self.assertEqual(len(alerts), 2)
+        self.assertIn("Please choose a valid date", alerts)
+        self.assertTrue(any("Invalid enum value" in a for a in alerts))
+
+    def test_no_alerts_in_clean_snapshot(self):
+        from vibeharness.web import _extract_validation_alerts
+        self.assertEqual(_extract_validation_alerts('- button "Continue" [ref=e81]'), [])
+        self.assertEqual(_extract_validation_alerts(''), [])
+
+
 class CalendarNavigationTest(unittest.TestCase):
     """iter-1: SelectOptionTool._select_calendar_date drives a custom calendar to the
     target ISO date by stepping the month/year nav buttons, then clicking the day."""

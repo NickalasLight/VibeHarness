@@ -331,6 +331,26 @@ def _interactable_ref_lines(snapshot: str, limit: int = 40) -> list[str]:
     return out
 
 
+def _extract_validation_alerts(snapshot: str) -> list[str]:
+    """Return the text of any ``alert`` nodes in ``snapshot`` (client-side validation errors).
+
+    A wizard step that rejects a Continue click renders one ``alert [ref=eN]: <message>``
+    line per invalid field (iter-2 Step 2: "Invalid enum value... received ''" for the
+    unset work arrangement, "Please choose a valid date"). Surfacing these verbatim lets
+    the steer name the EXACT fields still blocking advancement instead of leaving the model
+    to re-click Continue blindly (iter-2 turns 16-19: 4 blind Continue clicks, never read
+    the errors, never advanced)."""
+    alerts: list[str] = []
+    for line in (snapshot or "").splitlines():
+        # Snapshot shape: '- alert [ref=e189]: Invalid enum value. Expected ...'
+        m = re.search(r"\balert\b[^:]*\[ref=e\d+\][^:]*:\s*(.+?)\s*$", line)
+        if m:
+            text = m.group(1).strip()
+            if text and text not in alerts:
+                alerts.append(text)
+    return alerts
+
+
 def _check_dom_delta(cli: "PlaywrightCli", before_snapshot: str,
                      result: "ToolResult") -> "ToolResult":
     """Append a DOM-change summary to ``result`` when new elements appeared.
@@ -367,6 +387,25 @@ def _check_dom_delta(cli: "PlaywrightCli", before_snapshot: str,
             + "\n".join(f"  {line}" for line in controls[:40])
         )
         return ToolResult(result.ok, (result.observation or "") + delta_msg)
+    # VALIDATION-REJECT detection (iter-2 fix): the page did NOT turn over (no page advance),
+    # but new `alert` nodes appeared — i.e. a Continue/Submit click was REJECTED by client-side
+    # validation. Tell the model the EXACT errors and that the form did not advance, so it fixes
+    # the named fields instead of re-clicking Continue blindly (iter-2 turns 16-19: 4 wasted
+    # Continue clicks, run died on Step 2 never having set the work arrangement).
+    alerts = _extract_validation_alerts(after)
+    new_alerts = [a for a in alerts if a not in _extract_validation_alerts(before_snapshot)]
+    if new_alerts:
+        errs = "\n".join(f"  • {a}" for a in new_alerts)
+        reject_msg = (
+            "\n\nFORM NOT ADVANCED — the page did NOT move to the next step. Your last click "
+            "was REJECTED by validation. Fix these errors BEFORE clicking Continue again:\n"
+            + errs
+            + "\nFor each error: find the matching field in the snapshot above and set it "
+            "(select_option for dropdowns, the calendar for dates). Do NOT click Continue "
+            "again until every error above is resolved — re-clicking it without fixing them "
+            "does nothing."
+        )
+        return ToolResult(result.ok, (result.observation or "") + reject_msg)
     new_lines = _extract_ref_lines(new_refs, after)
     delta_msg = (
         f"\n\nDOM CHANGE DETECTED: {len(new_refs)} new element(s) appeared:\n"
