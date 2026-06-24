@@ -131,10 +131,9 @@ def agent_default_toolsets(catalog: ToolsetCatalog | None = None) -> dict[str, l
 # Why these defaults:
 #   - fs:        MULTIPLE actions/turn (keep the global Config default). Filesystem
 #                steps are predictable enough to batch (write a file, read it back).
-#   - web:       EXACTLY 1 action/turn. Web actions depend on the page changing after
-#                each one; emitting several in a turn acts on STALE refs before a fresh
-#                snapshot (root of #41). One web action/turn ⇒ a fresh snapshot next
-#                turn ⇒ the next action targets the CURRENT refs.
+#   - web:       up to 4 actions/turn. (Raised from 1: snapshot-ref enforcement (#73)
+#                now rejects stale/invalid refs with a hard error, so batching a few
+#                web actions per turn is safe and lets the agent make faster progress.)
 #   - validator: 1 (single-shot pass/fail; never batches).
 #
 # Any agent NOT listed here falls back to the global Config default (so new agents
@@ -148,4 +147,4 @@ def agent_default_max_actions(
     ``default`` is the global Config default and is used for the ``fs`` agent so the
     multi-action batching it ships with stays driven by one source of truth.
     """
-    return {"fs": default, "web": 1, "validator": 1}
+    return {"fs": default, "web": 4, "validator": 1}

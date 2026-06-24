@@ -2,8 +2,8 @@
 
 The number of tool calls allowed PER TURN is configurable by agent type, not just
 by the global ``Config.max_actions_per_turn``. Defaults: fs keeps the global
-(multiple) default; web == 1 (so each web action lands on a fresh snapshot, the #41
-root cause); validator == 1.
+(multiple) default; web == 4 (raised from 1 now that snapshot-ref enforcement #73
+guards stale refs); validator == 1.
 
 These tests assert ONE source of truth: the cap the CLI resolves for an agent is
 the cap the prompt STATES *and* the cap the agent loop ENFORCES. No model / Ollama
@@ -60,12 +60,12 @@ class IsolatedSettings(unittest.TestCase):
 
 
 class MappingTest(IsolatedSettings):
-    def test_defaults_are_fs_multiple_web_one_validator_one(self):
+    def test_defaults_are_fs_multiple_web_four_validator_one(self):
         mapping = agent_default_max_actions()
         # fs keeps the GLOBAL (multiple) default — the single source of truth.
         self.assertEqual(mapping["fs"], Config.max_actions_per_turn)
         self.assertGreater(mapping["fs"], 1)  # "multiple"
-        self.assertEqual(mapping["web"], 1)
+        self.assertEqual(mapping["web"], 4)
         self.assertEqual(mapping["validator"], 1)
 
     def test_fs_default_tracks_supplied_global_default(self):
@@ -74,8 +74,8 @@ class MappingTest(IsolatedSettings):
 
 
 class ResolutionPrecedenceTest(IsolatedSettings):
-    def test_agent_web_resolves_to_one(self):
-        self.assertEqual(_resolved_cap(["task", "--agent", "web"]), 1)
+    def test_agent_web_resolves_to_four(self):
+        self.assertEqual(_resolved_cap(["task", "--agent", "web"]), 4)
 
     def test_agent_validator_resolves_to_one(self):
         self.assertEqual(_resolved_cap(["task", "--agent", "validator"]), 1)
@@ -117,8 +117,8 @@ class PromptStatesResolvedCapTest(IsolatedSettings):
         self.assertEqual(_resolved_cap(argv), cap)
         self.assertIn(f"at most {cap} actions per turn", prompt)
 
-    def test_web_prompt_states_one(self):
-        self._assert_prompt_states(["task", "--agent", "web"], 1)
+    def test_web_prompt_states_four(self):
+        self._assert_prompt_states(["task", "--agent", "web"], 4)
 
     def test_validator_prompt_states_one(self):
         self._assert_prompt_states(["task", "--agent", "validator"], 1)
