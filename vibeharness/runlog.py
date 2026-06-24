@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+import uuid
 from datetime import datetime
 from pathlib import Path
 
@@ -82,6 +83,56 @@ class RunLogger:
                     body, encoding="utf-8", errors="backslashreplace")
         except Exception:
             # Diagnostics are a best-effort aid; never let a dump failure break the run.
+            pass
+
+    def log_validator(self, *, task: str, history: str, claim: str,
+                      reasoning: str, passed: bool, reason: str,
+                      model: str | None = None, config: Config | None = None) -> None:
+        """Persist ONE validator invocation to its own file in this run's ``.vibe/``.
+
+        The validator subagent (``LLMValidator.validate``) runs a single-shot model
+        call each time the agent calls ``validate``; without this its reasoning and
+        verdict are lost from the on-disk record (issue #47). Each call writes its own
+        ``validator_<guid>.json`` (``validator_`` marks the producer; the uuid4 hex
+        guid guarantees no clobber when ``validate`` is called multiple times).
+
+        Best-effort and exception-safe — exactly the contract of the #37 diagnostics
+        dump: a logging failure must NEVER throw into the run, so every step is guarded
+        and errors are swallowed; the validator's verdict is unaffected either way.
+        """
+        try:
+            self.dir.mkdir(parents=True, exist_ok=True)
+            _hide(self.dir)
+            now = datetime.now()
+            payload = {
+                "type": "validator",
+                "run_stamp": self.stamp,
+                "timestamp": now.isoformat(timespec="seconds"),
+                "model": (config.model if config is not None else model),
+                "config": {
+                    "model": config.model,
+                    "temperature": config.temperature,
+                    "action_temperature": config.action_temperature,
+                    "top_p": config.top_p,
+                    "top_k": config.top_k,
+                } if config is not None else None,
+                "inputs": {
+                    "task": task,
+                    "history": history,
+                    "claim": claim,
+                },
+                "reasoning": reasoning,
+                "verdict": {
+                    "passed": passed,
+                    "reason": reason,
+                },
+            }
+            guid = uuid.uuid4().hex
+            path = self.dir / f"validator_{guid}.json"
+            path.write_text(json.dumps(payload, indent=2, ensure_ascii=False),
+                            encoding="utf-8", errors="backslashreplace")
+        except Exception:
+            # Logging is a best-effort record; never let it break the validation run.
             pass
 
     def write(self, task: str, config: Config, result: RunResult) -> Path:
