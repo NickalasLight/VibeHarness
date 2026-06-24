@@ -15,13 +15,14 @@ from __future__ import annotations
 
 import itertools
 import json
+import threading
 from dataclasses import asdict, dataclass, field
 
 from typing import Callable
 
 from .codec import ToolCallCodec, get_codec
 from .config import Config
-from .llm import LLMClient
+from .llm import Decision, LLMClient
 from .memory import NarrativeMemory
 from .prompt import build_turn_prompt
 from .registry import ToolRegistry
@@ -55,6 +56,9 @@ class RunResult:
     finished: bool = False
     final_summary: str = ""
     validations: list[dict] = field(default_factory=list)  # each validator verdict
+    # Set when the run ended for a reason other than finishing/exhausting the step
+    # budget (e.g. a turn exceeded its wall-clock generation budget). Empty otherwise.
+    stop_reason: str = ""
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -113,11 +117,20 @@ class RalphAgent:
             self._reporter.turn_start(i)
             system = self._system_provider() if self._system_provider else self._system
             user = build_turn_prompt(task, memory.render(), self._codec.turn_action_hint())
-            decision = self._client.decide(
-                system, user, constraint,
-                on_reason=self._reporter.reasoning_token,
-                on_action=self._reporter.action_token,
-            )
+            decision = self._decide(system, user, constraint)
+            if decision is None:
+                # The turn exceeded its wall-clock generation budget. Record a
+                # failed turn so the abort is observable, then end gracefully.
+                budget = self._cfg.turn_timeout_seconds
+                reason = (f"turn {i} exceeded the {budget}s generation budget; aborting")
+                turn = Turn(index=i, reasoning="", raw_action="")
+                result.turns.append(turn)
+                self._record(turn, Action(None, {}, reason, ok=False), memory)
+                result.stop_reason = reason
+                if on_turn is not None:
+                    on_turn(result)
+                break
+
             turn = Turn(index=i, reasoning=decision.reasoning, raw_action=decision.action_json)
             result.turns.append(turn)
 
@@ -149,6 +162,46 @@ class RalphAgent:
                 break
 
         return result
+
+    # ---- per-turn generation, bounded by a wall-clock budget ----
+    def _decide(self, system: str, user: str, constraint) -> Decision | None:
+        """Run one turn's blocking decide() call.
+
+        When ``turn_timeout_seconds <= 0`` the call is inline — identical to the
+        original behaviour (no thread, no guard). When > 0, decide() (a blocking,
+        streaming call) is run in a daemon worker thread and joined with the
+        budget. Returns the Decision on success, or ``None`` if the budget was
+        exceeded. A blown budget leaves the worker thread running detached; it is a
+        daemon so it cannot keep the process alive once the run returns.
+        """
+        budget = self._cfg.turn_timeout_seconds
+        if budget <= 0:
+            return self._client.decide(
+                system, user, constraint,
+                on_reason=self._reporter.reasoning_token,
+                on_action=self._reporter.action_token,
+            )
+
+        box: dict = {}
+
+        def work() -> None:
+            try:
+                box["decision"] = self._client.decide(
+                    system, user, constraint,
+                    on_reason=self._reporter.reasoning_token,
+                    on_action=self._reporter.action_token,
+                )
+            except BaseException as exc:  # surface, don't swallow, generation errors
+                box["error"] = exc
+
+        worker = threading.Thread(target=work, name="vibe-turn-decide", daemon=True)
+        worker.start()
+        worker.join(budget)
+        if worker.is_alive():
+            return None                  # budget exceeded; abandon the daemon worker
+        if "error" in box:
+            raise box["error"]
+        return box["decision"]
 
     # ---- validation ----
     def _validate(self, task: str, args: dict, turn: Turn, memory: NarrativeMemory,

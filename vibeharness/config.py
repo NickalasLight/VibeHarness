@@ -17,6 +17,17 @@ class Config:
     max_steps: int = 15               # <= 0 means unlimited
     max_actions_per_turn: int = 4     # cap on tool calls the model may emit per turn
 
+    # Per-turn wall-clock budget (seconds). 0 (default) disables the guard,
+    # preserving the original behaviour exactly: decide() is called inline with no
+    # threading. When > 0, each turn's blocking decide() is run in a daemon worker
+    # thread and joined with this timeout; if it overruns, the turn is recorded as a
+    # failure and the run ends gracefully (RunResult.finished stays False). Caps a
+    # turn's wall-clock TIME, complementing reason_tokens/action_tokens which only
+    # cap token COUNT. The stuck generation thread is a daemon so it cannot keep the
+    # process alive after the run returns (tradeoff: that thread may still be running
+    # detached until the process exits or its blocking I/O unwinds).
+    turn_timeout_seconds: int = 0
+
     # tool-call wire format (see vibeharness.codec.get_codec). "json" is the
     # decode-constrained baseline; other codecs add alternative formats.
     codec: str = "json"
