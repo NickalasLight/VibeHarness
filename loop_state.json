@@ -20,7 +20,7 @@
     "loop_issue": "Full loop architecture documented in GitHub issue #142 on VibeHarness repo.",
     "iter3_fixes": "Escape in _select_via_combobox; work arrangement='Hybrid'; ONE-DROPDOWN-AT-A-TIME warning; calendar select_option is atomic in tool (no manual nav needed); _check_dom_delta surfaces validation alerts on rejected Continue (FORM NOT ADVANCED steer) to break blind Continue loops"
   },
-  "run_pid": null,
+  "run_pid": 10536,
   "run_log": "C:\\git\\vibethinkharnessProto1\\vibe_run_iter3.log",
   "task_id": "1"
 }
