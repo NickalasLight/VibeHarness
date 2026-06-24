@@ -78,10 +78,19 @@ class Validator(ABC):
 
 
 class LLMValidator(Validator):
-    """Validator backed by an LLM (the same model, a different system prompt)."""
+    """Validator backed by an LLM (the same model, a different system prompt).
 
-    def __init__(self, client: LLMClient):
+    If a :class:`~vibeharness.runlog.RunLogger` is supplied, every ``validate`` call
+    is persisted to its own ``validator_<guid>.json`` in the run's ``.vibe/`` folder
+    (issue #47) — inputs, the validator's private reasoning, and the verdict. The
+    logger is optional/None-safe so existing usage and tests that construct
+    ``LLMValidator(client)`` keep working and simply log nothing.
+    """
+
+    def __init__(self, client: LLMClient, logger=None, config: "Config | None" = None):
         self._client = client
+        self._logger = logger
+        self._config = config
 
     def validate(self, task: str, history: str, claim: str,
                  on_reason: "TokenSink | None" = None,
@@ -92,11 +101,30 @@ class LLMValidator(Validator):
             on_reason=on_reason, on_action=on_action)
         try:
             data = json.loads(decision.action_json)
+            verdict = Verdict(passed=(data.get("verdict") == "pass"),
+                              reason=data.get("reason", ""), reasoning=decision.reasoning)
         except json.JSONDecodeError:
-            return Verdict(False, "validator output could not be parsed; treating as incomplete.",
-                           decision.reasoning)
-        return Verdict(passed=(data.get("verdict") == "pass"),
-                       reason=data.get("reason", ""), reasoning=decision.reasoning)
+            verdict = Verdict(False, "validator output could not be parsed; treating as incomplete.",
+                              decision.reasoning)
+        self._log(task, history, claim, verdict)
+        return verdict
+
+    def _log(self, task: str, history: str, claim: str, verdict: Verdict) -> None:
+        """Hand this invocation to the run logger (best-effort; never throws).
+
+        Mirrors the #37 diagnostics contract: the logger's own write is already
+        guarded, and this wrapper guards the call site too so even a missing/odd
+        logger can never break the verdict the agent depends on.
+        """
+        if self._logger is None:
+            return
+        try:
+            self._logger.log_validator(
+                task=task, history=history, claim=claim,
+                reasoning=verdict.reasoning, passed=verdict.passed,
+                reason=verdict.reason, config=self._config)
+        except Exception:
+            pass
 
 
 class ValidateTool(Tool):

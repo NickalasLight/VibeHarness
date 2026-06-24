@@ -374,7 +374,7 @@ def _run_locked(args, task, config, registry, codec, names, workdir, logger,
     print(f" toolsets: {', '.join(names)} (+ validate)")
 
     client = OllamaClient(config)
-    validator = LLMValidator(client)
+    validator = LLMValidator(client, logger=logger, config=config)
 
     # Refresh the system prompt every turn so its "# Workspace" section reflects
     # files the agent creates as it goes. Scanning Path.cwd() each call (rather
