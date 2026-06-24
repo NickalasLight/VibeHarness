@@ -34,10 +34,24 @@ class Config:
 
     # context + per-turn token budgets.
     # num_ctx is the whole window (system prompt + history + generation share it).
-    # 131072 is the model's max; on an 8 GB card the KV overflow spills to system
-    # RAM (Windows shared GPU memory), so context fills slow down but don't OOM.
-    # Use OLLAMA_NUM_PARALLEL=1 so a single instance gets the whole window.
-    num_ctx: int = 131072
+    #
+    # ISSUE #77 (single-runner fix): num_ctx is PINNED to one value that fits the
+    # 8 GB GPU. Background (diagnosed in #76 / PR #87): the old 131072 request never
+    # actually fit — Ollama's auto-fit shrank each request to a VARYING size
+    # (4096/16384/32768) depending on free VRAM at the moment. Ollama keys a
+    # llama-server runner by (model, context-size), so every distinct auto-fit size
+    # spawned a NEW runner; with MAX_LOADED_MODELS/KEEP_ALIVE unset they were never
+    # evicted, stacked up, and exhausted the GPU -> the OOM/CUDA crash. Sending one
+    # fixed num_ctx on EVERY request (see OllamaClient._options) means only ONE
+    # runner shape is ever requested, so at most one runner exists.
+    #
+    # 32768 is chosen as the largest of the observed auto-fit sizes — it has actually
+    # loaded on this card, so it is known-fittable, and it is large enough that a
+    # heavy real page still fits: the worst-case YouTube watch snapshot (~45k chars
+    # ≈ ~11k tokens at 4 chars/token) plus the prompt and output reservation stays
+    # well under 32768. If 32768 proves unstable in live runs, drop to 16384 (also
+    # an observed-fitting size) — both keep the single-runner invariant.
+    num_ctx: int = 32768
     reason_tokens: int = 2048         # phase 1 (free reasoning, discarded)
     action_tokens: int = 16384        # phase 2 (constrained JSON action) — can be large
 
@@ -47,6 +61,12 @@ class Config:
     # backend
     backend: str = "ollama"           # "ollama" or "llamacpp"
     ollama_url: str = "http://127.0.0.1:11434"
+    # ISSUE #77: a CONSTANT keep_alive sent on every Ollama request. Keeping the
+    # value identical across requests (paired with the pinned num_ctx and
+    # OLLAMA_MAX_LOADED_MODELS=1) means a fresh request reuses / re-pins the single
+    # existing runner instead of leaving idle runners around to be re-loaded. "30m"
+    # comfortably spans a long agent run without holding the GPU forever after it.
+    ollama_keep_alive: str = "30m"
     llamacpp_url: str = "http://127.0.0.1:8080"
     request_timeout: int = 600
 

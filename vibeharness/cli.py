@@ -20,7 +20,7 @@ from .agent import RalphAgent, RunResult
 from .codec import UnknownCodec, available_codecs, get_codec
 from .config import Config
 from .filesystem import FileSystem, FileSystemError
-from .llm import OllamaClient, OllamaUnavailable
+from .llm import OllamaClient, OllamaUnavailable, ensure_single_runner_env
 from .lock import SingleInstanceLock, VibeAlreadyRunning
 from .prompt import SystemPromptBuilder
 from .reporting import ConsoleReporter
@@ -568,6 +568,12 @@ def main(argv: list[str] | None = None) -> int:
         sys.stdout.reconfigure(encoding="utf-8")  # robust unicode on Windows consoles
     except AttributeError:
         pass
+
+    # ISSUE #77: cap Ollama at one loaded model on startup so a new runner evicts the
+    # old one rather than stacking (the OOM/CUDA root cause). setdefault inside, so a
+    # user-set value is preserved. Done here too (not only in OllamaClient.__init__)
+    # so the var is present before any backend object is constructed.
+    ensure_single_runner_env()
 
     parser = build_parser()
     # Friendly help: bare `vibe`, `vibe help`, or `vibe -help` all show help.
