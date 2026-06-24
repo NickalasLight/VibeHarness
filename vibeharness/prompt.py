@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 
+from .config import Config
 from .registry import ToolRegistry
 
 _SYSTEM_TEMPLATE = """\
@@ -25,6 +26,7 @@ already taken and what each returned.
 - Batch several actions in one turn when they are independent or you are confident \
 of the outcome (e.g. write a file then read it back). Emit a single action when \
 you must see its result before deciding the next move.
+- You may emit at most {max_actions} actions in a single turn.
 - Output nothing except that JSON array. Do not invent tools or parameters. \
 Only use the tools listed below.
 - After your actions run you will see each result described in the account. Use it \
@@ -53,12 +55,15 @@ Re-read the task before deciding each action.
 
 
 class SystemPromptBuilder:
-    def __init__(self, registry: ToolRegistry):
+    def __init__(self, registry: ToolRegistry, max_actions_per_turn: int = Config().max_actions_per_turn):
         self._registry = registry
+        self._max_actions = max_actions_per_turn
 
     def build(self, task: str = "") -> str:
-        schema = json.dumps(self._registry.action_schema(), indent=2)
-        body = _SYSTEM_TEMPLATE.format(docs=self._registry.docs(), schema=schema)
+        limit = self._max_actions if self._max_actions > 0 else None
+        schema = json.dumps(self._registry.action_schema(max_items=limit), indent=2)
+        body = _SYSTEM_TEMPLATE.format(docs=self._registry.docs(), schema=schema,
+                                       max_actions=self._max_actions)
         if not task:
             return body
         # Anchor the task at the very front of the context (primacy / authoritative

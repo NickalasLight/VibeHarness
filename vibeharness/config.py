@@ -15,6 +15,7 @@ class Config:
 
     # loop
     max_steps: int = 15               # <= 0 means unlimited
+    max_actions_per_turn: int = 4     # cap on tool calls the model may emit per turn
 
     # context + per-turn token budgets.
     # num_ctx is the whole window (system prompt + history + generation share it).

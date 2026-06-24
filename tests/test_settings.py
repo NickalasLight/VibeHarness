@@ -33,6 +33,14 @@ class SettingsTest(unittest.TestCase):
         Settings.set("max-steps", "25")
         self.assertEqual(Settings.apply(Config()).max_steps, 25)
 
+    def test_set_max_actions_per_turn_roundtrips(self):
+        field, value = Settings.set("max-actions-per-turn", "3")
+        self.assertEqual((field, value), ("max_actions_per_turn", 3))
+        self.assertEqual(Settings.apply(Config()).max_actions_per_turn, 3)
+        # underscore form maps to the same field
+        Settings.set("max_actions_per_turn", "6")
+        self.assertEqual(Settings.apply(Config()).max_actions_per_turn, 6)
+
     def test_set_unknown_key_raises(self):
         with self.assertRaises(KeyError):
             Settings.set("frobnicate", "1")

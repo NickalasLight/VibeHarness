@@ -57,6 +57,8 @@ current default temperature: {saved_temp}
                    help="Ollama model name for this run only")
     p.add_argument("--max-steps", type=int, default=None, metavar="N",
                    help="max turns for this run only (0 = unlimited, until finish)")
+    p.add_argument("--max-actions-per-turn", type=int, default=None, metavar="N",
+                   help="max tool calls the model may emit per turn for this run only")
     p.add_argument("--workdir", default=None, metavar="DIR",
                    help="working directory (default: current terminal directory)")
     p.add_argument("--toolset", action="append", metavar="NAME",
@@ -91,6 +93,8 @@ def resolve_config(args: argparse.Namespace) -> Config:
         overrides["model"] = args.model
     if args.max_steps is not None:
         overrides["max_steps"] = args.max_steps
+    if getattr(args, "max_actions_per_turn", None) is not None:
+        overrides["max_actions_per_turn"] = args.max_actions_per_turn
     if getattr(args, "headless", False):
         overrides["web_headless"] = True
     return replace(cfg, **overrides) if overrides else cfg
@@ -113,6 +117,7 @@ def cmd_show_config() -> int:
     print(f"  model       = {effective.model}")
     print(f"  temperature = {effective.temperature}")
     print(f"  max_steps   = {effective.max_steps}")
+    print(f"  max_actions_per_turn = {effective.max_actions_per_turn}")
     print(f"  top_p       = {effective.top_p}")
     print(f"  top_k       = {effective.top_k}")
     return 0
@@ -153,7 +158,8 @@ def run_agent(args: argparse.Namespace) -> int:
         return 2
 
     registry = catalog.build_registry(toolsets, config)
-    system_prompt = SystemPromptBuilder(registry).build(task)   # task anchored at the front
+    system_prompt = SystemPromptBuilder(
+        registry, config.max_actions_per_turn).build(task)   # task anchored at the front
 
     if args.workdir:
         workdir = Path(args.workdir).resolve()

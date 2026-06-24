@@ -93,7 +93,8 @@ class RalphAgent:
     def run(self, task: str, on_turn: Callable[["RunResult"], None] | None = None) -> RunResult:
         memory = NarrativeMemory()
         result = RunResult(task=task)
-        schema = self._registry.action_schema()
+        limit = self._cfg.max_actions_per_turn
+        schema = self._registry.action_schema(max_items=limit if limit > 0 else None)
 
         # max_steps <= 0 means run until validation passes.
         turns = (itertools.count(1) if self._cfg.max_steps <= 0
@@ -114,6 +115,15 @@ class RalphAgent:
                 self._record(turn, Action(None, {}, f"your last response was invalid and "
                                           f"could not be run: {error}.", ok=False), memory)
             else:
+                # Defensive guard: even if a batch slips past the schema cap, only the
+                # first `limit` actions run. Record a brief note so the model knows.
+                if limit > 0 and len(actions) > limit:
+                    dropped = len(actions) - limit
+                    actions = actions[:limit]
+                    self._record(turn, Action(None, {}, f"you emitted more than the "
+                                              f"per-turn limit of {limit} actions; only the "
+                                              f"first {limit} were run ({dropped} ignored).",
+                                              ok=False), memory)
                 for tool_name, args in actions:
                     if tool_name == "validate":
                         self._validate(task, args, turn, memory, result)

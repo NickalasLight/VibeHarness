@@ -74,6 +74,25 @@ class AgentLoopTest(unittest.TestCase):
         self.assertEqual(validator.calls[0]["claim"], "done")
         self.assertIn("make a file", validator.calls[0]["task"])
 
+    def test_over_limit_batch_runs_only_first_n(self):
+        # Five writes in one batch, but the cap is 2 -> only the first 2 files appear,
+        # and the model is told the extras were ignored. The run never crashes.
+        batch = [{"tool": "write_file",
+                  "args": {"path": self.p(f"f{n}.txt"), "content": "x"}} for n in range(5)]
+        client = FakeLLMClient([batch])
+        agent = RalphAgent(client, self.registry, "SYSTEM",
+                           Config(max_steps=1, max_actions_per_turn=2),
+                           FakeValidator(passed=True))
+        result = agent.run("over limit")
+        self.assertTrue(os.path.exists(self.p("f0.txt")))
+        self.assertTrue(os.path.exists(self.p("f1.txt")))
+        self.assertFalse(os.path.exists(self.p("f2.txt")))
+        # one note action + two executed writes
+        obs = [a.observation for a in result.turns[0].actions]
+        self.assertTrue(any("per-turn limit" in o for o in obs))
+        executed = [a for a in result.turns[0].actions if a.tool == "write_file"]
+        self.assertEqual(len(executed), 2)
+
     def test_multiple_actions_in_one_turn(self):
         actions = [[
             {"tool": "write_file", "args": {"path": self.p("a.txt"), "content": "batched"}},
