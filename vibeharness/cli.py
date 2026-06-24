@@ -20,6 +20,7 @@ from .codec import UnknownCodec, available_codecs, get_codec
 from .config import Config
 from .filesystem import FileSystem, FileSystemError
 from .llm import OllamaClient, OllamaUnavailable
+from .lock import SingleInstanceLock, VibeAlreadyRunning
 from .prompt import SystemPromptBuilder
 from .reporting import ConsoleReporter
 from .runlog import RunLogger
@@ -195,6 +196,31 @@ def run_agent(args: argparse.Namespace) -> int:
         os.chdir(workdir)
     workdir = Path.cwd()
 
+    # Single-instance lock: only one model stream is supported at a time.
+    # Acquire now that workdir/log_path are known but before any model work;
+    # a crashed prior run leaves a stale lock that we auto-reclaim.
+    started = datetime.now()
+    logger = RunLogger(workdir, started)
+    lock = SingleInstanceLock()
+    try:
+        lock.acquire(str(workdir), str(logger.json_path))
+    except VibeAlreadyRunning as e:
+        print("error: another vibe run is already active "
+              "(only one stream is supported at a time).", file=sys.stderr)
+        print(f"  workdir: {e.workdir}", file=sys.stderr)
+        print(f"  log:     {e.log_path}", file=sys.stderr)
+        print(f"  started: {e.started}  (pid {e.pid})", file=sys.stderr)
+        print("Wait for it to finish, then try again.", file=sys.stderr)
+        return 3
+    try:
+        return _run_locked(args, task, config, registry, codec, names, workdir,
+                           logger, system_prompt, toolsets)
+    finally:
+        lock.release()
+
+
+def _run_locked(args, task, config, registry, codec, names, workdir, logger,
+                system_prompt, toolsets) -> int:
     reporter = ConsoleReporter(color=not args.no_color)
     reporter.run_start(task, str(workdir), config)
     print(f" toolsets: {', '.join(names)} (+ validate)")
@@ -221,8 +247,6 @@ def run_agent(args: argparse.Namespace) -> int:
                        reporter=reporter, system_prompt_provider=system_prompt_provider,
                        codec=codec)
 
-    started = datetime.now()
-    logger = RunLogger(workdir, started)
     checkpoint = lambda res: _safe_log(logger, task, config, res)   # stream log each turn
     # Write an initial log at run START (before turn 1). on_turn fires only AFTER a
     # turn completes, so without this a turn that hangs or raises mid-way would leave
