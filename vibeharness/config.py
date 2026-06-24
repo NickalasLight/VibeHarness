@@ -65,6 +65,31 @@ class Config:
     # very largest pages (e.g. w3schools ~63k) because overlay controls are emitted
     # last; the longer-term fix is to PRIORITIZE interactive/overlay controls in the
     # injected snapshot rather than rely on cap size (future enhancement, see #28).
-    web_snapshot_char_limit: int = 40000
+    #
+    # As of issue #43 this fixed cap is no longer the primary control: the snapshot
+    # is sized DYNAMICALLY each turn so it may be as large as the remaining context
+    # window allows (a 200k snapshot beside a 50k message is fine; a 500k snapshot
+    # beside the same message is truncated only because together they would overflow
+    # num_ctx). ``web_snapshot_char_limit`` is kept as an ABSOLUTE CEILING / safety
+    # fallback: the dynamic budget is min(dynamic_budget, web_snapshot_char_limit).
+    # Set it very high (or rely on the dynamic budget alone) to let the window be the
+    # only limit. The dynamic computation lives in vibeharness.snapshot_budget.
+    web_snapshot_char_limit: int = 2_000_000
+
+    # --- dynamic snapshot budget (issue #43) ---
+    # The live page snapshot injected into the per-turn system prompt is truncated
+    # ONLY when including it whole would push the full model message (system prompt +
+    # per-turn user/history) past the usable input window. The usable input window is
+    #   input_budget = num_ctx - (reason_tokens + action_tokens) - snapshot_safety_margin_tokens
+    # all in TOKENS. We estimate tokens from characters with a fixed, conservative
+    # ratio (chars per token). 4.0 is the long-standing English rule of thumb; we keep
+    # it configurable and deliberately treat it as a *floor* (real ARIA snapshots —
+    # refs, URLs, punctuation — often pack FEWER chars per token, i.e. more tokens per
+    # char, so a too-high ratio would UNDER-count tokens and risk overflow). Combined
+    # with the explicit token safety margin this keeps us safely under num_ctx.
+    snapshot_chars_per_token: float = 4.0
+    # Extra tokens held back on top of the output reservation, absorbing chat-template
+    # wrapping, role tokens, and tokenizer estimate error so we never reach num_ctx.
+    snapshot_safety_margin_tokens: int = 1024
     web_headless: bool = False        # headed by default so a human can watch
     web_browser: str = "chrome"
