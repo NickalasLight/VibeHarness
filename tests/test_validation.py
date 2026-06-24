@@ -1,6 +1,13 @@
+import glob
+import json
+import os
+import tempfile
 import unittest
+from datetime import datetime
+from pathlib import Path
 
 from vibeharness.config import Config
+from vibeharness.runlog import RunLogger
 from vibeharness.toolset import (Toolset, agent_default_toolsets,
                                  default_catalog)
 from vibeharness.validation import (LLMValidator, ValidateTool,
@@ -60,6 +67,85 @@ class ValidatorTest(unittest.TestCase):
     def test_build_prompt_handles_missing_claim(self):
         prompt = build_validator_prompt("t", "h", "")
         self.assertIn("no summary", prompt)
+
+
+class ValidatorLoggingTest(unittest.TestCase):
+    """Issue #47: every validate() call is persisted to its own
+    validator_<guid>.json in the run's .vibe/ folder."""
+
+    def _logger(self, workspace):
+        return RunLogger(workspace, datetime(2026, 6, 24, 12, 0, 0))
+
+    def _validator_files(self, vibe_dir):
+        return sorted(glob.glob(str(Path(vibe_dir) / "validator_*.json")))
+
+    def test_validate_writes_validator_file_with_inputs_reasoning_verdict(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            logger = self._logger(tmp)
+            v = LLMValidator(ScriptedClient('{"verdict":"pass","reason":"all good"}'),
+                             logger=logger, config=Config()).validate(
+                "ORIGINAL TASK", "AGENT HISTORY", "AGENT CLAIM")
+            self.assertTrue(v.passed)
+
+            files = self._validator_files(logger.dir)
+            self.assertEqual(len(files), 1)
+            self.assertTrue(os.path.basename(files[0]).startswith("validator_"))
+
+            data = json.loads(Path(files[0]).read_text(encoding="utf-8"))  # valid JSON
+            # inputs
+            self.assertEqual(data["inputs"]["task"], "ORIGINAL TASK")
+            self.assertEqual(data["inputs"]["history"], "AGENT HISTORY")
+            self.assertEqual(data["inputs"]["claim"], "AGENT CLAIM")
+            # private reasoning captured
+            self.assertIn("judging", data["reasoning"])
+            # verdict
+            self.assertTrue(data["verdict"]["passed"])
+            self.assertEqual(data["verdict"]["reason"], "all good")
+            # timestamp + model/config
+            self.assertIn("timestamp", data)
+            self.assertEqual(data["model"], Config().model)
+            self.assertEqual(data["config"]["temperature"], Config().temperature)
+
+    def test_two_validate_calls_write_two_distinct_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            logger = self._logger(tmp)
+            v = LLMValidator(ScriptedClient('{"verdict":"fail","reason":"nope"}'),
+                             logger=logger, config=Config())
+            v.validate("t", "h1", "c1")
+            v.validate("t", "h2", "c2")
+            files = self._validator_files(logger.dir)
+            self.assertEqual(len(files), 2)
+            self.assertNotEqual(files[0], files[1])  # unique guids, no clobber
+            histories = {json.loads(Path(f).read_text(encoding="utf-8"))["inputs"]["history"]
+                         for f in files}
+            self.assertEqual(histories, {"h1", "h2"})
+
+    def test_no_logger_writes_nothing_and_still_validates(self):
+        # Back-compat: LLMValidator(client) with no logger works and writes no file.
+        with tempfile.TemporaryDirectory() as tmp:
+            v = LLMValidator(ScriptedClient('{"verdict":"pass","reason":"ok"}')).validate(
+                "t", "h", "c")
+            self.assertTrue(v.passed)
+            self.assertEqual(self._validator_files(Path(tmp) / ".vibe"), [])
+
+    def test_logging_failure_does_not_break_validation(self):
+        # An unwritable log dir must not stop the verdict from being returned.
+        class ExplodingLogger:
+            def log_validator(self, **kwargs):
+                raise OSError("disk full")
+        v = LLMValidator(ScriptedClient('{"verdict":"pass","reason":"ok"}'),
+                         logger=ExplodingLogger(), config=Config()).validate("t", "h", "c")
+        self.assertTrue(v.passed)
+        self.assertEqual(v.reason, "ok")
+
+    def test_runlogger_log_validator_swallows_write_errors(self):
+        # The logger's own write is guarded too: pointing .vibe/ at an existing
+        # FILE makes mkdir() raise, which must be swallowed (no exception).
+        with tempfile.TemporaryDirectory() as tmp:
+            logger = self._logger(tmp)
+            Path(logger.dir).write_text("not a dir", encoding="utf-8")  # block mkdir
+            logger.log_validator(task="t", history="h", claim="c", reasoning="r",
+                                 passed=True, reason="ok", config=Config())  # must not raise
 
 
 class ValidateToolTest(unittest.TestCase):
