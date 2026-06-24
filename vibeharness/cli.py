@@ -16,6 +16,7 @@ from datetime import datetime
 from pathlib import Path
 
 from .agent import RalphAgent
+from .codec import UnknownCodec, get_codec
 from .config import Config
 from .filesystem import FileSystem, FileSystemError
 from .llm import OllamaClient, OllamaUnavailable
@@ -159,8 +160,13 @@ def run_agent(args: argparse.Namespace) -> int:
         return 2
 
     registry = catalog.build_registry(toolsets, config)
+    try:
+        codec = get_codec(config.codec)
+    except UnknownCodec as e:
+        print(f"error: {e}")
+        return 2
     system_prompt = SystemPromptBuilder(
-        registry, config.max_actions_per_turn).build(task)   # task anchored at the front
+        registry, config.max_actions_per_turn, codec).build(task)   # task anchored at the front
 
     if args.workdir:
         workdir = Path(args.workdir).resolve()
@@ -178,7 +184,7 @@ def run_agent(args: argparse.Namespace) -> int:
     # Refresh the system prompt every turn so its "# Workspace" section reflects
     # files the agent creates as it goes. Scanning Path.cwd() each call (rather
     # than a cached tree) is what makes newly written files appear next turn.
-    builder = SystemPromptBuilder(registry)
+    builder = SystemPromptBuilder(registry, config.max_actions_per_turn, codec)
     fs = FileSystem()
 
     def render_workspace() -> str:
@@ -191,7 +197,8 @@ def run_agent(args: argparse.Namespace) -> int:
 
     system_prompt_provider = lambda: builder.build(task, workspace=render_workspace())
     agent = RalphAgent(client, registry, system_prompt, config, validator,
-                       reporter=reporter, system_prompt_provider=system_prompt_provider)
+                       reporter=reporter, system_prompt_provider=system_prompt_provider,
+                       codec=codec)
 
     started = datetime.now()
     logger = RunLogger(workdir, started)

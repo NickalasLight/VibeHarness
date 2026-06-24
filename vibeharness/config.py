@@ -17,6 +17,10 @@ class Config:
     max_steps: int = 15               # <= 0 means unlimited
     max_actions_per_turn: int = 4     # cap on tool calls the model may emit per turn
 
+    # tool-call wire format (see vibeharness.codec.get_codec). "json" is the
+    # decode-constrained baseline; other codecs add alternative formats.
+    codec: str = "json"
+
     # context + per-turn token budgets.
     # num_ctx is the whole window (system prompt + history + generation share it).
     # 131072 is the model's max; on an 8 GB card the KV overflow spills to system
