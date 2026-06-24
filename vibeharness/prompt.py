@@ -13,9 +13,21 @@ low-attention middle of the context.
 """
 from __future__ import annotations
 
+from typing import Iterable, Protocol
+
 from .codec import ToolCallCodec, get_codec
 from .config import Config
 from .registry import ToolRegistry
+
+
+class _GuidanceSource(Protocol):
+    """Anything that can advertise short system-prompt guidance — e.g. a Toolset.
+
+    Kept structural (a Protocol) so :class:`SystemPromptBuilder` depends only on the
+    ``system_guidance`` capability, not on the concrete ``Toolset`` class (DIP).
+    """
+
+    def system_guidance(self) -> str | None: ...
 
 _SYSTEM_TEMPLATE = """\
 You are a capable task-execution agent operating a computer through a small set \
@@ -34,7 +46,7 @@ feedback on what is missing — fix it and validate again.
 # Tools
 {docs}
 
-# Guidance
+{tool_guidance}# Guidance
 - Treat the task as exact ground truth: do not paraphrase, invent, or drift from it. \
 Re-read it before each action.
 - Prefer the simplest tool for the step; use relative paths unless an absolute one \
@@ -46,14 +58,42 @@ is required.
 class SystemPromptBuilder:
     def __init__(self, registry: ToolRegistry,
                  max_actions_per_turn: int = Config().max_actions_per_turn,
-                 codec: ToolCallCodec | None = None):
+                 codec: ToolCallCodec | None = None,
+                 guidance: str = ""):
         self._registry = registry
         self._max_actions = max_actions_per_turn
         self._codec = codec or get_codec("json")
+        # Pre-assembled, role-specific guidance for the ACTIVE toolset(s). Empty by
+        # default so existing callers (e.g. SystemPromptBuilder(registry)) are
+        # unaffected and no empty section is rendered.
+        self._guidance = guidance
+
+    @staticmethod
+    def assemble_guidance(sources: Iterable[_GuidanceSource]) -> str:
+        """Collect the non-empty ``system_guidance`` of each source, in order, with
+        duplicates removed. The result is ready to pass as the ``guidance`` argument.
+
+        Order-stable (preserves the order toolsets were selected) and de-duplicated so
+        two toolsets sharing a note never repeat it. Returns "" when nothing applies.
+        """
+        seen: set[str] = set()
+        notes: list[str] = []
+        for source in sources:
+            text = (source.system_guidance() or "").strip()
+            if text and text not in seen:
+                seen.add(text)
+                notes.append(text)
+        return "\n".join(f"- {note}" for note in notes)
 
     def build(self, task: str = "", workspace: str = "") -> str:
+        # Render the per-toolset guidance section only when there is guidance to show,
+        # so a no-guidance build leaves no empty "# Working with your tools" heading.
+        tool_guidance = ""
+        if self._guidance.strip():
+            tool_guidance = f"# Working with your tools\n{self._guidance.strip()}\n\n"
         body = _SYSTEM_TEMPLATE.format(
             docs=self._registry.docs(),
+            tool_guidance=tool_guidance,
             format_instructions=self._codec.format_instructions(self._max_actions))
         header = ""
         if task:
