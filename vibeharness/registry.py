@@ -27,14 +27,19 @@ class ToolRegistry:
     def all(self) -> list[Tool]:
         return list(self._tools.values())
 
-    def action_schema(self) -> dict:
+    def action_schema(self, max_items: int | None = None) -> dict:
         """An array of one or more actions; each must match one tool's call schema.
-        Forces every emitted action to be structurally valid."""
-        return {
+        Forces every emitted action to be structurally valid. When ``max_items`` is
+        given, adds ``maxItems`` so the model literally cannot emit more than that
+        many actions in a single turn."""
+        schema = {
             "type": "array",
             "minItems": 1,
             "items": {"oneOf": [t.call_schema() for t in self._tools.values()]},
         }
+        if max_items is not None:
+            schema["maxItems"] = max_items
+        return schema
 
     def docs(self) -> str:
         return "\n\n".join(t.doc() for t in self._tools.values())
