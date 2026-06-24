@@ -130,11 +130,24 @@ the right tool. Prose already strips the placeholder, which is correct.
 the 3-min wall-clock cap → many more turns per run → more of the form completed. (Branch default
 stays 15 for non-time-capped runs.)
 
-### Iteration 6 — IN PROGRESS
-Re-run with `--max-steps 0` (full 3-min budget). Watching for: many more turns; more fields
-filled across Personal Info; reaching the Continue/Next button + step 2; whether the model finds
-remaining empty fields (City/State/ZIP/links) or cycles among done ones (would motivate a
-steer-message enhancement listing already-handled refs). Combobox (State) still pending.
+### Iteration 6 — DONE (task bqhfpi2i5) — full budget used (78 turns, exit 124); FAILURE loops found
+`--max-steps 0` worked: 78 turns in the 3-min cap. Filled **8 fields** (added City e61, e69) and
+the anti-loop guard steered 32 success-repeats. BUT ~30 turns were wasted on **repeated FAILING
+actions**: `click e163` (invalid/hallucinated ref) ×12, `fill e68` (non-input combobox) ×11,
+`click e72` ×4. **Gap found:** the guard only deduped SUCCESSFUL actions, so failing actions were
+retried forever (a failed action never entered the signature set).
+
+**Fix applied (`agent.py`):** track EVERY attempted action + its outcome (`attempted: dict[sig
+-> ok]`). On an identical repeat, steer regardless of prior outcome — success → "already done,
+move on"; failure → "this already FAILED and will fail again; pick a DIFFERENT ref that's in the
+snapshot / different tool / advance". So each distinct action runs at most once. +1 test
+(repeated-failure steered); suite **551 passed**. Commit: `fix(#125): anti-loop guard also steers
+repeated FAILED actions`.
+
+### Iteration 7 — IN PROGRESS
+Re-run with failure-loop steering + max-steps 0. Watching for: far fewer wasted turns (e163/e68
+killed after 1 try); more unique fields filled; reaching the State combobox + Continue/step 2.
+Combobox handling (select_option on the div-listbox) is the likely next dedicated fix.
 
 ## Current status
-RUNNING iteration 6 (3-min cap, max-steps 0). Awaiting completion notification.
+RUNNING iteration 7 (3-min cap, max-steps 0). Awaiting completion notification.

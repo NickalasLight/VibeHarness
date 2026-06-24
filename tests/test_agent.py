@@ -96,6 +96,37 @@ class AgentLoopTest(unittest.TestCase):
         self.assertEqual(tool.calls, 1)  # the duplicate did not run
         self.assertIn("ALREADY did this exact action", result.transcript())
 
+    def test_anti_loop_steers_repeated_failed_action(self):
+        # #125 iter 6: a repeated FAILING action (e.g. an invalid ref) must also be steered,
+        # not retried forever. Runs once, then the identical retry is blocked.
+        class FailTool(Tool):
+            name = "boomf"
+            description = "always fails"
+
+            def __init__(self):
+                self.calls = 0
+
+            @property
+            def parameters(self):
+                return []
+
+            def run(self, args) -> ToolResult:
+                self.calls += 1
+                return ToolResult(False, "you tried boomf but it failed.")
+
+        tool = FailTool()
+        registry = ToolRegistry([tool])
+        client = FakeLLMClient([
+            {"tool": "boomf", "args": {}},   # turn 1: runs, fails
+            {"tool": "boomf", "args": {}},   # turn 2: identical -> steered (already failed)
+            VALIDATE,
+        ])
+        agent = RalphAgent(client, registry, "SYS", Config(max_steps=10),
+                           FakeValidator(passed=True))
+        result = agent.run("boom")
+        self.assertEqual(tool.calls, 1)  # the failed action was not retried
+        self.assertIn("already FAILED", result.transcript())
+
     def test_anti_loop_allows_different_args(self):
         # Same tool with DIFFERENT args is a different action and must still run.
         actions = [

@@ -140,13 +140,16 @@ class RalphAgent:
         result = RunResult(task=task)
         limit = self._cfg.max_actions_per_turn
         constraint = self._codec.constraint(self._registry, limit)
-        # Anti-loop guard (#125): signatures of actions already executed SUCCESSFULLY this
-        # run. A small model (esp. single-phase + greedy over a near-static page snapshot)
-        # tends to re-emit the exact same action forever — e.g. re-filling an already-filled
-        # field, or re-clicking a ref. Repeating an identical successful action never makes
-        # progress, so we do NOT re-run it; we steer the model to a different element / to
-        # advance the form instead. Navigation tools are exempt (see _action_signature).
-        done_signatures: set[str] = set()
+        # Anti-loop guard (#125): every action ATTEMPTED this run, mapped to whether it
+        # succeeded. A small model (esp. single-phase + greedy over a near-static page
+        # snapshot) re-emits the exact same action forever — re-filling an already-filled
+        # field (success loop) OR retrying an impossible one (failure loop: an invalid/
+        # hallucinated ref, or `fill` on a non-input). Neither makes progress, so we do NOT
+        # re-run an identical (tool, args); we steer to a different element / advance the
+        # form. The steer differs by prior outcome. Navigation tools are exempt
+        # (see _action_signature). Iter 6 showed failure loops (click e163 ×12, fill e68
+        # ×11) dominated when only successes were deduped — hence both outcomes are tracked.
+        attempted: dict[str, bool] = {}
 
         # max_steps <= 0 means run until validation passes.
         turns = (itertools.count(1) if self._cfg.max_steps <= 0
@@ -204,20 +207,27 @@ class RalphAgent:
                                 break
                             continue
                         sig = self._action_signature(tool_name, args)
-                        if sig is not None and sig in done_signatures:
-                            self._record(turn, Action(
-                                tool_name, args,
-                                f"you ALREADY did this exact action successfully earlier this "
-                                f"run ({tool_name} {json.dumps(args, ensure_ascii=False)}); "
-                                f"repeating it makes no progress. Do something DIFFERENT now — "
-                                f"act on the NEXT field or element you have not handled yet, or "
-                                f"advance the form (e.g. click a Next/Continue/Submit control).",
-                                ok=False), memory)
+                        if sig is not None and sig in attempted:
+                            payload = json.dumps(args, ensure_ascii=False)
+                            if attempted[sig]:
+                                obs = (f"you ALREADY did this exact action successfully earlier "
+                                       f"this run ({tool_name} {payload}); repeating it makes no "
+                                       f"progress. Do something DIFFERENT now — act on the NEXT "
+                                       f"field or element you have not handled yet, or advance the "
+                                       f"form (e.g. click a Next/Continue/Submit control).")
+                            else:
+                                obs = (f"this exact action already FAILED earlier this run "
+                                       f"({tool_name} {payload}) and will fail the same way again. "
+                                       f"Do NOT repeat it — pick a DIFFERENT ref that actually "
+                                       f"appears in the current page snapshot, use a different tool, "
+                                       f"or advance the form. Never reuse a ref that is not in the "
+                                       f"snapshot.")
+                            self._record(turn, Action(tool_name, args, obs, ok=False), memory)
                             continue
                         action = self._execute(tool_name, args)
                         self._record(turn, action, memory)
-                        if action.ok and sig is not None:
-                            done_signatures.add(sig)
+                        if sig is not None:
+                            attempted[sig] = action.ok
             except BaseException as exc:
                 # Failsafe: any unexpected mid-turn error (an uncaught tool/validator/
                 # decode exception, a KeyboardInterrupt, …) must NOT discard the work
