@@ -81,9 +81,14 @@ class CodecCliExitTest(unittest.TestCase):
 
 
 class PrintSystemCodecTest(unittest.TestCase):
-    """--print-system renders with the CONFIGURED codec, not a hardcoded default
-    (issue #123): on beta_qwen3coder the default codec is `hermes`, so the printed
-    prompt must show the <tools>/<tool_call> format the model actually receives."""
+    """--print-system renders the prompt the model ACTUALLY receives.
+
+    Issue #129/#130/#131: on beta_qwen3coder the default is the hermes codec WITH native
+    Ollama tools (config.native_tools=True). Native tools mean Ollama injects the # Tools
+    block + the <tool_call>/anti-fence format instructions from the model's OWN chat
+    template via the tools: field — so the harness prompt deliberately OMITS them. (On
+    `beta`, where the default codec is json and native tools are off, the json format is
+    rendered as before.)"""
 
     def _print_system(self, *extra):
         buf = io.StringIO()
@@ -94,8 +99,17 @@ class PrintSystemCodecTest(unittest.TestCase):
 
     def test_default_config_codec_is_reflected(self):
         out = self._print_system()
-        if Config().codec == "hermes":
-            # branch default: the hermes <tools>/<tool_call> format is rendered
+        cfg = Config()
+        native = (cfg.codec == "hermes" and getattr(cfg, "native_tools", False)
+                  and not cfg.two_phase)
+        if native:
+            # Native tools: Ollama injects the tools + format block, so the harness
+            # prompt omits the hand-injected <tools>/<tool_call> blocks.
+            self.assertNotIn("<tools>", out)
+            self.assertNotIn("<tool_call>", out)
+            self.assertIn("# How the loop works", out)
+        elif cfg.codec == "hermes":
+            # Non-native hermes: the harness still hand-injects the format.
             self.assertIn("<tools>", out)
             self.assertIn("<tool_call>", out)
             self.assertIn('"name"', out)

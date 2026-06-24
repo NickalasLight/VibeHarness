@@ -55,6 +55,37 @@ is required.
 """
 
 
+# NATIVE-tools system template (issue #129/#130/#131). When the harness sends the tools
+# in Ollama's ``tools:`` field, Ollama injects the model's OWN trained `# Tools` block
+# (the enveloped function schemas) AND the call-format / anti-fence instructions from the
+# model's chat template. So this template OMITS both the `{docs}` `# Tools` section and the
+# codec's `{format_instructions}` (re-stating them would fight the model's native template
+# and waste the window) — it keeps only the loop description, the per-toolset guidance, and
+# the general guidance. It still tells the model that tools are provided to it natively.
+_SYSTEM_TEMPLATE_NATIVE = """\
+You are a capable task-execution agent operating a computer through a small set \
+of tools. Work in a loop: each turn, look at the current state and the result of \
+your previous actions, then call one or more of the tools available to you to make \
+progress. Keep going until the task is fully done, then call `validate`.
+
+# How the loop works
+- The tools you may call are provided to you directly. Call them using the function-\
+calling format — do NOT paste tool definitions or wrap calls in markdown.
+- Each action's result is returned to you as a tool message. Use it to decide your \
+next turn. On an error, adapt — never repeat the same failing call.
+- When the task is genuinely done, end your turn with `validate` plus a short \
+summary. A validator checks your work: if it agrees the run ends; otherwise you get \
+feedback on what is missing — fix it and validate again.
+
+{tool_guidance}# Guidance
+- Treat the task as exact ground truth: do not paraphrase, invent, or drift from it. \
+Re-read it before each action.
+- Prefer the simplest tool for the step; use relative paths unless an absolute one \
+is required.
+- Verify before validating (e.g. read a file back after writing it).
+"""
+
+
 class SystemPromptBuilder:
     def __init__(self, registry: ToolRegistry,
                  max_actions_per_turn: int = Config().max_actions_per_turn,
@@ -86,7 +117,7 @@ class SystemPromptBuilder:
         return "\n".join(f"- {note}" for note in notes)
 
     def build(self, task: str = "", workspace: str = "", page: str = "",
-              include_tool_guidance: bool = True) -> str:
+              include_tool_guidance: bool = True, native_tools: bool = False) -> str:
         """Render the full system prompt: header (task + workspace + page) + body.
 
         When ``include_tool_guidance`` is False, the body — the `# How the loop works`
@@ -98,6 +129,14 @@ class SystemPromptBuilder:
         because it is judging the work, not producing tool calls. The header uses the
         SAME rendering as the full prompt, so the already-#43-budgeted snapshot is
         reused verbatim.
+
+        When ``native_tools`` is True (issue #129/#130/#131), the harness sends the tool
+        schemas in Ollama's ``tools:`` field, so Ollama injects the model's OWN `# Tools`
+        block and call-format instructions from its chat template. The body then OMITS
+        both the `# Tools` docs and the codec's `{format_instructions}` (re-stating them
+        would duplicate/fight the model's native template) — it keeps the loop
+        description, the per-toolset guidance, and the general guidance. Ignored when
+        ``include_tool_guidance`` is False (the validator view has no tool body anyway).
         """
         body = ""
         if include_tool_guidance:
@@ -106,18 +145,23 @@ class SystemPromptBuilder:
             tool_guidance = ""
             if self._guidance.strip():
                 tool_guidance = f"# Working with your tools\n{self._guidance.strip()}\n\n"
-            # The active codec may supply its own tool-definition rendering (issue
-            # #105 / #123): a Hermes/Qwen model reads tools as a <tools> function-schema
-            # block, not Markdown. Fall back to the registry's Markdown docs when the
-            # codec has no opinion (every codec but `hermes` returns None), so the other
-            # formats render exactly as before.
-            docs = self._codec.tool_definitions(self._registry)
-            if docs is None:
-                docs = self._registry.docs()
-            body = _SYSTEM_TEMPLATE.format(
-                docs=docs,
-                tool_guidance=tool_guidance,
-                format_instructions=self._codec.format_instructions(self._max_actions))
+            if native_tools:
+                # Ollama injects the tools + format instructions from the model's own
+                # template; omit the harness's `# Tools` docs and format block.
+                body = _SYSTEM_TEMPLATE_NATIVE.format(tool_guidance=tool_guidance)
+            else:
+                # The active codec may supply its own tool-definition rendering (issue
+                # #105 / #123): a Hermes/Qwen model reads tools as a <tools> function-schema
+                # block, not Markdown. Fall back to the registry's Markdown docs when the
+                # codec has no opinion (every codec but `hermes` returns None), so the other
+                # formats render exactly as before.
+                docs = self._codec.tool_definitions(self._registry)
+                if docs is None:
+                    docs = self._registry.docs()
+                body = _SYSTEM_TEMPLATE.format(
+                    docs=docs,
+                    tool_guidance=tool_guidance,
+                    format_instructions=self._codec.format_instructions(self._max_actions))
         header = ""
         if task:
             # Anchor the task at the very front of the context (primacy / authoritative

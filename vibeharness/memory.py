@@ -1,8 +1,19 @@
 """Natural-language narrative memory.
 
-Instead of a JSON/ChatML message history, the agent's past is kept as a plain
-English account ("First, you ... Then, you ...") which is regenerated into the
-prompt each turn. Thinking is never stored here.
+The agent's past kept as a plain English account ("First, you ... Then, you ...").
+
+FATE under native stateful chat (issue #129/#130/#131): on the native path the model's
+transport-level memory is now the REAL ``chat_history`` (system/user/assistant/tool
+messages) maintained by :class:`~vibeharness.agent.RalphAgent`, NOT this prose. So when
+``native_tools`` is active the narrative is no longer injected into the model's user
+message. It is KEPT (not removed) as a SUPPLEMENT for two consumers that read prose, not
+transport messages:
+
+  * the VibeThinker advisor's history rendering, and
+  * the human-readable run transcript / logs (``RunResult.transcript``).
+
+On the LEGACY (non-native) path it remains the agent's only memory and is injected each
+turn exactly as before. Thinking is never stored here.
 """
 from __future__ import annotations
 

@@ -73,6 +73,27 @@ class ToolCallCodec(ABC):
         codec-local (open/closed: no edits to the prompt builder per new format)."""
         return None
 
+    def tools(self, registry: "ToolRegistry") -> list[dict] | None:
+        """The enveloped tool schemas for Ollama's native ``tools:`` request field, or
+        ``None`` if this codec does not use native tool calling (issue #129/#130/#131).
+
+        A codec whose model speaks Ollama's native tool protocol returns the list of
+        ``{"type": "function", "function": {...}}`` envelopes; the LLM client then sends
+        them in the request's ``tools:`` field so Ollama applies the model's OWN trained
+        tool template (envelope + anti-fence wording) instead of the harness injecting a
+        tool block by hand. Codecs that inject their own prompt block (json, xml, …)
+        return ``None`` and the client sends no ``tools:`` field — behaviour unchanged."""
+        return None
+
+    def parse_tool_calls(self, tool_calls: list) -> "list[ToolCall]":
+        """Convert Ollama's structured ``message.tool_calls`` into ``(name, args)`` pairs.
+
+        Only meaningful for a native-tools codec; the default returns ``[]``. The client
+        calls this when Ollama returns a non-empty ``tool_calls`` array, and otherwise
+        falls back to :meth:`parse` on the message content (the common case for small
+        models, which Ollama leaves as text)."""
+        return []
+
     @abstractmethod
     def constraint(self, registry: "ToolRegistry", max_actions: int) -> DecodeConstraint:
         """The decode-time constraint for the action phase (may be unconstrained)."""

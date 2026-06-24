@@ -62,6 +62,26 @@ class Config:
     # the call from it. On `beta`/`beta_mythos_fast` (VibeThinker) this stays True.
     two_phase: bool = False
 
+    # ISSUE #129/#130/#131 (beta_qwen3coder): NATIVE Ollama tool calling + stateful chat.
+    # When True (the default on this branch), the base agent sends the model's tools in
+    # the /api/chat ``tools:`` field (so Ollama applies the model's OWN trained tool
+    # template — enveloped schemas + the anti-fence clause — instead of the harness
+    # hand-injecting a <tools> block) AND maintains a stateful multi-turn message history
+    # (system/user/assistant/tool) across turns instead of regenerating a prose narrative.
+    # Ground-truthed from live /api/chat runs: the 3B model still returns the call as text
+    # (Ollama leaves tool_calls null), so the codec's tolerant parse() of the content is
+    # retained as the primary path; structured tool_calls are used when present. Requires
+    # the active codec to support native tools (``codec.tools()`` non-None) — only the
+    # ``hermes`` codec does today; with any other codec this silently no-ops to the legacy
+    # single-message path so the json/xml/etc codecs are unaffected.
+    native_tools: bool = True
+    # FIFO chat-history eviction cap (issue #129/#130/#131). 0 (default) = no fixed turn
+    # cap; history is bounded ONLY by the token budget (num_ctx minus the output
+    # reservation and safety margin), with the OLDEST non-system messages dropped first.
+    # A positive value additionally caps the number of retained user/assistant/tool
+    # messages, a coarse belt-and-braces limit on top of the token budget.
+    chat_history_max_turns: int = 0
+
     # context + per-turn token budgets.
     # num_ctx is the whole window (system prompt + history + generation share it).
     #
