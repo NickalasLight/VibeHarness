@@ -235,6 +235,67 @@ def output_signals_no_match(output: str) -> bool:
     return False
 
 
+# ---------------------------------------------------------------------------
+# DOM-change detection helpers — appended to interaction tool observations.
+# After any successful interactive action (click, fill, type, press_key,
+# select_option, check, uncheck) the snapshot is diffed against a pre-action
+# baseline and newly-appeared elements are reported inline so the model can
+# immediately use their refs without needing an explicit snapshot call.
+# ---------------------------------------------------------------------------
+
+def _diff_snapshot_refs(before: str, after: str) -> list[str]:
+    """Return refs in ``after`` that were not in ``before`` (new elements).
+
+    Extracts all ``[ref=eN]`` patterns from both snapshots and returns the
+    sorted list of refs that are new in ``after``. Returns an empty list when
+    nothing changed or snapshots are empty.
+    """
+    _REF_ATTR_RE = re.compile(r"\[ref=(e\d+)\]")
+    before_refs = set(_REF_ATTR_RE.findall(before or ""))
+    after_refs = set(_REF_ATTR_RE.findall(after or ""))
+    new_refs = after_refs - before_refs
+    return sorted(new_refs, key=lambda r: int(r[1:]))
+
+
+def _extract_ref_lines(refs: list[str], snapshot: str) -> list[str]:
+    """Return the snapshot lines that contain each ref in ``refs``.
+
+    Returns up to 20 lines (stripped) to keep the delta message concise.
+    """
+    results: list[str] = []
+    for ref in refs:
+        for line in (snapshot or "").splitlines():
+            if f"[ref={ref}]" in line:
+                results.append(line.strip())
+                break
+    return results[:20]
+
+
+def _check_dom_delta(cli: "PlaywrightCli", before_snapshot: str,
+                     result: "ToolResult") -> "ToolResult":
+    """Append a DOM-change summary to ``result`` when new elements appeared.
+
+    Captures a fresh snapshot, computes the ref diff against
+    ``before_snapshot``, and — if any new refs exist — appends a
+    ``DOM CHANGE DETECTED`` paragraph to the observation so the model sees
+    the new elements' refs immediately without needing to call ``snapshot``.
+    Returns the original ``result`` unchanged when the action failed or no
+    new elements appeared.
+    """
+    if not result.ok:
+        return result
+    after = capture_page_snapshot_raw(cli) or ""
+    new_refs = _diff_snapshot_refs(before_snapshot, after)
+    if not new_refs:
+        return result
+    new_lines = _extract_ref_lines(new_refs, after)
+    delta_msg = (
+        f"\n\nDOM CHANGE DETECTED: {len(new_refs)} new element(s) appeared:\n"
+        + "\n".join(f"  {line}" for line in new_lines[:20])
+    )
+    return ToolResult(result.ok, (result.observation or "") + delta_msg)
+
+
 # Substrings playwright-cli emits (in its error text) when the named session has no
 # live daemon/browser to act on — i.e. the persistent session has died or was never
 # opened. The CLI's exact phrasing is "The browser '<name>' is not open, please run
@@ -594,6 +655,12 @@ class _WebTool(Tool):
     # ever calling playwright (issue #73). Tools without a targeted element
     # (goto/type/press_key/screenshot-whole-page/navigate_*/reload) leave this off.
     _validate_target: bool = False
+    # When True, ``run()`` captures a DOM snapshot before the action and appends a
+    # DOM CHANGE DETECTED summary to the observation when new refs appear. Set on
+    # interactive tools (click, type, press_key, check, uncheck) via the class body.
+    # FillTool and SelectOptionTool manage the delta themselves because they override
+    # run() with additional logic that must run first.
+    _detect_dom_change: bool = False
 
     def __init__(self, cli: PlaywrightCli, observation_limit: int):
         self._cli = cli
@@ -608,7 +675,15 @@ class _WebTool(Tool):
         """The thing acted on, for the narrative observation. Override as needed."""
         return args.get("url") or args.get("target") or "the page"
 
-    def run(self, args: dict) -> ToolResult:
+    def _run_impl(self, args: dict) -> ToolResult:
+        """Core run logic: validate params, guard target ref, invoke CLI, phrase result.
+
+        Extracted from the original ``run()`` so that the public ``run()`` entry point
+        can wrap it with optional DOM-change detection without subclass complications.
+        Subclasses that override ``run()`` call ``super().run()`` which now goes through
+        this wrapper; they should call ``super()._run_impl()`` if they need the raw
+        result before the DOM delta is appended (see FillTool, SelectOptionTool).
+        """
         missing = [p for p in self._required if not args.get(p)]
         if missing:
             return ToolResult(False, f"you called `{self.name}` but did not provide: "
@@ -644,6 +719,21 @@ class _WebTool(Tool):
             return ToolResult(False, f"you tried to {self._verb} {subject} but it failed: "
                               f"{self._trim(output)}")
         return ToolResult(True, f"you {self._verb} {subject}. Result:\n{self._trim(output)}")
+
+    def run(self, args: dict) -> ToolResult:
+        """Public entry point. Wraps ``_run_impl`` with optional DOM-change detection.
+
+        When ``_detect_dom_change`` is True, captures a before-snapshot, runs the
+        action, then appends a DOM CHANGE DETECTED message listing any new element
+        refs that appeared. Subclasses that override ``run()`` call
+        ``super()._run_impl()`` directly so they retain control of when (and if) the
+        delta is appended.
+        """
+        if not self._detect_dom_change:
+            return self._run_impl(args)
+        before = capture_page_snapshot_raw(self._cli) or ""
+        result = self._run_impl(args)
+        return _check_dom_delta(self._cli, before, result)
 
     def _guard_target(self, args: dict) -> ToolResult | None:
         """Reject a ``target`` that is not a ref present in the current snapshot.
@@ -710,6 +800,7 @@ class ClickTool(_WebTool):
     _verb = "clicked"
     _required = ("target",)
     _validate_target = True
+    _detect_dom_change = True
 
     @property
     def parameters(self):
@@ -739,7 +830,9 @@ class FillTool(_WebTool):
         return ["fill", args["target"], args["text"]]
 
     def run(self, args: dict) -> ToolResult:
-        result = super().run(args)
+        # Capture the DOM before calling the action so we can detect new elements.
+        before = capture_page_snapshot_raw(self._cli) or ""
+        result = self._run_impl(args)
         if not result.ok:
             obs_lower = (result.observation or "").lower()
             if any(p in obs_lower for p in _NOT_INTERACTABLE_PHRASES):
@@ -760,7 +853,9 @@ class FillTool(_WebTool):
                     f"it is a dropdown or combobox."
                 )
                 return ToolResult(False, obs)
-        return result
+            return result
+        # Action succeeded — append DOM change delta if any new elements appeared.
+        return _check_dom_delta(self._cli, before, result)
 
 
 class TypeTool(_WebTool):
@@ -769,6 +864,7 @@ class TypeTool(_WebTool):
                   "(use `fill` to set a field's value directly).")
     _verb = "typed into"
     _required = ("text",)
+    _detect_dom_change = True
 
     def _subject(self, args):
         return "the focused element"
@@ -786,6 +882,7 @@ class PressKeyTool(_WebTool):
     description = "Press a single keyboard key, e.g. 'Enter', 'Tab', 'ArrowLeft', 'Escape'."
     _verb = "pressed a key on"
     _required = ("key",)
+    _detect_dom_change = True
 
     @property
     def parameters(self):
@@ -815,10 +912,12 @@ class SelectOptionTool(_WebTool):
         return ["select", args["target"], args["value"]]
 
     def run(self, args: dict) -> ToolResult:
+        # Capture DOM before the action so we can detect new elements afterward.
+        before = capture_page_snapshot_raw(self._cli) or ""
         # Try the native <select> path first (the base behaviour).
-        result = super().run(args)
+        result = self._run_impl(args)
         if result.ok:
-            return result
+            return _check_dom_delta(self._cli, before, result)
         # FALLBACK (#125): a CUSTOM combobox (<div role="listbox">) is not a native
         # <select>, so Playwright's `select` fails ("Element is not a <select> element")
         # and the discrete subtools alone never reach the (closed) options. Detect that
@@ -830,7 +929,7 @@ class SelectOptionTool(_WebTool):
         if "not a <select>" in obs or "is not a select" in obs or "<select> element" in obs:
             combo = self._select_via_combobox(args["target"], args["value"])
             if combo is not None:
-                return combo
+                return _check_dom_delta(self._cli, before, combo)
         return result
 
     def _select_via_combobox(self, target: str, value: str) -> ToolResult | None:
@@ -867,6 +966,7 @@ class CheckTool(_WebTool):
     _verb = "checked"
     _required = ("target",)
     _validate_target = True
+    _detect_dom_change = True
 
     @property
     def parameters(self):
@@ -883,6 +983,7 @@ class UncheckTool(_WebTool):
     _verb = "unchecked"
     _required = ("target",)
     _validate_target = True
+    _detect_dom_change = True
 
     @property
     def parameters(self):
