@@ -310,18 +310,6 @@ def make_snapshot_provider(config: Config) -> Callable[[], str]:
     return lambda: capture_page_snapshot(cli, config.web_snapshot_char_limit)
 
 
-def make_raw_snapshot_provider(config: Config) -> Callable[[], str]:
-    """Build a per-turn provider that returns the UNTRUNCATED live snapshot (#43).
-
-    The dynamic snapshot budget (see :mod:`vibeharness.snapshot_budget`) needs the
-    raw snapshot so it can decide, against the full message, how much of it fits. As
-    with :func:`make_snapshot_provider` it binds the run's session/timeout from
-    ``config`` and never raises (returns "" when no page is available).
-    """
-    cli = PlaywrightCli(config.web_session, config.web_cli_timeout)
-    return lambda: capture_page_snapshot_raw(cli)
-
-
 class WebToolset(Toolset):
     name = "web"
     description = ("Browse the web with a stateful browser: navigate, read page content and "
