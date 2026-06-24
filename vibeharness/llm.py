@@ -12,6 +12,7 @@ Both phases stream token-by-token so callers can render generation live.
 from __future__ import annotations
 
 import json
+import os
 import urllib.error
 import urllib.request
 from abc import ABC, abstractmethod
@@ -43,9 +44,24 @@ class LLMClient(ABC):
         ...
 
 
+def ensure_single_runner_env() -> None:
+    """ISSUE #77: cap Ollama at ONE loaded model so a new runner EVICTS the old one
+    instead of stacking. Set via the process environment (the only way to configure
+    the ``ollama serve`` daemon's loaded-model limit) using ``setdefault`` so a value
+    the user already exported is respected, not clobbered. Idempotent and side-effect
+    free beyond the env var, so it is safe to call from client init and cli main.
+
+    NOTE: this affects the daemon only if it reads the env at the time it (re)loads a
+    model; an already-running ``ollama serve`` started without the var keeps its
+    previous limit. The pinned num_ctx + constant keep_alive (above) hold the
+    single-runner invariant regardless, so this is belt-and-braces."""
+    os.environ.setdefault("OLLAMA_MAX_LOADED_MODELS", "1")
+
+
 class OllamaClient(LLMClient):
     def __init__(self, config: Config):
         self._cfg = config
+        ensure_single_runner_env()
 
     def decide(self, system: str, user: str, constraint: DecodeConstraint,
                on_reason: TokenSink | None = None,
@@ -63,7 +79,8 @@ class OllamaClient(LLMClient):
         req = urllib.request.Request(
             self._cfg.ollama_url + "/api/generate",
             data=json.dumps({"model": self._cfg.model, "prompt": prompt,
-                             "stream": True, "options": self._options()}).encode(),
+                             "stream": True, "keep_alive": self._cfg.ollama_keep_alive,
+                             "options": self._options()}).encode(),
             headers={"Content-Type": "application/json"},
         )
         return self._read_stream(req, lambda obj: obj.get("response", ""),
@@ -102,9 +119,16 @@ class OllamaClient(LLMClient):
 
     # ---- streaming transport ----
     def _stream(self, path: str, payload: dict, on_token: TokenSink | None) -> str:
+        # ISSUE #77: a CONSTANT keep_alive is stamped on EVERY request here (the
+        # single chokepoint for /api/chat and /api/generate via _reason/_act). Paired
+        # with the pinned options.num_ctx (see _options) this means every request asks
+        # for the SAME runner shape and re-pins its keep_alive, so only one
+        # llama-server runner is ever spawned. An explicit per-payload keep_alive is
+        # NOT overridden (none is set today), keeping this future-proof.
+        body = {"keep_alive": self._cfg.ollama_keep_alive, **payload, "stream": True}
         req = urllib.request.Request(
             self._cfg.ollama_url + path,
-            data=json.dumps({**payload, "stream": True}).encode(),
+            data=json.dumps(body).encode(),
             headers={"Content-Type": "application/json"},
         )
         return self._read_stream(req, self._chat_or_response, on_token)
@@ -149,6 +173,10 @@ class OllamaClient(LLMClient):
 
     # ---- helpers ----
     def _options(self) -> dict:
+        # ISSUE #77: num_ctx (the pinned Config.num_ctx) is included here, and this
+        # dict is spread into EVERY request payload (_reason/_act/generate). That
+        # makes the requested runner shape identical across requests, so Ollama keys
+        # them all to the SAME (model, context-size) runner — at most one is spawned.
         c = self._cfg
         return {"temperature": c.temperature, "top_p": c.top_p, "top_k": c.top_k,
                 "num_ctx": c.num_ctx, "num_gpu": c.num_gpu}
