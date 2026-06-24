@@ -27,7 +27,12 @@ from .reporting import ConsoleReporter
 from .runlog import RunLogger
 from .settings import Settings, settable_keys
 from .snapshot_budget import compute_snapshot_budget, render_budgeted_snapshot
-from .toolset import ToolsetCatalog, agent_default_toolsets, default_catalog
+from .toolset import (
+    ToolsetCatalog,
+    agent_default_max_actions,
+    agent_default_toolsets,
+    default_catalog,
+)
 from .validation import LLMValidator
 from .web import make_raw_snapshot_provider
 
@@ -132,8 +137,39 @@ def codec_error(name: str) -> str | None:
     return f"error: unknown codec '{name}'. Available: {', '.join(available_codecs())}"
 
 
+def resolve_max_actions(args: argparse.Namespace) -> int:
+    """Resolve the per-turn tool-call cap for the selected agent (issue #52).
+
+    Precedence (high to low):
+      1. an EXPLICIT ``--max-actions-per-turn`` flag, or a saved setting for it,
+      2. the selected ``--agent`` type's default (``agent_default_max_actions``),
+      3. the global ``Config.max_actions_per_turn`` default.
+
+    The resolved value is the SINGLE source of truth: it is written into the run's
+    Config so BOTH the prompt builder ("you may emit up to N actions") and the agent
+    loop (which executes at most N) read the same number and cannot drift.
+    """
+    # An explicit per-run flag wins outright.
+    if getattr(args, "max_actions_per_turn", None) is not None:
+        return args.max_actions_per_turn
+    # A saved setting is an explicit user choice too — honour it over the agent default.
+    saved = Settings.load()
+    if "max_actions_per_turn" in saved:
+        return int(saved["max_actions_per_turn"])
+    # Otherwise fall back to the selected agent's default, then the global default.
+    global_default = Config.max_actions_per_turn
+    agent = getattr(args, "agent", None)
+    if agent:
+        return agent_default_max_actions(global_default).get(agent, global_default)
+    return global_default
+
+
 def resolve_config(args: argparse.Namespace) -> Config:
-    """Config defaults < saved settings < CLI flags (only those provided)."""
+    """Config defaults < saved settings < CLI flags (only those provided).
+
+    ``max_actions_per_turn`` additionally folds in the per-agent-type default (#52):
+    see :func:`resolve_max_actions` for the full precedence.
+    """
     cfg = Settings.apply(Config())
     overrides: dict[str, object] = {}
     if args.temp is not None:
@@ -144,8 +180,10 @@ def resolve_config(args: argparse.Namespace) -> Config:
         overrides["codec"] = args.codec
     if args.max_steps is not None:
         overrides["max_steps"] = args.max_steps
-    if getattr(args, "max_actions_per_turn", None) is not None:
-        overrides["max_actions_per_turn"] = args.max_actions_per_turn
+    # Resolve the per-turn cap once for the selected agent (explicit flag / saved
+    # setting > agent-type default > global default) and thread it through Config so
+    # the prompt builder and the agent loop share one source of truth.
+    overrides["max_actions_per_turn"] = resolve_max_actions(args)
     if getattr(args, "headless", False):
         overrides["web_headless"] = True
     return replace(cfg, **overrides) if overrides else cfg
