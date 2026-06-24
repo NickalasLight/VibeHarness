@@ -158,6 +158,30 @@ class RunnerTest(unittest.TestCase):
         self.assertEqual(d["passed"], 1)
         self.assertEqual(len(d["results"]), 1)
 
+    def test_transcript_dir_captures_run_artifacts(self):
+        import tempfile
+        from pathlib import Path
+        task = get_tasks([1])[0]
+        actions = [
+            {"tool": "create_file",
+             "args": {"path": "greeting.txt", "content": "Hello, world!"}},
+            VALIDATE,
+        ]
+        with tempfile.TemporaryDirectory() as td:
+            runner = BenchmarkRunner(
+                Config(max_steps=5),
+                client_factory=client_factory_for(actions),
+                validator_factory=pass_validator_factory,
+                verbose=False, transcript_dir=td)
+            runner.run_task("json", task)
+            txt = Path(td) / "json" / f"{task.number:02d}_{task.id}.txt"
+            js = Path(td) / "json" / f"{task.number:02d}_{task.id}.json"
+            self.assertTrue(txt.exists(), "transcript .txt was not written")
+            self.assertTrue(js.exists(), "transcript .json was not written")
+            self.assertIn("TASK:", txt.read_text(encoding="utf-8"))
+            self.assertIn("greeting.txt", txt.read_text(encoding="utf-8"))
+            json.loads(js.read_text(encoding="utf-8"))  # valid JSON dump
+
     def test_each_task_runs_in_isolated_workdir(self):
         # Two tasks in one codec run must not see each other's files: task 1 creates
         # greeting.txt; task 3 (dir tree) should pass independently in its own sandbox.

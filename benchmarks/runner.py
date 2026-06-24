@@ -167,15 +167,37 @@ class BenchmarkRunner:
     def __init__(self, config: Config | None = None,
                  client_factory: ClientFactory = _default_client_factory,
                  validator_factory: ValidatorFactory = _default_validator_factory,
-                 verbose: bool = True):
+                 verbose: bool = True,
+                 transcript_dir: Path | str | None = None):
         self._cfg = config or Config()
         self._client_factory = client_factory
         self._validator_factory = validator_factory
         self._verbose = verbose
+        # When set, the full per-run transcript (reasoning, raw actions, every
+        # observation) is saved per (codec, task) for later analysis. Resolved to an
+        # ABSOLUTE path now because each task runs inside a chdir'd temp sandbox.
+        self._transcript_dir = Path(transcript_dir).resolve() if transcript_dir else None
 
     def _log(self, msg: str) -> None:
         if self._verbose:
             print(msg, flush=True)
+
+    def _save_transcript(self, codec_name: str, task: Task, result) -> None:
+        """Write the run's full transcript + structured dump under
+        ``<transcript_dir>/<codec>/<NN_taskid>.{txt,json}``. Best-effort: a save
+        failure must never fail the benchmark."""
+        if self._transcript_dir is None:
+            return
+        try:
+            out = self._transcript_dir / codec_name
+            out.mkdir(parents=True, exist_ok=True)
+            stem = f"{task.number:02d}_{task.id}"
+            (out / f"{stem}.txt").write_text(result.transcript(), encoding="utf-8")
+            (out / f"{stem}.json").write_text(
+                json.dumps(result.to_dict(), indent=2, ensure_ascii=False),
+                encoding="utf-8")
+        except Exception as e:  # pragma: no cover - defensive
+            self._log(f"  (warning: could not save transcript for {task.id}: {e})")
 
     def run_task(self, codec_name: str, task: Task) -> TaskResult:
         """Run a single task under a single codec in its own temp sandbox."""
@@ -227,6 +249,7 @@ class BenchmarkRunner:
                 return TaskResult(task.id, task.number, False,
                                   f"run error: {error}", turns, elapsed, finished, error)
 
+            self._save_transcript(codec_name, task, result)
             passed, detail = task.run_check(workdir)
             return TaskResult(task.id, task.number, passed, detail,
                               turns, elapsed, finished)
@@ -313,6 +336,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="also write the full results as JSON to this path")
     p.add_argument("--md-out", default=None, metavar="PATH",
                    help="also write the comparison table as markdown to this path")
+    p.add_argument("--transcript-dir", default=None, metavar="DIR",
+                   help="save each run's full transcript (+JSON dump) under "
+                        "DIR/<codec>/<task>.{txt,json} for later analysis")
     p.add_argument("--list-codecs", action="store_true",
                    help="list available codecs and exit")
     return p
@@ -360,7 +386,8 @@ def main(argv: list[str] | None = None,
         return 2
 
     config = resolve_config(args)
-    runner = BenchmarkRunner(config, client_factory, validator_factory)
+    runner = BenchmarkRunner(config, client_factory, validator_factory,
+                             transcript_dir=args.transcript_dir)
     cards = runner.run(codec_names, tasks)
 
     print("\n=== comparison ===")
