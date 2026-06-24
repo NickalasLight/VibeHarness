@@ -59,9 +59,30 @@ array (string-aware brace scan). A valid call is no longer discarded over a miss
 Added regression tests (fenced / bare / array); `tests/test_codec_hermes.py` = 26 passed.
 Commit: see git log `fix(#125): hermes parser tolerant of fenced/bare JSON`.
 
-### Iteration 2 — IN PROGRESS
-Re-run with the tolerant parser. Watching for: tool calls now PARSE + EXECUTE; browser opens +
-navigates to `/apply`; the live SPA form snapshot reaches the agent; first real form fills.
+### Iteration 2 — DONE (task b2e0wsnnf) — BIG progress, two new issues found
+**Tolerant parser worked: tool calls now PARSE + EXECUTE.** The agent navigated to `/apply`
+and successfully filled First name, Email, Apt, Phone, City via `fill` on real refs. Encoding
+is healthy. Two problems surfaced:
+1. **Two-phase waste (transport):** the model emits a tool call in BOTH the phase-1 "thinking"
+   channel (DISCARDED) and the phase-2 "action" channel (executed). qwen2.5-coder is a
+   non-thinking instruct model, so phase 1 = a wasted real call. Worse, the model's combobox
+   RECOVERY clicks (e.g. `click e65` to open the State dropdown) kept landing in the discarded
+   thinking channel while the failing action ran — blocking recovery.
+2. **Custom combobox loop (next iteration):** State `e82` is a `<div role="listbox">` custom
+   combobox, NOT a native `<select>`; `select_option` fails ("Element is not a <select>"). The
+   agent looped 7 turns retrying `select_option(e82,"TX")` and froze (last-name field also got
+   muddled). `select_option` can't drive a custom combo — needs click-open + click-option.
+
+**Fix applied (this iteration → issue #1, the higher-leverage one):** added SINGLE-phase
+generation. `Config.two_phase=False` (branch default) → `decide()` does ONE native `/api/chat`
+call and the codec parses the tool call from it; no discarded duplicate. `llm.py:_chat` added;
+two-phase preserved for VibeThinker/mythos. Full suite **548 passed**. Commit: `fix(#125):
+single-phase generation for non-thinking instruct model`.
+
+### Iteration 3 — IN PROGRESS
+Re-run with single-phase. Watching for: no wasted phase-1 call; full per-turn throughput; does
+the model now self-recover on the State combobox (click-open then click TX)? If it still loops
+on `select_option`, the NEXT fix is combobox handling (click-based selection / guidance).
 
 ## Current status
-RUNNING iteration 2 (3-min cap). Awaiting completion notification.
+RUNNING iteration 3 (3-min cap). Awaiting completion notification.

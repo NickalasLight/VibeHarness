@@ -92,14 +92,16 @@ class RequestShapeTest(unittest.TestCase):
         return fake
 
     def test_decide_sends_num_ctx_and_keep_alive_on_every_request(self):
-        # phase 1 (/api/chat) then phase 2 (/api/generate): two recorded bodies.
+        # TWO-phase path (VibeThinker / mythos): phase 1 (/api/chat) then phase 2
+        # (/api/generate) -> two recorded bodies, each carrying the runner-shape options.
+        cfg = Config(ollama_url="http://test:11434", two_phase=True)
         phase1 = _FakeResponse([_line({"message": {"content": "think"}}),
                                 _line({"done": True})])
         phase2 = _FakeResponse([_line({"response": '{"tool":"x"}'}),
                                 _line({"done": True})])
         fake = self._install([phase1, phase2])
 
-        OllamaClient(self.cfg).decide("SYS", "USER", DecodeConstraint())
+        OllamaClient(cfg).decide("SYS", "USER", DecodeConstraint())
 
         self.assertEqual(len(fake.bodies), 2)  # both phases issued a request
         for body in fake.bodies:
@@ -107,6 +109,22 @@ class RequestShapeTest(unittest.TestCase):
                              msg="keep_alive missing/wrong on a request")
             self.assertEqual(body["options"]["num_ctx"], 32768,
                              msg="num_ctx missing/wrong on a request")
+
+    def test_decide_single_phase_sends_one_chat_request(self):
+        # SINGLE-phase path (#125, qwen3coder default two_phase=False): decide() issues
+        # exactly ONE /api/chat request, still stamped with num_ctx + keep_alive.
+        cfg = Config(ollama_url="http://test:11434")  # two_phase defaults to False
+        self.assertFalse(cfg.two_phase)
+        chat = _FakeResponse([_line({"message": {"content": '{"name":"x","arguments":{}}'}}),
+                              _line({"done": True})])
+        fake = self._install([chat])
+
+        d = OllamaClient(cfg).decide("SYS", "USER", DecodeConstraint())
+
+        self.assertEqual(len(fake.bodies), 1)
+        self.assertEqual(d.reasoning, "")  # no separate reasoning pass
+        self.assertEqual(fake.bodies[0]["keep_alive"], "30m")
+        self.assertEqual(fake.bodies[0]["options"]["num_ctx"], 32768)
 
     def test_generate_sends_num_ctx_and_keep_alive(self):
         resp = _FakeResponse([_line({"response": "hi"}), _line({"done": True})])

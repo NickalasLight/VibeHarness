@@ -73,6 +73,13 @@ class OllamaClient(LLMClient):
     def decide(self, system: str, user: str, constraint: DecodeConstraint,
                on_reason: TokenSink | None = None,
                on_action: TokenSink | None = None) -> Decision:
+        # SINGLE-phase (#125): one native /api/chat generation yields the tool call
+        # directly. For non-thinking instruct models (qwen2.5-coder) the separate
+        # reasoning pass only produces a discarded duplicate call. The codec parses the
+        # call from the full output; there is no separate reasoning to stream/keep.
+        if not self._cfg.two_phase:
+            action = self._chat(system, user, constraint, on_action)
+            return Decision(reasoning="", action_json=action)
         reasoning = self._reason(system, user, on_reason)
         action = self._act(system, user, reasoning, constraint, on_action)
         return Decision(reasoning=reasoning, action_json=action)
@@ -92,6 +99,31 @@ class OllamaClient(LLMClient):
         )
         return self._read_stream(req, lambda obj: obj.get("response", ""),
                                  on_token, max_chars=max_chars)
+
+    # ---- single-phase: one native chat generation (#125, two_phase=False) ----
+    def _chat(self, system: str, user: str, constraint: DecodeConstraint,
+              on_token: TokenSink | None) -> str:
+        """One /api/chat generation that yields the tool call directly.
+
+        Uses the model's native chat template (system + user -> assistant), greedy for
+        verbatim string fidelity, with a generous budget so any short preamble plus the
+        tool-call JSON fit. The codec's tolerant parse() extracts the call from the
+        output (``<tool_call>`` block, ```json fence, or bare/array JSON)."""
+        payload = {
+            "model": self._cfg.model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            "options": {**self._options(),
+                        "temperature": self._cfg.action_temperature,
+                        "num_predict": self._cfg.reason_tokens + self._cfg.action_tokens,
+                        "stop": list(constraint.stop)},
+        }
+        # Honour a JSON-schema constraint if a codec supplies one (hermes does not).
+        if constraint.json_schema is not None:
+            payload["format"] = constraint.json_schema
+        return self._stream("/api/chat", payload, on_token).strip()
 
     # ---- phase 1: free reasoning, stop at </think> ----
     def _reason(self, system: str, user: str, on_token: TokenSink | None) -> str:

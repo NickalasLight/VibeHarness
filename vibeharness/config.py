@@ -51,6 +51,17 @@ class Config:
     # trained dialect. On `beta` this default is "json".
     codec: str = "hermes"
 
+    # ISSUE #125 (beta_qwen3coder): SINGLE-phase generation. The two-phase
+    # reason-then-act transport (free <think> pass, then a raw continuation constrained
+    # to the action) exists for VibeThinker, which emits long <think> chains. But
+    # qwen2.5-coder:3b-instruct is a NON-thinking instruct model: it emits a tool call
+    # immediately, so phase 1 produces a real tool call that is then DISCARDED and phase 2
+    # emits another — halving throughput and dropping the model's primary intent (observed
+    # in #125 iter 2: recovery clicks landed in the thrown-away phase-1 channel). With
+    # two_phase=False, decide() does ONE native /api/chat generation and the codec parses
+    # the call from it. On `beta`/`beta_mythos_fast` (VibeThinker) this stays True.
+    two_phase: bool = False
+
     # context + per-turn token budgets.
     # num_ctx is the whole window (system prompt + history + generation share it).
     #
