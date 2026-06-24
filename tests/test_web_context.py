@@ -120,7 +120,7 @@ class PerTurnSnapshotInjectionTest(unittest.TestCase):
         builder = SystemPromptBuilder(_registry(["web"]))
         page = self._provider(cli)
         sp = builder.build("DO THE THING", page=page())
-        self.assertIn("# Current page (live snapshot)", sp)
+        self.assertIn("# Current page (live snapshot", sp)
         self.assertIn("FIRST-SNAP consent dialog", sp)
 
     def test_second_turn_drops_stale_snapshot(self):
@@ -154,13 +154,13 @@ class PerTurnSnapshotInjectionTest(unittest.TestCase):
         # fs-only: cli.py passes no page provider, so build() gets page="" and emits
         # no page section.
         sp = SystemPromptBuilder(_registry(["fs"])).build("DO THE THING", page="")
-        self.assertNotIn("# Current page (live snapshot)", sp)
+        self.assertNotIn("# Current page (live snapshot", sp)
 
     def test_page_section_truncated_to_cap(self):
         cli = _FakeSnapshotCli(["z" * 9000])
         sp = SystemPromptBuilder(_registry(["web"])).build(
             "T", page=capture_page_snapshot(cli, char_limit=200))
-        self.assertIn("# Current page (live snapshot)", sp)
+        self.assertIn("# Current page (live snapshot", sp)
         self.assertIn("truncated", sp)
 
 
@@ -216,7 +216,7 @@ class CliSnapshotProviderGatingTest(unittest.TestCase):
         _, render_page = self._wire(["fs"])
         self.assertEqual(render_page(), "")
         sp = SystemPromptBuilder(_registry(["fs"])).build("DO THE THING", page=render_page())
-        self.assertNotIn("# Current page (live snapshot)", sp)
+        self.assertNotIn("# Current page (live snapshot", sp)
 
     def test_web_render_page_feeds_snapshot_into_page_section(self):
         # web active: swap in a fake CLI (no browser) so the provider yields canned
@@ -227,7 +227,7 @@ class CliSnapshotProviderGatingTest(unittest.TestCase):
         cli = _FakeSnapshotCli(["### Page\nWIRED-SNAP consent banner"])
         render_page = lambda: capture_page_snapshot(cli, 6000)
         sp = SystemPromptBuilder(_registry(["web"])).build("T", page=render_page())
-        self.assertIn("# Current page (live snapshot)", sp)
+        self.assertIn("# Current page (live snapshot", sp)
         self.assertIn("WIRED-SNAP consent banner", sp)
 
 

@@ -163,10 +163,13 @@ class PlaywrightCli:
 
 
 # Shared element-targeting guidance, woven into every tool that takes a `target`.
+# NOTE: deliberately does NOT embed the page-section heading text verbatim — that
+# heading is a structural marker tests use to detect the auto-injected page section,
+# and repeating it inside a tool description would create false matches.
 _REF_NOTE = (
-    "Target an element by the stable ref shown for it in the live page snapshot "
-    "(e.g. 'e6'), or by a CSS selector. The snapshot is provided to you automatically "
-    "each turn under '# Current page (live snapshot ...)' — never guess a ref."
+    "Target an element by the stable ref shown for it in the live page view "
+    "(e.g. 'e6'), or by a CSS selector. That page view is provided to you "
+    "automatically each turn — never guess a ref."
 )
 
 
@@ -475,8 +478,9 @@ def capture_page_snapshot(cli: PlaywrightCli, char_limit: int) -> str:
     return its text, truncated to ``char_limit`` (issue #24).
 
     Reuses the supplied :class:`PlaywrightCli` — i.e. the SAME named session the
-    agent's `browse` tool drives — so the captured snapshot reflects the actual
-    page the model is acting on; it never launches a second browser. On any failure
+    agent's discrete browser tools (goto/click/fill/…) drive — so the captured
+    snapshot reflects the actual page the model is acting on; it never launches a
+    second browser. This is internal auto-injection, NOT an agent tool. On any failure
     (no session open yet, CLI error, timeout) it returns "" so the caller simply
     renders no page section that turn rather than crashing the run.
 
@@ -520,7 +524,8 @@ def make_snapshot_provider(config: Config) -> Callable[[], str]:
     each time it is called (once per turn, at prompt-build time), captures a FRESH
     snapshot from the run's existing Playwright session and returns it truncated to
     ``config.web_snapshot_char_limit``. The session name and timeout come from
-    ``config`` so the snapshot CLI shares the exact session the `browse` tool uses.
+    ``config`` so the snapshot CLI shares the exact session the discrete browser
+    tools use.
 
     NOTE (#43): this fixed-cap provider is retained for backward compatibility and
     tests; the live run now uses :func:`make_raw_snapshot_provider` plus the dynamic

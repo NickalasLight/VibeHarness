@@ -109,9 +109,21 @@ See [Toolsets](#toolsets) for details.
 ```bash
 git clone https://github.com/NickalasLight/VibeHarness.git
 cd VibeHarness
-pip install -e .          # creates the `vibe` console command
+pip install -e .          # EDITABLE install: creates the `vibe` console command
+vibe --version           # -> vibe <version> (build <git-short-sha>)
 vibe "list this folder and tell me what's here"
 ```
+
+> **Run the source you think you're running.** Always install **editable** (`pip install -e .`)
+> from the checkout you are editing — then the `vibe` command imports *this* working tree, so
+> source changes take effect immediately with no reinstall. Confirm it any time with:
+> ```bash
+> vibe --version            # prints the package version + the git short-sha it was built from
+> pip show vibeharness      # "Editable project location" must point at your checkout
+> ```
+> If `vibe --version` shows an unexpected sha, you are on a stale build — re-run `pip install -e .`
+> from the right directory. On Windows, if the console script can't be written to a system
+> `Scripts\` folder (Access denied), install into your user site with `pip install -e . --user`.
 
 ### Option B — no install
 ```bash

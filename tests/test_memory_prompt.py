@@ -179,8 +179,10 @@ class ToolsetGuidanceTest(unittest.TestCase):
         from vibeharness.web import WebToolset
         text = WebToolset().system_guidance()
         self.assertIsNotNone(text)
-        # Names the live-snapshot section verbatim so the model reads it each turn...
-        self.assertIn("# Current page (live snapshot)", text)
+        # Names the live-snapshot section so the model reads it each turn (the page
+        # is provided automatically; there is no snapshot tool to request it — #51)...
+        self.assertIn("# Current page (live snapshot", text)
+        self.assertIn("provided automatically", text.lower())
         # ...and still keeps the #23 consent/banner-dismissal guidance.
         lower = text.lower()
         self.assertTrue(
@@ -196,7 +198,7 @@ class ToolsetGuidanceTest(unittest.TestCase):
         # End to end through the builder: a web-active system prompt's guidance
         # section references the same heading the snapshot is injected under (#24).
         sp = self._build(["web"])
-        self.assertIn("# Current page (live snapshot)", sp)
+        self.assertIn("# Current page (live snapshot", sp)
 
 
 class ToolsetGuidanceHookTest(unittest.TestCase):

@@ -44,7 +44,10 @@ class ToolsetCatalogTest(unittest.TestCase):
         registry = catalog.build_registry(catalog.select(["fs", "web"]), self.config)
         names = set(registry.names())
         self.assertIn("read_file", names)   # from fs
-        self.assertIn("browse", names)      # from web
+        self.assertIn("goto", names)        # a discrete web subtool (#51)
+        self.assertIn("click", names)       # another discrete web subtool
+        self.assertNotIn("browse", names)   # the monolithic browse tool is gone (#51)
+        self.assertNotIn("snapshot", names) # the snapshot tool is gone (#51)
         self.assertIn("validate", names)    # core, injected into every registry
 
 

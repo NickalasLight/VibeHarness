@@ -1,11 +1,13 @@
-"""Unit tests for BrowseTool's pure error/guard surface.
+"""Unit tests for the discrete web subtools' pure error/guard surface (issue #51).
 
-The arg-mapping happy paths (goto/snapshot/click/eval -> CLI args) are deliberately
-NOT re-asserted here against a recorder: they merely restate BrowseTool's
-implementation and are now proven for real, end to end, in
-tests/integration/test_web_live.py. What remains here are the pure-unit paths a
-live browser can't cheaply force on demand: the fill-missing-text guard,
-unknown-action, output truncation, and the schema branch.
+The monolithic ``browse(action=...)`` tool was split into one first-class Tool per
+playwright-cli operation (goto, click, fill, type, press_key, select_option, …) and
+the agent-facing ``snapshot`` tool was removed entirely. The arg-mapping happy paths
+are proven end to end in tests/integration/test_web_live.py; what remains here are the
+pure-unit paths a live browser can't cheaply force: the missing-required-param guard,
+the CLI->argv mapping (against a recorder, since there is no single dispatcher to
+prove anymore), output truncation, error-observation phrasing, and the per-tool
+call schema.
 """
 import subprocess
 import sys
@@ -13,47 +15,150 @@ import time
 import unittest
 
 from vibeharness.config import Config
-from vibeharness.web import BrowseTool, PlaywrightCli, WebToolset
+from vibeharness.web import (
+    PlaywrightCli, WebToolset,
+    GotoTool, ClickTool, FillTool, TypeTool, PressKeyTool, SelectOptionTool,
+    CheckTool, UncheckTool, HoverTool, DragTool, UploadTool, EvaluateTool,
+    ScreenshotTool, NavigateBackTool, NavigateForwardTool, ReloadTool,
+    _WEB_TOOL_CLASSES,
+)
 
 from tests._fakes import FakeCli
 
 
-class BrowseToolTest(unittest.TestCase):
-    def _tool(self, ok=True, output="### Page URL: https://example.com"):
-        self.cli = FakeCli(ok=ok, output=output)
-        return BrowseTool(self.cli, observation_limit=1000)
+class SubtoolMappingTest(unittest.TestCase):
+    """Each discrete subtool maps its validated args to the right playwright-cli argv,
+    phrases a clear past-tense observation, and surfaces CLI failures as ok=False."""
+
+    def _make(self, cls, ok=True, output="### Page URL: https://example.com"):
+        cli = FakeCli(ok=ok, output=output)
+        return cls(cli, observation_limit=1000), cli
+
+    def test_goto_maps_to_goto_url(self):
+        tool, cli = self._make(GotoTool)
+        res = tool.run({"url": "https://example.com"})
+        self.assertTrue(res.ok)
+        self.assertEqual(cli.calls, [["goto", "https://example.com"]])
+        self.assertIn("navigated to", res.observation)
+
+    def test_click_maps_to_click_target(self):
+        tool, cli = self._make(ClickTool)
+        tool.run({"target": "e6"})
+        self.assertEqual(cli.calls, [["click", "e6"]])
+
+    def test_fill_maps_to_fill_target_text(self):
+        tool, cli = self._make(FillTool)
+        tool.run({"target": "e3", "text": "John"})
+        self.assertEqual(cli.calls, [["fill", "e3", "John"]])
+
+    def test_type_maps_to_type_text(self):
+        tool, cli = self._make(TypeTool)
+        tool.run({"text": "hello"})
+        self.assertEqual(cli.calls, [["type", "hello"]])
+
+    def test_press_key_maps_to_press_key(self):
+        tool, cli = self._make(PressKeyTool)
+        tool.run({"key": "Enter"})
+        self.assertEqual(cli.calls, [["press", "Enter"]])
+
+    def test_select_option_maps_to_select(self):
+        tool, cli = self._make(SelectOptionTool)
+        tool.run({"target": "e9", "value": "TX"})
+        self.assertEqual(cli.calls, [["select", "e9", "TX"]])
+
+    def test_check_and_uncheck_map_through(self):
+        t1, c1 = self._make(CheckTool)
+        t1.run({"target": "e1"})
+        self.assertEqual(c1.calls, [["check", "e1"]])
+        t2, c2 = self._make(UncheckTool)
+        t2.run({"target": "e1"})
+        self.assertEqual(c2.calls, [["uncheck", "e1"]])
+
+    def test_hover_maps_to_hover(self):
+        tool, cli = self._make(HoverTool)
+        tool.run({"target": "e5"})
+        self.assertEqual(cli.calls, [["hover", "e5"]])
+
+    def test_drag_maps_to_drag_start_end(self):
+        tool, cli = self._make(DragTool)
+        tool.run({"target": "e1", "end": "e2"})
+        self.assertEqual(cli.calls, [["drag", "e1", "e2"]])
+
+    def test_upload_maps_to_upload_file(self):
+        tool, cli = self._make(UploadTool)
+        tool.run({"file": "/tmp/cv.pdf"})
+        self.assertEqual(cli.calls, [["upload", "/tmp/cv.pdf"]])
+
+    def test_evaluate_maps_to_eval(self):
+        tool, cli = self._make(EvaluateTool)
+        tool.run({"expression": "() => document.title"})
+        self.assertEqual(cli.calls, [["eval", "() => document.title"]])
+
+    def test_navigate_back_forward_reload_map_through(self):
+        for cls, expect in ((NavigateBackTool, ["go-back"]),
+                            (NavigateForwardTool, ["go-forward"]),
+                            (ReloadTool, ["reload"])):
+            tool, cli = self._make(cls)
+            tool.run({})
+            self.assertEqual(cli.calls, [expect])
+
+    def test_screenshot_optional_target(self):
+        t1, c1 = self._make(ScreenshotTool)
+        t1.run({})
+        self.assertEqual(c1.calls, [["screenshot"]])
+        t2, c2 = self._make(ScreenshotTool)
+        t2.run({"target": "e7"})
+        self.assertEqual(c2.calls, [["screenshot", "e7"]])
 
     def test_fill_requires_target_and_text(self):
-        res = self._tool().run({"action": "fill", "target": "e3"})
+        tool, cli = self._make(FillTool)
+        res = tool.run({"target": "e3"})         # missing text
         self.assertFalse(res.ok)
         self.assertIn("text", res.observation)
-        self.assertEqual(self.cli.calls, [])  # never reached the CLI
+        self.assertEqual(cli.calls, [])          # never reached the CLI
 
-    def test_unknown_action_is_error(self):
-        res = self._tool().run({"action": "teleport"})
+    def test_goto_requires_url(self):
+        tool, cli = self._make(GotoTool)
+        res = tool.run({})
         self.assertFalse(res.ok)
-        self.assertIn("unknown browser action", res.observation)
+        self.assertIn("url", res.observation)
+        self.assertEqual(cli.calls, [])
 
     def test_output_is_truncated(self):
-        tool = BrowseTool(FakeCli(output="x" * 5000), observation_limit=100)
-        res = tool.run({"action": "snapshot"})
+        tool = GotoTool(FakeCli(output="x" * 5000), observation_limit=100)
+        res = tool.run({"url": "https://example.com"})
         self.assertIn("truncated", res.observation)
 
     def test_failed_eval_surfaces_as_error_observation(self):
         # A null/throwing eval (CLI exits non-zero) must come back as a normal
         # ok=False observation the agent can adapt to — not a hang (issue #4).
-        tool = self._tool(ok=False, output="Error: Cannot read properties of null")
-        res = tool.run({"action": "eval",
-                        "expression": "() => document.querySelector('video').play()"})
+        tool = EvaluateTool(FakeCli(ok=False, output="Error: Cannot read properties of null"),
+                            observation_limit=1000)
+        res = tool.run({"expression": "() => document.querySelector('video').play()"})
         self.assertFalse(res.ok)
         self.assertIn("failed", res.observation)
         self.assertIn("null", res.observation)
 
-    def test_browse_schema_branch_present(self):
-        tool = self._tool()
-        schema = tool.call_schema()
-        self.assertEqual(schema["properties"]["tool"]["const"], "browse")
-        self.assertIn("action", schema["properties"]["args"]["properties"])
+
+class SubtoolSchemaTest(unittest.TestCase):
+    def test_each_subtool_call_schema_names_itself(self):
+        for cls in _WEB_TOOL_CLASSES:
+            tool = cls(FakeCli(), observation_limit=1000)
+            schema = tool.call_schema()
+            self.assertEqual(schema["properties"]["tool"]["const"], tool.name)
+            # args is an object schema derived from the tool's params.
+            self.assertEqual(schema["properties"]["args"]["type"], "object")
+
+    def test_no_subtool_is_named_browse_or_snapshot(self):
+        names = {cls.name for cls in _WEB_TOOL_CLASSES}
+        self.assertNotIn("browse", names)
+        self.assertNotIn("snapshot", names)
+
+    def test_required_params_marked_in_schema(self):
+        schema = FillTool(FakeCli(), 1000).call_schema()
+        required = schema["properties"]["args"].get("required", [])
+        self.assertIn("target", required)
+        self.assertIn("text", required)
 
 
 class _SleepCli(PlaywrightCli):
@@ -92,20 +197,19 @@ class TimeoutTest(unittest.TestCase):
         # proving the call did NOT hang past the bound.
         self.assertLess(elapsed, 15, "web action hung past its timeout (issue #4)")
 
-    def test_timeout_error_surfaces_as_browse_tool_observation(self):
+    def test_timeout_error_surfaces_as_web_tool_observation(self):
         # The agent only ever sees a ToolResult; assert the timeout becomes a
         # clear ok=False observation naming the action, so the agent can adapt.
         cli = _SleepCli(timeout=1, sleep_seconds=30)
-        tool = BrowseTool(cli, observation_limit=1000)
+        tool = EvaluateTool(cli, observation_limit=1000)
         start = time.monotonic()
-        res = tool.run({"action": "eval",
-                        "expression": "() => document.querySelector('video').play()"})
+        res = tool.run({"expression": "() => document.querySelector('video').play()"})
         elapsed = time.monotonic() - start
 
         self.assertFalse(res.ok)
-        self.assertIn("evaluated JavaScript on", res.observation)  # the 'eval' verb
+        self.assertIn("evaluated JavaScript on", res.observation)  # the 'evaluate' verb
         self.assertIn("timed out after 1s", res.observation)
-        self.assertLess(elapsed, 15, "browse tool hung past its timeout (issue #4)")
+        self.assertLess(elapsed, 15, "web tool hung past its timeout (issue #4)")
 
     def test_timeout_expired_is_caught_not_propagated(self):
         # If communicate() raises TimeoutExpired (the documented timeout signal),

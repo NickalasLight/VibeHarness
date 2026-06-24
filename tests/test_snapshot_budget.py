@@ -273,14 +273,16 @@ class EndToEndProviderTest(unittest.TestCase):
         cfg = _cfg()
         raw = "### Page\nCONSENT BANNER e6"
         sp = self._provider(cfg, raw)(user="short user message")
-        self.assertIn("# Current page (live snapshot)", sp)
+        self.assertIn("# Current page (live snapshot", sp)
         self.assertIn("CONSENT BANNER e6", sp)
         self.assertNotIn("truncated", sp)
 
     def test_large_snapshot_truncated_against_full_message(self):
-        # Tiny window so even a modest snapshot must truncate; the user message is part
-        # of 'rest', so a bigger user message yields a smaller injected snapshot.
-        cfg = _cfg(num_ctx=4_100, reason_tokens=500, action_tokens=1_500,
+        # Small window so even a modest snapshot must truncate; the user message is part
+        # of 'rest', so a bigger user message yields a smaller injected snapshot. The
+        # web system prompt now documents 16 discrete subtools (#51), so this window is
+        # sized to leave room for that larger 'rest' PLUS a truncatable snapshot.
+        cfg = _cfg(num_ctx=8_000, reason_tokens=500, action_tokens=1_500,
                    snapshot_safety_margin_tokens=0)
         raw = "z" * 100_000
         small_user = self._provider(cfg, raw)(user="u" * 100)
@@ -295,12 +297,12 @@ class EndToEndProviderTest(unittest.TestCase):
         cfg = _cfg(num_ctx=600, reason_tokens=200, action_tokens=300,
                    snapshot_safety_margin_tokens=0)
         sp = self._provider(cfg, "z" * 100_000)(user="u" * 8_000)
-        self.assertNotIn("# Current page (live snapshot)", sp)
+        self.assertNotIn("# Current page (live snapshot", sp)
 
     def test_no_snapshot_renders_no_page_section(self):
         cfg = _cfg()
         sp = self._provider(cfg, "")(user="hi")
-        self.assertNotIn("# Current page (live snapshot)", sp)
+        self.assertNotIn("# Current page (live snapshot", sp)
 
     def test_provider_accepts_user_message(self):
         # The provider must accept the per-turn user message (arity contract for #43).

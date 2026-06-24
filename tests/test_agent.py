@@ -134,7 +134,7 @@ class AgentLoopTest(unittest.TestCase):
         # not-ok action; the loop does not crash and goes on to validate+finish.
         cases = [
             ("{ not json", "invalid"),                       # unparseable JSON
-            ({"tool": "teleport", "args": {}}, "not a real tool"),  # unknown tool
+            ({"tool": "teleport", "args": {}}, "is not a valid tool"),  # unknown tool
         ]
         for bad_action, expected in cases:
             with self.subTest(bad_action=bad_action):
