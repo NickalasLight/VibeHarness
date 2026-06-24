@@ -197,5 +197,121 @@ class TestConfigSeam(unittest.TestCase):
         self.assertEqual(unwrapped(), _CONSENT)
 
 
+import os
+
+# The real raw ARIA capture (YouTube, native [ref=eN]) from a live diagnostics run. We
+# assert the #70 interactable-labeling fixes against UNMODIFIED raw ARIA, not a hand-built
+# fixture, so the test reflects what the agent actually sees.
+_REAL_SNAPSHOT = (
+    r"C:\git\vh-ashley38\.vibe\20260624_074859-diagnostics"
+    r"\turn-003-snapshot-20260624_075650_524351.txt"
+)
+
+
+def _load_real_prose():
+    if not os.path.exists(_REAL_SNAPSHOT):
+        return None
+    with open(_REAL_SNAPSHOT, encoding="utf-8") as f:
+        return aria_yaml_to_prose(f.read())
+
+
+class TestInteractableLabelingRealSnapshot(unittest.TestCase):
+    """Issue #70: interactables in the prose must be unmistakable, over REAL raw ARIA."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.prose = _load_real_prose()
+
+    def setUp(self):
+        if self.prose is None:
+            self.skipTest(f"real snapshot not present: {_REAL_SNAPSHOT}")
+
+    def _line_with(self, ref):
+        for line in self.prose.splitlines():
+            if f"[{ref}]" in line:
+                return line
+        return None
+
+    def test_search_combobox_is_fillable_text_field_with_fill_affordance(self):
+        # HEADLINE FIX: the YouTube search box is `combobox "Search" [ref=e104]`. It must
+        # render as a FILLABLE TEXT FIELD that cues `fill` — never "dropdown"/select_option.
+        line = self._line_with("e104")
+        self.assertIsNotNone(line, "search combobox e104 dropped from prose")
+        self.assertTrue(line.lstrip().startswith("[e104]"), line)   # ref preserved
+        self.assertIn('text field "Search"', line)
+        self.assertIn("type a value with fill", line)
+        self.assertNotIn("dropdown", line)
+        self.assertNotIn("select_option", line)
+
+    def test_button_line_has_click_affordance(self):
+        # The "Search" submit button (e79) is a real button -> click.
+        line = self._line_with("e79")
+        self.assertIsNotNone(line)
+        self.assertIn("button", line)
+        self.assertTrue(line.rstrip().endswith("— click"), line)
+
+    def test_dialog_accept_reject_keep_refs_and_click_affordance(self):
+        # Consent Accept/Reject must still carry refs AND a click affordance.
+        for ref in ("e1293", "e1300"):
+            line = self._line_with(ref)
+            self.assertIsNotNone(line, f"dialog control {ref} dropped")
+            self.assertTrue(line.lstrip().startswith(f"[{ref}]"), line)
+            self.assertIn("button", line)
+            self.assertTrue(line.rstrip().endswith("— click"), line)
+        # blocking-dialog preamble still present
+        self.assertIn("OPEN IN FRONT", self.prose)
+        self.assertIn("[e1206]", self.prose)
+
+
+class TestInteractableLabelingFixtures(unittest.TestCase):
+    """A genuine <select>/listbox is not in the real snapshot — construct one in a fixture."""
+
+    def test_true_listbox_renders_with_select_option(self):
+        raw = (
+            "```yaml\n"
+            '- listbox "Country" [ref=e10]:\n'
+            '  - option "Germany" [ref=e11]\n'
+            '  - option "Austria" [ref=e12]\n'
+            "```"
+        )
+        prose = aria_yaml_to_prose(raw)
+        listbox_line = next(l for l in prose.splitlines() if "e10" in l)
+        self.assertIn("dropdown list", listbox_line)
+        self.assertIn("pick an option with select_option", listbox_line)
+        # options surfaced for context, not mislabeled as the primary fill/click target
+        self.assertIn('option "Germany"', prose)
+
+    def test_native_select_renders_with_select_option(self):
+        raw = '```yaml\n- select "Sort by" [ref=e20]\n```'
+        prose = aria_yaml_to_prose(raw)
+        line = next(l for l in prose.splitlines() if "e20" in l)
+        self.assertIn("dropdown list", line)
+        self.assertIn("select_option", line)
+
+    def test_checkbox_renders_with_toggle_affordance(self):
+        raw = '```yaml\n- checkbox "Remember me" [ref=e30]\n```'
+        prose = aria_yaml_to_prose(raw)
+        line = next(l for l in prose.splitlines() if "e30" in l)
+        self.assertIn("toggle with check/uncheck", line)
+
+    def test_actionable_role_without_ref_flagged_not_targetable(self):
+        # A button with no ref (decorative-looking but actionable role) must be flagged,
+        # not silently shown with a bare [-] that looks identical to ignorable chrome.
+        raw = '```yaml\n- button "Ghost"\n```'
+        prose = aria_yaml_to_prose(raw)
+        line = next(l for l in prose.splitlines() if "Ghost" in l)
+        self.assertIn("(no ref)", line)
+        self.assertIn("not directly targetable", line)
+
+    def test_combobox_default_is_text_field_not_dropdown(self):
+        # The safer-failure-mode default for an unqualified combobox.
+        raw = '```yaml\n- combobox "Search" [ref=e1]\n```'
+        prose = aria_yaml_to_prose(raw)
+        line = next(l for l in prose.splitlines() if "e1" in l)
+        self.assertIn("text field", line)
+        self.assertIn("fill", line)
+        self.assertNotIn("dropdown", line)
+
+
 if __name__ == "__main__":
     unittest.main()
