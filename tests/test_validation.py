@@ -27,14 +27,14 @@ class ValidatorTest(unittest.TestCase):
         for verdict_json, expected_pass, reason_fragment in cases:
             with self.subTest(verdict_json=verdict_json):
                 v = LLMValidator(ScriptedClient(verdict_json)).validate(
-                    "do X then Y", "First, you did X.", "claim")
+                    "# YOUR ASSIGNED TASK\ndo X then Y", "First, you did X.")
                 self.assertEqual(v.passed, expected_pass)
                 self.assertIn(reason_fragment, v.reason)
                 if expected_pass:
                     self.assertIn("judging", v.reasoning)
 
     def test_unparseable_verdict_is_treated_as_fail(self):
-        v = LLMValidator(ScriptedClient("not json at all")).validate("t", "h", "c")
+        v = LLMValidator(ScriptedClient("not json at all")).validate("ctx", "h")
         self.assertFalse(v.passed)
 
     def test_validator_passes_a_decode_constraint_not_a_raw_schema(self):
@@ -53,20 +53,33 @@ class ValidatorTest(unittest.TestCase):
                 captured["constraint"] = constraint
                 return Decision(reasoning="", action_json='{"verdict":"pass","reason":"ok"}')
 
-        LLMValidator(RecordingClient()).validate("t", "h", "c")
+        LLMValidator(RecordingClient()).validate("ctx", "h")
         self.assertIsInstance(captured["constraint"], DecodeConstraint)
         self.assertEqual(captured["constraint"].json_schema, VERDICT_SCHEMA)
 
-    def test_validator_prompt_includes_task_history_and_claim(self):
+    def test_validator_prompt_includes_context_and_history_but_not_claim(self):
+        # Issue #57: the validator's user message carries the SAME context the agent
+        # had (the tool-less main prompt) + the action history — and NO self-claim.
         client = ScriptedClient('{"verdict":"pass","reason":"ok"}')
-        LLMValidator(client).validate("ORIGINAL TASK", "AGENT HISTORY", "AGENT CLAIM")
+        context = ("# YOUR ASSIGNED TASK\nORIGINAL TASK\n\n---\n\n"
+                   "# Current page (live snapshot)\nbutton \"Submit\" [ref=e7]\n\n---\n\n")
+        LLMValidator(client).validate(context, "AGENT HISTORY")
+        # the page snapshot + task context appear, BEFORE the history
         self.assertIn("ORIGINAL TASK", client.last_user)
+        self.assertIn("# Current page (live snapshot)", client.last_user)
+        self.assertIn("[ref=e7]", client.last_user)
         self.assertIn("AGENT HISTORY", client.last_user)
-        self.assertIn("AGENT CLAIM", client.last_user)
+        self.assertLess(client.last_user.index("ORIGINAL TASK"),
+                        client.last_user.index("AGENT HISTORY"))
+        # no self-claim section anymore
+        self.assertNotIn("completion claim", client.last_user)
 
-    def test_build_prompt_handles_missing_claim(self):
-        prompt = build_validator_prompt("t", "h", "")
-        self.assertIn("no summary", prompt)
+    def test_build_prompt_places_context_before_history(self):
+        prompt = build_validator_prompt("CONTEXT BLOCK", "HISTORY BLOCK")
+        self.assertIn("CONTEXT BLOCK", prompt)
+        self.assertIn("HISTORY BLOCK", prompt)
+        self.assertLess(prompt.index("CONTEXT BLOCK"), prompt.index("HISTORY BLOCK"))
+        self.assertNotIn("claim", prompt.lower())
 
 
 class ValidatorLoggingTest(unittest.TestCase):
@@ -84,7 +97,7 @@ class ValidatorLoggingTest(unittest.TestCase):
             logger = self._logger(tmp)
             v = LLMValidator(ScriptedClient('{"verdict":"pass","reason":"all good"}'),
                              logger=logger, config=Config()).validate(
-                "ORIGINAL TASK", "AGENT HISTORY", "AGENT CLAIM")
+                "CONTEXT WITH TASK AND PAGE", "AGENT HISTORY")
             self.assertTrue(v.passed)
 
             files = self._validator_files(logger.dir)
@@ -92,10 +105,10 @@ class ValidatorLoggingTest(unittest.TestCase):
             self.assertTrue(os.path.basename(files[0]).startswith("validator_"))
 
             data = json.loads(Path(files[0]).read_text(encoding="utf-8"))  # valid JSON
-            # inputs
-            self.assertEqual(data["inputs"]["task"], "ORIGINAL TASK")
+            # inputs: the richer #57 context is recorded, not a self-claim
+            self.assertEqual(data["inputs"]["context"], "CONTEXT WITH TASK AND PAGE")
             self.assertEqual(data["inputs"]["history"], "AGENT HISTORY")
-            self.assertEqual(data["inputs"]["claim"], "AGENT CLAIM")
+            self.assertNotIn("claim", data["inputs"])
             # private reasoning captured
             self.assertIn("judging", data["reasoning"])
             # verdict
@@ -111,8 +124,8 @@ class ValidatorLoggingTest(unittest.TestCase):
             logger = self._logger(tmp)
             v = LLMValidator(ScriptedClient('{"verdict":"fail","reason":"nope"}'),
                              logger=logger, config=Config())
-            v.validate("t", "h1", "c1")
-            v.validate("t", "h2", "c2")
+            v.validate("ctx", "h1")
+            v.validate("ctx", "h2")
             files = self._validator_files(logger.dir)
             self.assertEqual(len(files), 2)
             self.assertNotEqual(files[0], files[1])  # unique guids, no clobber
@@ -124,7 +137,7 @@ class ValidatorLoggingTest(unittest.TestCase):
         # Back-compat: LLMValidator(client) with no logger works and writes no file.
         with tempfile.TemporaryDirectory() as tmp:
             v = LLMValidator(ScriptedClient('{"verdict":"pass","reason":"ok"}')).validate(
-                "t", "h", "c")
+                "ctx", "h")
             self.assertTrue(v.passed)
             self.assertEqual(self._validator_files(Path(tmp) / ".vibe"), [])
 
@@ -134,7 +147,7 @@ class ValidatorLoggingTest(unittest.TestCase):
             def log_validator(self, **kwargs):
                 raise OSError("disk full")
         v = LLMValidator(ScriptedClient('{"verdict":"pass","reason":"ok"}'),
-                         logger=ExplodingLogger(), config=Config()).validate("t", "h", "c")
+                         logger=ExplodingLogger(), config=Config()).validate("ctx", "h")
         self.assertTrue(v.passed)
         self.assertEqual(v.reason, "ok")
 
@@ -144,17 +157,29 @@ class ValidatorLoggingTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             logger = self._logger(tmp)
             Path(logger.dir).write_text("not a dir", encoding="utf-8")  # block mkdir
-            logger.log_validator(task="t", history="h", claim="c", reasoning="r",
+            logger.log_validator(context="ctx", history="h", reasoning="r",
                                  passed=True, reason="ok", config=Config())  # must not raise
 
 
 class ValidateToolTest(unittest.TestCase):
-    def test_schema_and_params(self):
+    def test_schema_takes_no_args(self):
+        # Issue #57: `validate` takes NO arguments. Its call-schema accepts an empty
+        # args object — no properties, nothing required — and `summary` is gone.
         tool = ValidateTool()
         self.assertEqual(tool.name, "validate")
+        self.assertEqual(tool.parameters, [])
         schema = tool.call_schema()
         self.assertEqual(schema["properties"]["tool"]["const"], "validate")
-        self.assertIn("summary", schema["properties"]["args"]["properties"])
+        args_schema = schema["properties"]["args"]
+        self.assertEqual(args_schema.get("properties", {}), {})
+        self.assertNotIn("summary", args_schema.get("properties", {}))
+        # an empty args object must be schema-valid (no `required` key)
+        self.assertNotIn("required", args_schema)
+
+    def test_no_arg_validate_runs(self):
+        # A no-arg validate call executes the safe fallback without error.
+        result = ValidateTool().run({})
+        self.assertTrue(result.ok)
 
 
 class ValidatorAgentTypeTest(unittest.TestCase):
@@ -207,7 +232,7 @@ class ValidatorExecutionUnchangedTest(unittest.TestCase):
                 calls["system"] = system
                 return Decision(reasoning="", action_json='{"verdict":"pass","reason":"ok"}')
 
-        verdict = LLMValidator(RecordingClient()).validate("task", "history", "claim")
+        verdict = LLMValidator(RecordingClient()).validate("context", "history")
         # Exactly one model call (single-shot, not a loop) ...
         self.assertEqual(calls["count"], 1)
         # ... driven by the SAME prompt the framework now declares ...
@@ -216,6 +241,24 @@ class ValidatorExecutionUnchangedTest(unittest.TestCase):
         # ... and the verdict behavior is the parsed pass/fail.
         self.assertTrue(verdict.passed)
         self.assertEqual(verdict.reason, "ok")
+
+
+class ValidatorSystemPromptTest(unittest.TestCase):
+    """Issue #57: VALIDATOR_SYSTEM must reflect judging-from-context (no self-claim)
+    and steer the agent toward elements that actually exist in the page snapshot."""
+
+    def test_reflects_judging_from_snapshot_and_history_no_self_claim(self):
+        sys = VALIDATOR_SYSTEM.lower()
+        self.assertIn("snapshot", sys)
+        self.assertIn("history", sys)
+        # explicitly disclaims relying on a self-claim
+        self.assertIn("no self-claim", sys)
+
+    def test_steers_toward_real_existing_snapshot_elements(self):
+        sys = VALIDATOR_SYSTEM.lower()
+        self.assertIn("actually exist", sys)
+        # warns against guessed/invented selectors
+        self.assertTrue("guessed" in sys or "invented" in sys)
 
 
 if __name__ == "__main__":

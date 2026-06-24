@@ -21,7 +21,7 @@ from vibeharness.registry import ToolRegistry
 from tests._fakes import FakeLLMClient, FakeValidator
 
 
-VALIDATE = {"tool": "validate", "args": {"summary": "done"}}
+VALIDATE = {"tool": "validate", "args": {}}
 
 
 class SleepingLLMClient(LLMClient):

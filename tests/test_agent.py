@@ -45,7 +45,7 @@ class RecordingReporter(NullReporter):
         self.events.append(("verdict", text))
 
 
-VALIDATE = {"tool": "validate", "args": {"summary": "done"}}
+VALIDATE = {"tool": "validate", "args": {}}
 
 
 class AgentLoopTest(unittest.TestCase):
@@ -78,9 +78,11 @@ class AgentLoopTest(unittest.TestCase):
         self.assertEqual(result.final_summary, "file created and verified")
         self.assertEqual(len(result.validations), 1)
         self.assertTrue(result.validations[0]["passed"])
-        # the validator received the task + the agent's claim
-        self.assertEqual(validator.calls[0]["claim"], "done")
-        self.assertIn("make a file", validator.calls[0]["task"])
+        # Issue #57: the validator is fed (context, history) — no self-claim. With no
+        # context provider wired here, context is "" and history is the action account.
+        self.assertEqual(validator.calls[0]["context"], "")
+        self.assertNotIn("claim", validator.calls[0])
+        self.assertIn("you created the file", validator.calls[0]["history"])
 
     def test_over_limit_batch_runs_only_first_n(self):
         # Five writes in one batch, but the cap is 2 -> only the first 2 files appear,

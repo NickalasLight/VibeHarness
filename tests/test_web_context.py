@@ -231,5 +231,90 @@ class CliSnapshotProviderGatingTest(unittest.TestCase):
         self.assertIn("WIRED-SNAP consent banner", sp)
 
 
+class ValidatorContextProviderTest(unittest.TestCase):
+    """Issue #57: cli builds a TOOL-LESS twin of the per-turn prompt to feed the
+    validator — task + workspace + the same #43-budgeted page snapshot, but with the
+    tool descriptions / format block stripped. Reproduced via make_system_prompt_provider
+    with include_tool_guidance=False, the exact call cli._run_locked makes.
+    """
+
+    def _builder(self, names):
+        catalog = default_catalog()
+        toolsets = catalog.select(names)
+        registry = catalog.build_registry(toolsets, Config())
+        guidance = SystemPromptBuilder.assemble_guidance(toolsets)
+        return SystemPromptBuilder(registry, guidance=guidance), registry
+
+    def test_context_has_page_workspace_task_but_no_tools(self):
+        from vibeharness.cli import make_system_prompt_provider
+        builder, registry = self._builder(["web", "fs"])
+        raw = lambda: "### Page\nbutton \"Submit\" [ref=e7]"
+        provider = make_system_prompt_provider(
+            builder, Config(), "DO THE THING", lambda: "WS-TREE", raw,
+            logger=None, include_tool_guidance=False)
+        out = provider("USER-TURN")
+        # SAME context the agent had:
+        self.assertIn("DO THE THING", out)
+        self.assertIn("# Workspace", out)
+        self.assertIn("WS-TREE", out)
+        self.assertIn("# Current page (live snapshot)", out)
+        self.assertIn("[ref=e7]", out)
+        # but NOT the tool sections / format instructions / per-toolset guidance:
+        self.assertNotIn("# Tools", out)
+        self.assertNotIn("# Working with your tools", out)
+        self.assertNotIn("# How the loop works", out)
+        for tool in registry.all():
+            self.assertNotIn(tool.doc(), out)
+
+    def test_history_appears_after_page_context_in_validator_message(self):
+        # The full validator USER message is context-then-history (build_validator_prompt).
+        from vibeharness.cli import make_system_prompt_provider
+        from vibeharness.validation import build_validator_prompt
+        builder, _ = self._builder(["web", "fs"])
+        raw = lambda: "### Page\nbutton \"Submit\" [ref=e7]"
+        provider = make_system_prompt_provider(
+            builder, Config(), "DO THE THING", lambda: "WS", raw,
+            logger=None, include_tool_guidance=False)
+        context = provider("USER-TURN")
+        msg = build_validator_prompt(context, "First, you clicked Submit.")
+        self.assertLess(msg.index("# Current page (live snapshot)"),
+                        msg.index("First, you clicked Submit."))
+
+    def test_fs_only_back_compat_no_page_section(self):
+        # Back-compat: an fs run has no snapshot provider -> no page section, still
+        # carries task + workspace, still tool-less.
+        from vibeharness.cli import make_system_prompt_provider
+        builder, _ = self._builder(["fs"])
+        provider = make_system_prompt_provider(
+            builder, Config(), "DO THE THING", lambda: "WS-TREE", None,
+            logger=None, include_tool_guidance=False)
+        out = provider("USER-TURN")
+        self.assertIn("DO THE THING", out)
+        self.assertIn("WS-TREE", out)
+        self.assertNotIn("# Current page (live snapshot)", out)
+        self.assertNotIn("# Tools", out)
+
+    def test_large_snapshot_does_not_exceed_num_ctx(self):
+        # With a huge snapshot, the dynamic #43 budget still trims the tool-less prompt
+        # so the rendered context (plus reserved output) fits num_ctx.
+        from vibeharness.cli import make_system_prompt_provider
+        from vibeharness.snapshot_budget import estimate_tokens
+        cfg = Config()
+        builder, _ = self._builder(["web", "fs"])
+        raw = lambda: "x" * 5_000_000        # absurdly large page
+        provider = make_system_prompt_provider(
+            builder, cfg, "DO THE THING", lambda: "WS", raw,
+            logger=None, include_tool_guidance=False)
+        user = "U" * 2000
+        out = provider(user)
+        # The whole rendered prompt + user + the reserved output (reasoning + action)
+        # must fit num_ctx. The configured safety margin is deliberately the SLACK that
+        # absorbs the page-section wrapper / role tokens, so it is not added on top here
+        # (matching the headline invariant in test_snapshot_budget.NeverExceedsNumCtxTest).
+        reserved = cfg.reason_tokens + cfg.action_tokens
+        total = estimate_tokens(out + user, cfg.snapshot_chars_per_token) + reserved
+        self.assertLessEqual(total, cfg.num_ctx)
+
+
 if __name__ == "__main__":
     unittest.main()

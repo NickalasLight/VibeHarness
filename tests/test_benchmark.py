@@ -21,7 +21,7 @@ from tests._fakes import FakeLLMClient as ScriptedClient
 from tests._fakes import FakeValidator as PassValidator
 
 
-VALIDATE = {"tool": "validate", "args": {"summary": "done"}}
+VALIDATE = {"tool": "validate", "args": {}}
 
 
 def client_factory_for(actions):

@@ -84,6 +84,48 @@ class PromptTest(unittest.TestCase):
         self.assertIn("next action", prompt.lower())
 
 
+class ToollessPromptTest(unittest.TestCase):
+    """Issue #57: SystemPromptBuilder.build(include_tool_guidance=False) renders the
+    validator's view — task + workspace + page snapshot, but NO tool sections."""
+
+    def setUp(self):
+        catalog = default_catalog()
+        toolsets = catalog.select(["fs", "web"])
+        self.registry = catalog.build_registry(toolsets, Config())
+        self.guidance = SystemPromptBuilder.assemble_guidance(toolsets)
+        self.builder = SystemPromptBuilder(self.registry, guidance=self.guidance)
+
+    def test_keeps_task_workspace_and_page_snapshot(self):
+        sp = self.builder.build("DO THE THING", workspace="WS-TEXT",
+                                page="button \"Submit\" [ref=e7]",
+                                include_tool_guidance=False)
+        self.assertIn("YOUR ASSIGNED TASK", sp)
+        self.assertIn("DO THE THING", sp)
+        self.assertIn("# Workspace", sp)
+        self.assertIn("WS-TEXT", sp)
+        self.assertIn("# Current page (live snapshot)", sp)
+        self.assertIn("[ref=e7]", sp)
+
+    def test_strips_all_tool_sections(self):
+        sp = self.builder.build("DO THE THING", workspace="WS-TEXT",
+                                page="snap", include_tool_guidance=False)
+        # no tool docs, no per-toolset guidance, no codec format-instruction block
+        self.assertNotIn("# Tools", sp)
+        self.assertNotIn("# Working with your tools", sp)
+        self.assertNotIn("# How the loop works", sp)
+        self.assertNotIn("format_instructions", sp)
+        # specific tool names / descriptions must not leak in
+        for tool in self.registry.all():
+            self.assertNotIn(tool.doc(), sp,
+                             f"tool doc for {tool.name!r} leaked into tool-less prompt")
+
+    def test_full_build_still_has_tool_sections(self):
+        # The default (full) build is unchanged — sanity that the flag is opt-in.
+        sp = self.builder.build("DO THE THING", include_tool_guidance=True)
+        self.assertIn("# Tools", sp)
+        self.assertIn("# Working with your tools", sp)
+
+
 class ToolsetGuidanceTest(unittest.TestCase):
     """The system prompt varies by the ACTIVE toolset(s) via system_guidance."""
 
