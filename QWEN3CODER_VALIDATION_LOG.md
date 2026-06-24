@@ -144,10 +144,24 @@ snapshot / different tool / advance". So each distinct action runs at most once.
 (repeated-failure steered); suite **551 passed**. Commit: `fix(#125): anti-loop guard also steers
 repeated FAILED actions`.
 
-### Iteration 7 — IN PROGRESS
-Re-run with failure-loop steering + max-steps 0. Watching for: far fewer wasted turns (e163/e68
-killed after 1 try); more unique fields filled; reaching the State combobox + Continue/step 2.
-Combobox handling (select_option on the div-listbox) is the likely next dedicated fix.
+### Iteration 7 — DONE (task buejn3ej6) — failure loops killed, but model now SPINS (ceiling)
+Failure-loop steering worked: 58 failure-repeats steered, NONE retried twice. But fields filled
+**regressed to 3** (e41/e44/e48) and ~65 of 73 turns were steers — the model emitted
+already-attempted actions over and over without finding VALID new fields, and picked wrong refs
+(e46/e47/e49 = labels). Run-to-run VARIANCE is now visible (iter 6 = 8 fields, iter 7 = 3),
+indicating we are near the **3B model's planning / ref-selection ceiling**, not a harness bug.
+The guard reliably STOPS bad repeats but the model lacked a concrete next-target signal.
+
+**Fix applied (`agent.py`):** ACTIONABLE steering — the steer message now lists the refs already
+successfully handled and tells the model to pick a fillable/clickable ref from the snapshot NOT
+in that list. Uses data the guard already tracks (`handled_refs`). Suite **551 passed**. Commit:
+`feat(#125): actionable anti-loop steer (lists handled refs)`.
+
+### Iteration 8 — IN PROGRESS
+Re-run with actionable steering. Watching for: when steered, does the model now pick UNHANDLED
+fillable refs and fill more unique fields? If it still spins / variance dominates, that confirms
+the model-planning ceiling and the next step is to document it honestly + consider a stuck-detector
+to stop unproductive spinning (rather than more micro-fixes with diminishing returns).
 
 ## Current status
-RUNNING iteration 7 (3-min cap, max-steps 0). Awaiting completion notification.
+RUNNING iteration 8 (3-min cap, max-steps 0). Awaiting completion notification.

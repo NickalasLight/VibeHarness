@@ -150,6 +150,11 @@ class RalphAgent:
         # (see _action_signature). Iter 6 showed failure loops (click e163 ×12, fill e68
         # ×11) dominated when only successes were deduped — hence both outcomes are tracked.
         attempted: dict[str, bool] = {}
+        # Refs the model has ALREADY successfully acted on this run. Surfaced in the steer
+        # message (#125 iter 7) so a stuck model is told concretely which targets are done
+        # and to pick an UNHANDLED ref from the snapshot, instead of cycling among the same
+        # few. Targets the "can't find the next field" failure mode.
+        handled_refs: set[str] = set()
 
         # max_steps <= 0 means run until validation passes.
         turns = (itertools.count(1) if self._cfg.max_steps <= 0
@@ -222,12 +227,18 @@ class RalphAgent:
                                        f"appears in the current page snapshot, use a different tool, "
                                        f"or advance the form. Never reuse a ref that is not in the "
                                        f"snapshot.")
+                            if handled_refs:
+                                obs += (" You have already successfully handled these refs: "
+                                        f"{', '.join(sorted(handled_refs))} — pick a fillable/"
+                                        "clickable ref from the snapshot that is NOT in that list.")
                             self._record(turn, Action(tool_name, args, obs, ok=False), memory)
                             continue
                         action = self._execute(tool_name, args)
                         self._record(turn, action, memory)
                         if sig is not None:
                             attempted[sig] = action.ok
+                        if action.ok and isinstance(args.get("target"), str):
+                            handled_refs.add(args["target"])
             except BaseException as exc:
                 # Failsafe: any unexpected mid-turn error (an uncaught tool/validator/
                 # decode exception, a KeyboardInterrupt, …) must NOT discard the work
