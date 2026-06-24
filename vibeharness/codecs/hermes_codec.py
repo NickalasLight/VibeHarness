@@ -49,6 +49,57 @@ _BLOCK_RE = re.compile(
     re.DOTALL | re.IGNORECASE,
 )
 
+# FALLBACK recovery (#125 iter 1): an instruct model NOT trained on the <tool_call> tags
+# (e.g. qwen2.5-coder:3b-instruct) emits the correct {"name","arguments"} JSON but wraps
+# it in a ```json ... ``` markdown fence — or bare — with no <tool_call> tags at all. A
+# well-formed tool call must never be discarded over a missing wrapper, so when no
+# <tool_call> block is present we recover JSON objects from fences / raw text instead.
+_FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL | re.IGNORECASE)
+
+
+def _iter_json_values(text: str):
+    """Yield JSON values parsed from ``text``, tolerating surrounding prose.
+
+    Tries a whole-string parse first (handles a lone object or a top-level array of
+    calls), then falls back to a brace-balanced scan that extracts and parses each
+    top-level ``{...}`` region (string-/escape-aware so braces inside string values
+    don't throw off the depth count)."""
+    text = (text or "").strip()
+    if not text:
+        return
+    try:
+        yield json.loads(text)
+        return
+    except json.JSONDecodeError:
+        pass
+    depth = 0
+    start = None
+    in_str = False
+    esc = False
+    for i, ch in enumerate(text):
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}" and depth > 0:
+            depth -= 1
+            if depth == 0 and start is not None:
+                try:
+                    yield json.loads(text[start:i + 1])
+                except json.JSONDecodeError:
+                    pass
+                start = None
+
 
 class HermesCodec(ToolCallCodec):
     name = "hermes"
@@ -95,29 +146,45 @@ class HermesCodec(ToolCallCodec):
         return DecodeConstraint(json_schema=None)
 
     def parse(self, raw: str) -> "tuple[list[ToolCall] | None, str | None]":
-        blocks = _BLOCK_RE.findall(raw or "")
-        # Drop any block that is pure whitespace (e.g. a stray opening tag at end of
-        # output) so it doesn't masquerade as an empty, invalid call.
-        blocks = [b for b in blocks if b.strip()]
+        raw = raw or ""
+        # 1) Preferred: explicit <tool_call>...</tool_call> blocks (the trained wrapper).
+        blocks = [b.strip() for b in _BLOCK_RE.findall(raw) if b.strip()]
+        # 2) Fallback (#125 iter 1): no wrapper tags -> recover the {"name","arguments"}
+        #    JSON the model DID emit, from ```json ... ``` fences, else from the raw text.
+        #    Keeps a valid call from being thrown away just because the tags are missing.
         if not blocks:
-            return None, "no <tool_call>...</tool_call> blocks found"
+            fenced = [m.strip() for m in _FENCE_RE.findall(raw) if m.strip()]
+            blocks = fenced if fenced else ([raw.strip()] if raw.strip() else [])
+        if not blocks:
+            return None, ('no tool call found (expected a <tool_call>{...}</tool_call> '
+                          'block or a {"name", "arguments"} JSON object)')
+
         actions: list[ToolCall] = []
+        saw_json = False
         for inner in blocks:
-            try:
-                obj = json.loads(inner.strip())
-            except json.JSONDecodeError as e:
-                return None, f"invalid JSON inside <tool_call> block ({e})"
-            if not isinstance(obj, dict) or "name" not in obj:
-                return None, "each <tool_call> block must contain an object with a 'name' field"
-            name = obj["name"]
-            if not isinstance(name, str) or not name:
-                return None, "'name' must be a non-empty string"
-            args = obj.get("arguments", {})
-            if args is None:
-                args = {}
-            if not isinstance(args, dict):
-                return None, "'arguments' must be an object"
-            actions.append((name, args))
+            for value in _iter_json_values(inner):
+                saw_json = True
+                # A top-level array is treated as several calls; a lone object as one.
+                items = value if isinstance(value, list) else [value]
+                for obj in items:
+                    if not isinstance(obj, dict) or "name" not in obj:
+                        return None, ("each tool call must be a JSON object with a "
+                                      "'name' field")
+                    name = obj["name"]
+                    if not isinstance(name, str) or not name:
+                        return None, "'name' must be a non-empty string"
+                    args = obj.get("arguments", {})
+                    if args is None:
+                        args = {}
+                    if not isinstance(args, dict):
+                        return None, "'arguments' must be an object"
+                    actions.append((name, args))
+        if not saw_json:
+            return None, ('could not parse a tool call: expected a '
+                          '<tool_call>{...}</tool_call> block or a {"name", "arguments"} '
+                          "JSON object")
+        if not actions:
+            return None, "no valid tool call (need a JSON object with a 'name' field)"
         return actions, None
 
 

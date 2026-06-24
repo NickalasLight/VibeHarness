@@ -144,12 +144,12 @@ class HermesCodecTest(unittest.TestCase):
     def test_parse_no_blocks_reports_error(self):
         actions, err = self.codec.parse("just some prose, no tags")
         self.assertIsNone(actions)
-        self.assertIn("no <tool_call>", err)
+        self.assertIn("tool call", err)
 
     def test_parse_invalid_json_reports_error(self):
         actions, err = self.codec.parse('<tool_call>{not json}</tool_call>')
         self.assertIsNone(actions)
-        self.assertIn("invalid JSON", err)
+        self.assertIn("could not parse", err)
 
     def test_parse_missing_name_reports_error(self):
         actions, err = self.codec.parse(
@@ -172,7 +172,26 @@ class HermesCodecTest(unittest.TestCase):
     def test_parse_handles_none_input(self):
         actions, err = self.codec.parse(None)
         self.assertIsNone(actions)
-        self.assertIn("no <tool_call>", err)
+        self.assertIn("no tool call", err)
+
+    # ---- parse: tolerant fallback (#125 iter 1) — fenced/bare JSON without <tool_call> tags ----
+    def test_parse_fenced_json_without_tags(self):
+        # qwen2.5-coder:3b-instruct emits the call as ```json {...}``` with no wrapper tags.
+        actions, err = self.codec.parse(
+            '```json\n{"name": "goto", "arguments": {"url": "u"}}\n```')
+        self.assertIsNone(err)
+        self.assertEqual(actions, [("goto", {"url": "u"})])
+
+    def test_parse_bare_object_without_tags(self):
+        actions, err = self.codec.parse('{"name": "click", "arguments": {"target": "e5"}}')
+        self.assertIsNone(err)
+        self.assertEqual(actions, [("click", {"target": "e5"})])
+
+    def test_parse_top_level_array_of_calls(self):
+        actions, err = self.codec.parse(
+            '[{"name": "a", "arguments": {}}, {"name": "b", "arguments": {}}]')
+        self.assertIsNone(err)
+        self.assertEqual(actions, [("a", {}), ("b", {})])
 
 
 if __name__ == "__main__":
