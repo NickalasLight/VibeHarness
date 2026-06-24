@@ -57,7 +57,13 @@ class RunLogger:
             "validations": result.validations,
             "turns": result.to_dict()["turns"],   # includes per-turn reasoning traces
         }
+        # Encode defensively: model/browser-snapshot text can contain lone
+        # surrogates or other code points that utf-8 cannot encode and that would
+        # otherwise raise UnicodeEncodeError (on Windows the default cp1252 is even
+        # stricter). ``errors="backslashreplace"`` guarantees the write never crashes
+        # — a corrupt glyph degrades to an escape rather than losing the whole log.
         self.json_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False),
-                                  encoding="utf-8")
-        (self.dir / f"{self.stamp}.md").write_text(result.transcript(), encoding="utf-8")
+                                  encoding="utf-8", errors="backslashreplace")
+        (self.dir / f"{self.stamp}.md").write_text(
+            result.transcript(), encoding="utf-8", errors="backslashreplace")
         return self.json_path
