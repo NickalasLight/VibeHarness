@@ -110,11 +110,31 @@ advance the form"). Navigation tools (goto/open_browser/navigate_back) are exemp
 tests (skips duplicate; allows different args). Suite **550 passed**. Commit: `fix(#125):
 anti-loop guard — don't re-run an already-successful action`.
 
-### Iteration 5 — IN PROGRESS
-Re-run with anti-loop guard. Watching for: after filling a field, the model is forced OFF the
-duplicate and onto the NEXT empty field; progress through more Personal-Info fields and toward
-the Continue/Next button (step 1 → 2). Still pending: custom State combobox (select_option fails
-on the div-listbox) — likely the next blocker once field-fill flows.
+### Iteration 5 — DONE (task bzk3betd4) — anti-loop guard works; run is TURN-limited not time-limited
+**Anti-loop guard fired correctly** (turns 8/13/14/15 steered duplicates) and **unblocked
+progress**: after being steered off a re-fill, the model moved to NEW fields. Filled correctly:
+First, Last, Email, **Phone, Street** (5 fields, up from 3). Minor model error: filled Apt with
+the label text "Apt / Suite (optional)" instead of "Apt 14C" (copied the field name).
+
+**KEY INSIGHT:** the run exited code 2 = "stopped after 15 turns" — it hit `max_steps=15`
+**well under the 3-min cap** (single-phase turns are ~2-5s; 15 turns ≈ 1 min). The agent ran out
+of TURNS while still progressing, NOT out of time. We were wasting ~2/3 of the 3-min budget.
+
+**Live ARIA capture finding (re: showing field values):** Playwright ARIA shows a placeholder as
+a pseudo-value for EMPTY fields (`textbox "First name" [ref=e41]: Jane`) and NOTHING for FILLED
+fields (`textbox "First name" [active] [ref=e41]`). So rendering "current value" would mislead
+(placeholder looks like a value) and can't reliably mark filled-ness — the anti-loop guard stays
+the right tool. Prose already strips the placeholder, which is correct.
+
+**Fix applied (run param, no code change):** use `--max-steps 0` so the run is bounded only by
+the 3-min wall-clock cap → many more turns per run → more of the form completed. (Branch default
+stays 15 for non-time-capped runs.)
+
+### Iteration 6 — IN PROGRESS
+Re-run with `--max-steps 0` (full 3-min budget). Watching for: many more turns; more fields
+filled across Personal Info; reaching the Continue/Next button + step 2; whether the model finds
+remaining empty fields (City/State/ZIP/links) or cycles among done ones (would motivate a
+steer-message enhancement listing already-handled refs). Combobox (State) still pending.
 
 ## Current status
-RUNNING iteration 5 (3-min cap). Awaiting completion notification.
+RUNNING iteration 6 (3-min cap, max-steps 0). Awaiting completion notification.
