@@ -56,21 +56,25 @@ class SystemPromptBuilder:
     def __init__(self, registry: ToolRegistry):
         self._registry = registry
 
-    def build(self, task: str = "") -> str:
+    def build(self, task: str = "", workspace: str = "") -> str:
         schema = json.dumps(self._registry.action_schema(), indent=2)
         body = _SYSTEM_TEMPLATE.format(docs=self._registry.docs(), schema=schema)
-        if not task:
-            return body
-        # Anchor the task at the very front of the context (primacy / authoritative
-        # system instruction). Combined with the recency reminder in the turn prompt,
-        # the task is pinned at both high-attention ends, resisting mid-context drift.
-        header = (
-            f"# YOUR ASSIGNED TASK\n{task}\n\n"
-            f"Keep this EXACT task in mind at all times — do not paraphrase, summarize, "
-            f"or drift from it. Everything below explains the tools and rules for "
-            f"accomplishing it.\n\n---\n\n"
-        )
-        return header + body
+        header = ""
+        if task:
+            # Anchor the task at the very front of the context (primacy / authoritative
+            # system instruction). Combined with the recency reminder in the turn prompt,
+            # the task is pinned at both high-attention ends, resisting mid-context drift.
+            header = (
+                f"# YOUR ASSIGNED TASK\n{task}\n\n"
+                f"Keep this EXACT task in mind at all times — do not paraphrase, summarize, "
+                f"or drift from it. Everything below explains the tools and rules for "
+                f"accomplishing it.\n\n---\n\n"
+            )
+        if workspace:
+            # A snapshot of the working directory, refreshed every turn so newly
+            # created files show up next turn. Sits right after the task block.
+            header += f"# Workspace\n{workspace}\n\n---\n\n"
+        return header + body if header else body
 
 
 def build_turn_prompt(task: str, narrative: str) -> str:

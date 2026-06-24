@@ -41,6 +41,23 @@ class PromptTest(unittest.TestCase):
         sp = SystemPromptBuilder(self.registry).build()
         self.assertNotIn("YOUR ASSIGNED TASK", sp)
 
+    def test_system_prompt_includes_workspace_section(self):
+        sp = SystemPromptBuilder(self.registry).build("DO THE THING", workspace="WS-TEXT")
+        self.assertIn("# Workspace", sp)
+        self.assertIn("WS-TEXT", sp)
+        # workspace sits after the task block but before the tools docs
+        self.assertLess(sp.index("DO THE THING"), sp.index("# Workspace"))
+        self.assertLess(sp.index("# Workspace"), sp.index("# Tools"))
+
+    def test_system_prompt_workspace_without_task(self):
+        sp = SystemPromptBuilder(self.registry).build(workspace="WS-TEXT")
+        self.assertIn("WS-TEXT", sp)
+        self.assertNotIn("YOUR ASSIGNED TASK", sp)
+
+    def test_system_prompt_no_workspace_by_default(self):
+        sp = SystemPromptBuilder(self.registry).build("DO THE THING")
+        self.assertNotIn("# Workspace", sp)
+
     def test_turn_prompt_reminds_task_at_the_end(self):
         prompt = build_turn_prompt("make a file", "First, you did a thing")
         self.assertIn("make a file", prompt)

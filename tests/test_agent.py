@@ -1,3 +1,4 @@
+import itertools
 import json
 import os
 import tempfile
@@ -25,6 +26,18 @@ class FakeLLMClient(LLMClient):
         self._i += 1
         payload = action if isinstance(action, str) else json.dumps(action)
         return Decision(reasoning="", action_json=payload)
+
+
+class RecordingLLMClient(FakeLLMClient):
+    """Like FakeLLMClient but records the `system` prompt seen on each call."""
+
+    def __init__(self, actions):
+        super().__init__(actions)
+        self.systems = []
+
+    def decide(self, system, user, action_schema, on_reason=None, on_action=None):
+        self.systems.append(system)
+        return super().decide(system, user, action_schema, on_reason, on_action)
 
 
 class FakeValidator(Validator):
@@ -123,6 +136,25 @@ class AgentLoopTest(unittest.TestCase):
         seen = []
         self._agent([VALIDATE]).run("t", on_turn=lambda r: seen.append(len(r.turns)))
         self.assertEqual(seen, [1])   # one turn, checkpointed once
+
+    def test_static_system_used_without_provider(self):
+        client = RecordingLLMClient([{"tool": "list_directory", "args": {"path": self.dir}}])
+        agent = RalphAgent(client, self.registry, "STATIC-SYS",
+                           Config(max_steps=3), FakeValidator(passed=True))
+        agent.run("t")
+        self.assertEqual(client.systems, ["STATIC-SYS", "STATIC-SYS", "STATIC-SYS"])
+
+    def test_provider_refreshes_system_each_turn(self):
+        client = RecordingLLMClient([{"tool": "list_directory", "args": {"path": self.dir}}])
+        counter = itertools.count(1)
+        provider = lambda: f"SYS-{next(counter)}"
+        agent = RalphAgent(client, self.registry, "STATIC-SYS",
+                           Config(max_steps=3), FakeValidator(passed=True),
+                           system_prompt_provider=provider)
+        agent.run("t")
+        # each turn saw a freshly regenerated system prompt, not the static one
+        self.assertEqual(client.systems, ["SYS-1", "SYS-2", "SYS-3"])
+        self.assertNotIn("STATIC-SYS", client.systems)
 
     def test_transcript_and_to_dict(self):
         result = self._agent([VALIDATE]).run("t")

@@ -82,13 +82,18 @@ class RunResult:
 
 class RalphAgent:
     def __init__(self, client: LLMClient, registry: ToolRegistry, system_prompt: str,
-                 config: Config, validator: Validator, reporter: Reporter | None = None):
+                 config: Config, validator: Validator, reporter: Reporter | None = None,
+                 system_prompt_provider: Callable[[], str] | None = None):
         self._client = client
         self._registry = registry
         self._system = system_prompt
         self._cfg = config
         self._validator = validator
         self._reporter = reporter or NullReporter()
+        # Optional per-turn refresh hook. When set, it is called at the start of
+        # each turn to regenerate the system prompt (e.g. with a fresh workspace
+        # tree); when None, the static system_prompt above is reused every turn.
+        self._system_provider = system_prompt_provider
 
     def run(self, task: str, on_turn: Callable[["RunResult"], None] | None = None) -> RunResult:
         memory = NarrativeMemory()
@@ -100,9 +105,10 @@ class RalphAgent:
                  else range(1, self._cfg.max_steps + 1))
         for i in turns:
             self._reporter.turn_start(i)
+            system = self._system_provider() if self._system_provider else self._system
             user = build_turn_prompt(task, memory.render())
             decision = self._client.decide(
-                self._system, user, schema,
+                system, user, schema,
                 on_reason=self._reporter.reasoning_token,
                 on_action=self._reporter.action_token,
             )
