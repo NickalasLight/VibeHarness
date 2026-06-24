@@ -85,7 +85,7 @@ class SystemPromptBuilder:
                 notes.append(text)
         return "\n".join(f"- {note}" for note in notes)
 
-    def build(self, task: str = "", workspace: str = "") -> str:
+    def build(self, task: str = "", workspace: str = "", page: str = "") -> str:
         # Render the per-toolset guidance section only when there is guidance to show,
         # so a no-guidance build leaves no empty "# Working with your tools" heading.
         tool_guidance = ""
@@ -110,6 +110,14 @@ class SystemPromptBuilder:
             # A snapshot of the working directory, refreshed every turn so newly
             # created files show up next turn. Sits right after the task block.
             header += f"# Workspace\n{workspace}\n\n---\n\n"
+        if page:
+            # A fresh snapshot of the live browser page, regenerated every turn
+            # (issue #24) so the model always sees the CURRENT page state (consent
+            # banners, modals, …) without having to issue a `snapshot` action. Because
+            # the whole system prompt is rebuilt each turn, only the latest snapshot is
+            # ever present — the prior one disappears (stale-dropping by regeneration,
+            # never accumulated in narrative memory).
+            header += f"# Current page (live snapshot)\n{page}\n\n---\n\n"
         return header + body if header else body
 
 

@@ -15,6 +15,7 @@ from __future__ import annotations
 import shutil
 import subprocess
 import sys
+from typing import Callable
 
 from .config import Config
 from .toolset import Toolset
@@ -203,6 +204,44 @@ class BrowseTool(Tool):
         if len(text) <= self._limit:
             return text
         return text[:self._limit] + f"\n…[+{len(text) - self._limit} chars truncated]"
+
+
+def capture_page_snapshot(cli: PlaywrightCli, char_limit: int) -> str:
+    """Capture a fresh `snapshot` of the live page from an EXISTING session and
+    return its text, truncated to ``char_limit`` (issue #24).
+
+    Reuses the supplied :class:`PlaywrightCli` — i.e. the SAME named session the
+    agent's `browse` tool drives — so the captured snapshot reflects the actual
+    page the model is acting on; it never launches a second browser. On any failure
+    (no session open yet, CLI error, timeout) it returns "" so the caller simply
+    renders no page section that turn rather than crashing the run.
+
+    ``cli`` is the injectable seam: tests pass a stand-in whose ``run`` returns
+    canned snapshot text, so the per-turn injection can be exercised with no browser.
+    """
+    try:
+        ok, output = cli.run("snapshot")
+    except Exception:
+        return ""
+    if not ok:
+        return ""
+    text = (output or "").strip()
+    if len(text) <= char_limit:
+        return text
+    return text[:char_limit] + f"\n…[+{len(text) - char_limit} chars truncated]"
+
+
+def make_snapshot_provider(config: Config) -> Callable[[], str]:
+    """Build a per-turn page-snapshot provider bound to the run's web session.
+
+    Mirrors cli.py's ``render_workspace`` seam: returns a zero-arg callable that,
+    each time it is called (once per turn, at prompt-build time), captures a FRESH
+    snapshot from the run's existing Playwright session and returns it truncated to
+    ``config.web_snapshot_char_limit``. The session name and timeout come from
+    ``config`` so the snapshot CLI shares the exact session the `browse` tool uses.
+    """
+    cli = PlaywrightCli(config.web_session, config.web_cli_timeout)
+    return lambda: capture_page_snapshot(cli, config.web_snapshot_char_limit)
 
 
 class WebToolset(Toolset):
