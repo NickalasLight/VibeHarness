@@ -35,6 +35,7 @@ from .toolset import (
 )
 from .validation import LLMValidator
 from .web import make_raw_snapshot_provider
+from .snapshot_prose import aria_yaml_to_prose
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -85,6 +86,9 @@ current default temperature: {saved_temp}
                         "--agent's default. (default: fs). e.g. --toolset web,fs")
     p.add_argument("--headless", action="store_true",
                    help="run the web browser headless (default: headed so you can watch)")
+    p.add_argument("--web-snapshot-prose", action="store_true",
+                   help="render the live page snapshot as WebArena-style prose (pruned, "
+                        "ref-keyed) instead of raw ARIA-YAML (issue #64; A/B seam)")
     p.add_argument("--no-color", action="store_true", help="disable colored output")
     p.add_argument("--set", nargs=2, metavar=("KEY", "VALUE"),
                    help="persist a default, e.g. --set temp 0.5")
@@ -221,6 +225,8 @@ def resolve_config(args: argparse.Namespace) -> Config:
     overrides["max_actions_per_turn"] = resolve_max_actions(args)
     if getattr(args, "headless", False):
         overrides["web_headless"] = True
+    if getattr(args, "web_snapshot_prose", False):
+        overrides["web_snapshot_prose"] = True
     return replace(cfg, **overrides) if overrides else cfg
 
 
@@ -485,6 +491,15 @@ def _run_locked(args, task, config, registry, codec, names, workdir, logger,
     # message (system prompt minus the page section + the per-turn user message) is
     # known. So the provider takes the per-turn ``user`` message (see RalphAgent).
     raw_snapshot_provider = (make_raw_snapshot_provider(config) if "web" in names else None)
+    # Issue #64: behind a config seam, render the captured ARIA-YAML snapshot into
+    # WebArena-style prose BEFORE it enters the dynamic-budget / diagnostics pipeline.
+    # This is an A/B toggle, not a removal: with web_snapshot_prose False (default) the
+    # raw ARIA snapshot flows through exactly as before. The transform preserves the
+    # native [ref=eN] inline so the discrete web subtools keep resolving targets, and
+    # falls back to the raw text on any parse surprise (never blanks the page section).
+    if raw_snapshot_provider is not None and config.web_snapshot_prose:
+        _inner_snapshot_provider = raw_snapshot_provider
+        raw_snapshot_provider = lambda: aria_yaml_to_prose(_inner_snapshot_provider())
 
     # The per-turn provider applies #43's dynamic snapshot budget AND, given the
     # logger, performs #37's per-turn diagnostic dump (raw snapshot + injected prompt).

@@ -93,3 +93,14 @@ class Config:
     snapshot_safety_margin_tokens: int = 1024
     web_headless: bool = False        # headed by default so a human can watch
     web_browser: str = "chrome"
+
+    # --- snapshot prose rendering (issue #64) ---
+    # When True, the auto-injected live page snapshot is run through the deterministic
+    # WebArena-style ARIA->prose transform (vibeharness.snapshot_prose) before injection,
+    # instead of the raw Playwright ARIA-YAML. The prose prunes generic/img noise and
+    # emits one ref-keyed line per interesting control, which small models reason over
+    # far more reliably. Refs are preserved inline so the discrete web subtools (click/
+    # fill/…) keep working unchanged. This is an A/B SEAM, not a replacement: set False
+    # (default) to inject the raw ARIA snapshot exactly as before. Budgeting/diagnostics
+    # are unchanged — only the text fed into the page section differs.
+    web_snapshot_prose: bool = False
