@@ -53,8 +53,9 @@ def _enable_ansi() -> None:
 class ConsoleReporter(Reporter):
     """Streams a live, color-coded view of each turn to the terminal."""
 
-    def __init__(self, color: bool = True):
+    def __init__(self, color: bool = True, result_limit: int = 240):
         self._color = color
+        self._result_limit = result_limit   # console-only preview cap; agent gets the full result
         if color:
             _enable_ansi()
         self._reason_open = False
@@ -91,7 +92,12 @@ class ConsoleReporter(Reporter):
     def action_result(self, action) -> None:
         color = "green" if action.ok else "red"
         mark = "✓" if action.ok else "✗"
-        self._w("\n" + self._c(color, f"└ {mark} {action.observation}") + "\n")
+        # Collapse to one line and cap length for readability. This is display-only:
+        # the agent's memory and the .vibe log keep the full, untruncated result.
+        preview = " ".join(action.observation.split())
+        if len(preview) > self._result_limit:
+            preview = preview[:self._result_limit] + f" …(+{len(preview) - self._result_limit} more chars)"
+        self._w("\n" + self._c(color, f"└ {mark} {preview}") + "\n")
 
     def run_end(self, result) -> None:
         n = len(result.turns)

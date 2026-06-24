@@ -270,10 +270,12 @@ vibe --toolset web --task-file task.txt     # read a long task from a file
 
 ```bash
 python -m unittest discover -s tests -v     # standard library, no install needed
-# or, if you prefer pytest:
+# or, with pytest:
 pip install -e ".[dev]" && pytest -q
 ```
-The suite (58 tests, runs in <0.1s) covers the filesystem service, every tool, schema generation, the settings store, the narrative memory, prompt building, the LLM helper functions, run logging, and the full agent loop (single- and multi-action turns) driven by a fake LLM client.
+Two tiers:
+- **Unit tests** (fast, zero dependencies) cover the filesystem service, every tool, schema/toolset building, the settings store, narrative memory, prompt building, the LLM helpers, run logging, and the full agent loop (single- and multi-action turns) via a fake LLM client.
+- **Live integration tests** (`tests/integration/`) drive the *real* `browse` tool through `playwright-cli` against a demo web app at `http://localhost:3000`, exercising the agent's actual tool-calling surface — navigate, snapshot, click, fill. They **auto-skip** when the CLI or server isn't present (so CI stays green); start the demo app to run them. These are what catch integration bugs the fake-CLI unit tests can't (e.g. a snapshot returning empty due to a codec crash).
 
 ---
 
