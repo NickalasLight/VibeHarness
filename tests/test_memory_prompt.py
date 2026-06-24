@@ -103,7 +103,7 @@ class ToollessPromptTest(unittest.TestCase):
         self.assertIn("DO THE THING", sp)
         self.assertIn("# Workspace", sp)
         self.assertIn("WS-TEXT", sp)
-        self.assertIn("# Current page (live snapshot)", sp)
+        self.assertIn("# Current page (live snapshot", sp)
         self.assertIn("[ref=e7]", sp)
 
     def test_strips_all_tool_sections(self):

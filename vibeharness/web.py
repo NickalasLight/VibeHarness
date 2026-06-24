@@ -517,6 +517,18 @@ def capture_page_snapshot_raw(cli: PlaywrightCli) -> str:
     return (output or "").strip()
 
 
+def make_raw_snapshot_provider(config: Config) -> Callable[[], str]:
+    """Build a per-turn provider of the RAW, untruncated page snapshot (issues #37, #43).
+
+    Mirrors :func:`make_snapshot_provider` but returns the full snapshot with no char
+    cap — for #37 diagnostic ground-truth sizing and #43's dynamic-budget truncation.
+    Uses the run's existing session (same name/timeout from ``config``) so it reflects
+    the page the model acts on.
+    """
+    cli = PlaywrightCli(config.web_session, config.web_cli_timeout)
+    return lambda: capture_page_snapshot_raw(cli)
+
+
 def make_snapshot_provider(config: Config) -> Callable[[], str]:
     """Build a per-turn page-snapshot provider bound to the run's web session.
 

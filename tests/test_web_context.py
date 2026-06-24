@@ -257,7 +257,7 @@ class ValidatorContextProviderTest(unittest.TestCase):
         self.assertIn("DO THE THING", out)
         self.assertIn("# Workspace", out)
         self.assertIn("WS-TREE", out)
-        self.assertIn("# Current page (live snapshot)", out)
+        self.assertIn("# Current page (live snapshot", out)
         self.assertIn("[ref=e7]", out)
         # but NOT the tool sections / format instructions / per-toolset guidance:
         self.assertNotIn("# Tools", out)
@@ -277,7 +277,7 @@ class ValidatorContextProviderTest(unittest.TestCase):
             logger=None, include_tool_guidance=False)
         context = provider("USER-TURN")
         msg = build_validator_prompt(context, "First, you clicked Submit.")
-        self.assertLess(msg.index("# Current page (live snapshot)"),
+        self.assertLess(msg.index("# Current page (live snapshot"),
                         msg.index("First, you clicked Submit."))
 
     def test_fs_only_back_compat_no_page_section(self):
@@ -291,7 +291,7 @@ class ValidatorContextProviderTest(unittest.TestCase):
         out = provider("USER-TURN")
         self.assertIn("DO THE THING", out)
         self.assertIn("WS-TREE", out)
-        self.assertNotIn("# Current page (live snapshot)", out)
+        self.assertNotIn("# Current page (live snapshot", out)
         self.assertNotIn("# Tools", out)
 
     def test_large_snapshot_does_not_exceed_num_ctx(self):
