@@ -14,7 +14,8 @@ from vibeharness.config import Config
 from vibeharness.memory import NarrativeMemory
 from vibeharness.prompt import SystemPromptBuilder, build_turn_prompt
 from vibeharness.toolset import default_catalog
-from vibeharness.web import capture_page_snapshot, make_snapshot_provider
+from vibeharness.web import (capture_page_snapshot, capture_page_snapshot_raw,
+                             make_raw_snapshot_provider, make_snapshot_provider)
 
 
 class _FakeSnapshotCli:
@@ -79,6 +80,32 @@ class CapturePageSnapshotTest(unittest.TestCase):
             def run(self, *a):
                 raise RuntimeError("no session")
         self.assertEqual(capture_page_snapshot(_Raises(), char_limit=1000), "")
+
+
+class CaptureRawSnapshotTest(unittest.TestCase):
+    """Issue #37: the diagnostic raw capture returns the COMPLETE snapshot with no
+    char cap — ground truth on its true size — but stays exception-safe."""
+
+    def test_returns_full_text_uncapped(self):
+        cli = _FakeSnapshotCli(["w" * 50000])
+        text = capture_page_snapshot_raw(cli)
+        self.assertEqual(text, "w" * 50000)      # whole thing, no truncation marker
+        self.assertNotIn("truncated", text)
+        self.assertEqual(cli.calls, [["snapshot"]])  # same session, `snapshot` command
+
+    def test_failed_snapshot_returns_empty(self):
+        self.assertEqual(capture_page_snapshot_raw(_FakeSnapshotCli(["boom"], ok=False)), "")
+
+    def test_exception_returns_empty(self):
+        class _Raises:
+            def run(self, *a):
+                raise RuntimeError("no session")
+        self.assertEqual(capture_page_snapshot_raw(_Raises()), "")
+
+    def test_raw_provider_is_zero_arg_and_never_raises(self):
+        # With no live browser the snapshot call fails and the provider returns ""
+        # rather than raising — same contract as make_snapshot_provider.
+        self.assertEqual(make_raw_snapshot_provider(Config())(), "")
 
 
 class PerTurnSnapshotInjectionTest(unittest.TestCase):
