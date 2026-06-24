@@ -88,9 +88,9 @@ current default temperature: {saved_temp}
     p.add_argument("--headless", action="store_true",
                    help="run the web browser headless (default: headed so you can watch)")
     p.add_argument("--advisor", action="store_true",
-                   help="enable self-advisor: every 5 Qwen turns inject a free-text hint "
-                        "from the advisor model (default: same model as base agent = Qwen "
-                        "self-advises). Set advisor_model in config to use a different model.")
+                   help="enable VibeThinker advisor: after every 5 accumulated tool calls "
+                        "(counted across turns, injected at end-of-turn) VibeThinker generates "
+                        "free-text advice injected into the next Qwen turn.")
     p.add_argument("--web-snapshot-prose", action="store_true",
                    help="render the live page snapshot as WebArena-style prose (pruned, "
                         "ref-keyed) instead of raw ARIA-YAML (issue #64; A/B seam)")
@@ -537,19 +537,6 @@ def _run_locked(args, task, config, registry, codec, names, workdir, logger,
         raw_snapshot_provider = lambda: annotate_filled_snapshot(
             _inner_for_fill(), filled_controls)
 
-    # Snapshot deduplication: when the agent explicitly calls the `snapshot` tool,
-    # suppress the auto-injected snapshot on the NEXT turn (it would be redundant
-    # since the explicit tool result IS the fresh state). SnapshotTool sets a class-
-    # level flag; we reset it here after consuming it for the next turn's provider.
-    from .web import SnapshotTool as _SnapshotTool
-    if raw_snapshot_provider is not None:
-        _inner_for_dedup = raw_snapshot_provider
-        def raw_snapshot_provider():
-            if _SnapshotTool._called:
-                _SnapshotTool._called = False  # reset: only suppress ONE turn
-                return ""  # auto-snapshot suppressed — agent saw it as tool result
-            return _inner_for_dedup()
-
     # The per-turn provider applies #43's dynamic snapshot budget AND, given the
     # logger, performs #37's per-turn diagnostic dump (raw snapshot + injected prompt).
     system_prompt_provider = make_system_prompt_provider(
@@ -566,9 +553,10 @@ def _run_locked(args, task, config, registry, codec, names, workdir, logger,
                        reporter=reporter, system_prompt_provider=system_prompt_provider,
                        codec=codec, validator_context_provider=validator_context_provider)
 
-    # Advisor advice buffer: the checkpoint populates it every N turns; advice_provider
-    # drains it once at the start of the next turn and injects it into the user message.
+    # Advisor advice buffer: the checkpoint populates it after N accumulated tool calls;
+    # advice_provider drains it once at the start of the next turn.
     _advice_buffer: list[str] = []
+    _tool_calls_since_advisor = [0]  # mutable int via list so closure can write it
 
     def checkpoint(res: RunResult) -> None:
         # Update filled_controls from the latest turn's successful fill/select actions.
@@ -584,12 +572,18 @@ def _run_locked(args, task, config, registry, codec, names, workdir, logger,
                     filled_controls[tgt] = a.args["value"]
                 elif a.tool == "check" and tgt:
                     filled_controls[tgt] = "(checked)"
+            # Count tool calls this turn (real calls only, not error placeholders).
+            turn_tool_calls = sum(1 for a in latest.actions if a.tool is not None)
+            _tool_calls_since_advisor[0] += turn_tool_calls
         _safe_log(logger, task, config, res)
-        # Trigger advisor every N turns when enabled.
-        if advisor is not None and res.turns and len(res.turns) % config.advisor_interval == 0:
+        # Trigger advisor when accumulated tool calls reach the threshold (checked at
+        # end-of-turn so the base agent is never paused mid-turn for the advisor).
+        if (advisor is not None and res.turns
+                and _tool_calls_since_advisor[0] >= config.advisor_interval):
             advice = advisor.advise(task, res.turns, reporter=reporter)
             _advice_buffer.clear()
             _advice_buffer.append(advice)
+            _tool_calls_since_advisor[0] = 0  # reset counter after advisor call
 
     def advice_provider(turn_idx: int) -> str | None:
         return _advice_buffer.pop() if _advice_buffer else None

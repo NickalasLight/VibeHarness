@@ -129,8 +129,16 @@ class HermesCodec(ToolCallCodec):
         )
 
     def turn_action_hint(self) -> str:
-        return ('Respond with one or more <tool_call>{"name": ..., "arguments": {...}}'
-                "</tool_call> blocks.")
+        # Concrete multi-call example in the recency zone so the 3B model learns the
+        # pattern from an in-context demonstration, not just an abstract instruction.
+        return (
+            "Respond with one or more CONSECUTIVE <tool_call> blocks — one block per action.\n"
+            "Example (two actions in one turn):\n"
+            '<tool_call>\n{"name": "fill", "arguments": {"target": "e12", "text": "Alice"}}\n</tool_call>\n'
+            '<tool_call>\n{"name": "fill", "arguments": {"target": "e14", "text": "alice@example.com"}}\n</tool_call>\n'
+            "ALWAYS batch independent form-field fills, clicks, and selections together. "
+            "Use a single <tool_call> ONLY when you must see a result before deciding the next step."
+        )
 
     def tool_definitions(self, registry: ToolRegistry) -> str | None:
         """Render tools as the Hermes ``<tools>`` block (BARE per-line function schemas)

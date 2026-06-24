@@ -688,7 +688,11 @@ class _WebTool(Tool):
 
 class GotoTool(_WebTool):
     name = "goto"
-    description = "Navigate the browser to a URL. The page, cookies and history persist."
+    description = (
+        "Navigate the browser to a URL. The page, cookies and history persist. "
+        "If no browser session is open yet, this will open one automatically — "
+        "use goto as your FIRST action to open the target page."
+    )
     _verb = "navigated to"
     _required = ("url",)
 
@@ -1159,11 +1163,12 @@ class SnapshotTool(_WebTool):
 # ``open_browser`` lets the agent restore a dead persistent session.
 # ``snapshot`` lets the agent explicitly request a fresh page view mid-turn.
 _WEB_TOOL_CLASSES: tuple[type[_WebTool], ...] = (
-    OpenBrowserTool,
     GotoTool, ClickTool, FillTool, TypeTool, PressKeyTool, SelectOptionTool,
     CheckTool, UncheckTool, HoverTool, DragTool, UploadTool,
-    EvaluateTool, SnapshotTool, NavigateBackTool, NavigateForwardTool, ReloadTool,
-    # ScreenshotTool intentionally excluded — model is not visual.
+    ReloadTool,
+    # Excluded: OpenBrowserTool (goto opens browser automatically),
+    # EvaluateTool (not needed), SnapshotTool (auto-injected into system prompt),
+    # NavigateBackTool, NavigateForwardTool (not needed), ScreenshotTool (model is not visual).
 )
 
 

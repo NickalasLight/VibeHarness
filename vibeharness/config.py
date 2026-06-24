@@ -29,7 +29,7 @@ class Config:
 
     # loop
     max_steps: int = 15               # <= 0 means unlimited
-    max_actions_per_turn: int = 10    # cap on tool calls the model may emit per turn
+    max_actions_per_turn: int = 5     # cap on tool calls the model may emit per turn
 
     # Per-turn wall-clock budget (seconds). 0 (default) disables the guard,
     # preserving the original behaviour exactly: decide() is called inline with no
@@ -182,10 +182,10 @@ class Config:
     # as <user_advice>...</user_advice>.
     # Empty string means "same model as the base agent" (Qwen self-advises, one model in VRAM).
     # Set to "vibethinker:latest" to use VibeThinker as the advisor (requires model-swap mode).
-    advisor_model: str = ""
+    advisor_model: str = "vibethinker:latest"
 
     advisor_temperature: float = 1.0   # high diversity for advice
-    advisor_interval: int = 1          # call advisor every N Qwen turns (1 = every turn)
+    advisor_interval: int = 5          # call advisor after N accumulated tool calls (across turns)
     advisor_enabled: bool = False      # opt-in; set True via CLI or settings
 
     # --- snapshot prose rendering (issue #64) ---

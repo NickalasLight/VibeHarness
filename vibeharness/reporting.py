@@ -62,6 +62,7 @@ class NullReporter(Reporter):
     def validator_reasoning_token(self, text): pass
     def validator_verdict_token(self, text): pass
     def advisor_start(self): pass
+    def advisor_thinking_token(self, text): pass
     def advisor_token(self, text): pass
     def advisor_end(self): pass
 
@@ -80,7 +81,7 @@ def _enable_ansi() -> None:
 class ConsoleReporter(Reporter):
     """Streams a live, color-coded view of each turn to the terminal."""
 
-    def __init__(self, color: bool = True, result_limit: int = 240):
+    def __init__(self, color: bool = True, result_limit: int = 2000):
         self._color = color
         self._result_limit = result_limit   # console-only preview cap; agent gets the full result
         if color:
@@ -150,11 +151,20 @@ class ConsoleReporter(Reporter):
 
     # ---- advisor stream (rendered in blue, clearly labeled) ----
     def advisor_start(self) -> None:
-        self._adv_open = False
+        self._adv_think_open = False
+        self._adv_advice_open = False
         self._w(self._c("blue", "\n│ ╭─ advisor ──────────────────\n"))
-        self._w(self._c("blue", "│ ╎ "))
+
+    def advisor_thinking_token(self, text: str) -> None:
+        if not self._adv_think_open:
+            self._w(self._c("blue", "│ ╎ thinking: "))
+            self._adv_think_open = True
+        self._w(self._c("dim", text))
 
     def advisor_token(self, text: str) -> None:
+        if not self._adv_advice_open:
+            self._w(self._c("blue", "\n│ ╎ advice: "))
+            self._adv_advice_open = True
         self._w(self._c("blue", text))
 
     def advisor_end(self) -> None:
