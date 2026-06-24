@@ -1064,6 +1064,17 @@ class SelectOptionTool(_WebTool):
             misfire = self._guard_date_target(args.get("target", ""), before)
             if misfire is not None:
                 return misfire
+        # SPINBUTTON GUARD (iter-2 fix): a number stepper (spinbutton) is not a dropdown
+        # and cannot be interacted with via select_option. Its value is set by clicking the
+        # adjacent Increase/Decrease buttons (not the spinbutton container itself). The guard
+        # detects a spinbutton target and returns a message pointing to the correct Increase
+        # button ref so the agent can batch-click it to reach the target value.
+        # Must run BEFORE _target_is_plain_button because "spinbutton" contains "button" and
+        # the plain-button guard would otherwise fire with a less specific 'use click(eN)'
+        # message that points to the spinbutton container — not the Increase button.
+        sb = self._guard_spinbutton(args.get("target", ""), before)
+        if sb is not None:
+            return sb
         # PLAIN-BUTTON GUARD (iter-2): the model sometimes calls select_option on a real
         # <button> (e.g. "Continue →"/"Submit") instead of click. The custom-combobox
         # fallback would then just CLICK the button — which "works" once but records the
@@ -1151,6 +1162,55 @@ class SelectOptionTool(_WebTool):
         )
 
     @staticmethod
+    def _guard_spinbutton(target: str, snapshot: str) -> "ToolResult | None":
+        """Reject select_option on a spinbutton, pointing to its Increase button (iter-2).
+
+        A number stepper (spinbutton) cannot be interacted with via select_option or fill
+        — the value is changed by clicking its adjacent Increase/Decrease BUTTONS. When the
+        agent calls select_option on a spinbutton ref, return a targeted message naming the
+        correct Increase button ref so the agent clicks the right thing immediately. Must
+        run BEFORE _target_is_plain_button, since spinbutton lines contain 'button' as a
+        substring and would otherwise be caught by the plain-button guard with a less
+        specific 'use click(eN)' message that points to the spinbutton container (wrong)."""
+        ref = normalize_ref(target)
+        if ref is None:
+            return None
+        lines = (snapshot or "").splitlines()
+        for i, line in enumerate(lines):
+            if f"[ref={ref}]" not in line:
+                continue
+            if "spinbutton" not in line.lower():
+                return None  # not a spinbutton -> let normal path handle it
+            # Found the spinbutton. Search forward for the Increase button.
+            increase_ref = None
+            for j in range(i + 1, min(i + 8, len(lines))):
+                sib = lines[j]
+                if "increase" in sib.lower() and "[ref=" in sib:
+                    m = re.search(r"\[ref=(e\d+)\]", sib)
+                    if m:
+                        increase_ref = m.group(1)
+                        break
+            if increase_ref:
+                return ToolResult(
+                    False,
+                    f"'{target}' is a NUMBER STEPPER (spinbutton) — select_option/fill do "
+                    f"NOT apply. To increment it click the INCREASE BUTTON '{increase_ref}' "
+                    f"(aria-label 'Increase …') — NOT the spinbutton container '{target}' "
+                    f"which only focuses the field without changing the value. "
+                    f"To set the value to 9: click(target='{increase_ref}') nine times. "
+                    f"You can batch all 9 clicks in one turn.",
+                )
+            return ToolResult(
+                False,
+                f"'{target}' is a NUMBER STEPPER (spinbutton) — select_option/fill do not "
+                f"apply. Find the 'Increase …' button sibling in the snapshot (it is a "
+                f"button whose aria-label starts with 'Increase') and click it once per "
+                f"unit (9 times to reach 9). Do NOT click the spinbutton container "
+                f"itself — only the Increase/Decrease sibling buttons change the value.",
+            )
+        return None  # target not in snapshot -> fail open
+
+    @staticmethod
     def _target_is_plain_button(target: str, snapshot: str) -> "ToolResult | None":
         """Steer to `click` when ``target`` is a plain <button> (not a dropdown).
 
@@ -1159,7 +1219,8 @@ class SelectOptionTool(_WebTool):
         "Continue →"/"Submit"), so select_option does not accidentally click it and poison
         the anti-loop guard (iter-2). Returns ``None`` (proceed) for combobox-buttons
         (`button` lines that ALSO say combobox/listbox/haspopup) and when the target can't
-        be found (fail open)."""
+        be found (fail open). Spinbuttons are excluded here — they are handled earlier by
+        _guard_spinbutton, which gives a more targeted message about the Increase button."""
         ref = normalize_ref(target)
         if ref is None:
             return None
@@ -1170,7 +1231,9 @@ class SelectOptionTool(_WebTool):
             if "button" not in low:
                 return None  # not a button line -> let normal path handle it
             # A combobox/listbox rendered as a button IS a dropdown -> proceed normally.
-            if any(k in low for k in ("combobox", "listbox", "haspopup", "select", "expanded")):
+            # Spinbuttons contain 'button' as a substring but are handled by _guard_spinbutton.
+            if any(k in low for k in ("combobox", "listbox", "haspopup", "select", "expanded",
+                                      "spinbutton")):
                 return None
             return ToolResult(
                 False,
@@ -1196,6 +1259,15 @@ class SelectOptionTool(_WebTool):
 
         Returns a :class:`ToolResult`, or ``None`` to fall back to the original error
         (e.g. the trigger click itself failed for a non-combobox reason)."""
+        # ITER-3 FIX: if another dropdown/listbox is currently open (e.g. the agent called
+        # select_option on two comboboxes in the same turn), its overlay intercepts the click
+        # on ``target`` and prevents this combobox from opening — which makes the fallback
+        # click return ok=True but the calendar/listbox never appears, causing _select_via_combobox
+        # to return None and propagate the native "not a <select>" error (root cause of the
+        # work-arrangement + date-picker interference on Step 2 in iter-2). Press Escape first
+        # to close any open popup/listbox so the click reaches the actual trigger.
+        self._cli.run("press", "Escape")
+        time.sleep(0.15)
         ok, out = self._cli.run("click", target)
         if not ok and output_signals_session_closed(out):
             return ToolResult(False, f"you tried to open the '{target}' dropdown but the browser "

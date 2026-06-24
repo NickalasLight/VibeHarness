@@ -1,13 +1,13 @@
 {
   "phase": "optimizing",
-  "iteration": 1,
+  "iteration": 2,
   "last_score": 48,
   "best_score": 48,
   "vibethinker_enabled": false,
   "rewrite_pr_merged": true,
   "hf_test_pr_merged": true,
   "finished": false,
-  "notes": "Iter 1: score=48 (18 fields + 3 page advances, pages 1->4). Key fixes: combobox affordance, DatePicker nav, anti-loop softened, max_actions 4->12, advisor disabled. Iter 2 ready: qwen3:4b upgrade committed (PR #141), scoring system committed to job_app_benchmark. Remaining blockers: MultiSelect skills, NumberStepper (totalExperienceYears/dotnetExperienceYears), FileUpload, SignaturePad, pages 4-8 not reached. See GitHub issue #142 for full loop architecture and run instructions. NEXT RUN: vibe --agent web --max-steps 0 --task-file task_iter4.txt (NO --advisor, model=qwen3:4b). PREREQUISITE: OLLAMA_FLASH_ATTENTION=1 must be set and Ollama restarted before run.",
+  "notes": "Iter 2 RUNNING (PID=14720). Turn 7 at Jan 2022 calendar nav — agent manually clicking Next Year. Root causes identified and FIXED for iter-3: (1) _select_via_combobox now presses Escape before clicking trigger to close any open overlay; (2) task_iter4.txt: work arrangement value fixed to 'Hybrid' (agent passed hint text); (3) ONE-DROPDOWN-AT-A-TIME warning added. These changes are committed to branch (not yet PR). Agent passed 'I already live in the Dallas, TX area' correctly. Spinbutton guard active. Calendar nav expected to complete ~40 more min; then work arrangement, then page 3+. Iter-2 expected score 50-80 depending on page advance. Side task: job_app_benchmark identifier randomization complete (data-field/data-name suffixed with per-visit hex token, commit 4ac627d on main). See issue #142.",
   "ground_truth": {
     "tool_schema_format": "bare {name,description,parameters} for hand-crafted <tools>; ENVELOPED {type:function,function:{...}} for Ollama native tools: API field",
     "tool_result_role": "role:tool works via Ollama native API (Ollama handles it internally)",
@@ -17,6 +17,10 @@
     "advisor_decision": "DISABLED. Run command must NOT pass --advisor.",
     "context_window": "num_ctx=32768 required (OLLAMA_FLASH_ATTENTION=1 makes it safe at ~4500 MiB). 16384 gives only 7168 token input budget — too small for 8-page form. Restore to 32768.",
     "scoring_system": "GET http://localhost:3000/api/score/session-end at end of each run. Writes .vibe/last_benchmark_score.json with commitMessageStart.",
-    "loop_issue": "Full loop architecture documented in GitHub issue #142 on VibeHarness repo."
-  }
+    "loop_issue": "Full loop architecture documented in GitHub issue #142 on VibeHarness repo.",
+    "iter3_fixes": "Escape in _select_via_combobox; work arrangement='Hybrid'; ONE-DROPDOWN-AT-A-TIME warning; calendar select_option is atomic in tool (no manual nav needed)"
+  },
+  "run_pid": 14720,
+  "run_log": "C:\\git\\vibethinkharnessProto1\\vibe_run_iter2_restart.log",
+  "task_id": "1"
 }

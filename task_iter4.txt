@@ -1,0 +1,119 @@
+# Job application — agent instruction prompt
+
+You are filling out a job application on behalf of a candidate. ALL of the
+candidate's information is written out below in plain text — use it directly to
+fill the form. You do NOT need to read any file for the candidate's data.
+
+**Apply at:** http://localhost:3000/careers/senior-net-engineer-dallas-tx-FT-2024-8842
+(open the application form at `/careers/senior-net-engineer-dallas-tx-FT-2024-8842/apply`).
+
+## Candidate information (use these exact values)
+
+**Personal**
+- First name: Jason
+- Last name: Statham
+- Email: jason.statham.dev@example.com
+- Phone: +1 (214) 555-0199
+- Address: 1820 McKinney Avenue, Apt 14C
+- City: Dallas — State: TX — ZIP/postal code: 75201 — Country: United States
+- LinkedIn: https://www.linkedin.com/in/jason-statham-dotnet
+- GitHub: https://github.com/jstatham-dev
+- Portfolio: https://jstatham.dev
+
+**Work eligibility**
+- Work authorization: U.S. Citizen
+- Requires visa sponsorship: No
+- Willing to relocate: use select_option with EXACT value "I already live in the Dallas, TX area" (NOT "No, I am not willing to relocate" — these are two DIFFERENT options)
+- Work preference: use select_option with EXACT value "Hybrid" (NOT "This role is hybrid (3 days/week onsite)" — that is the hint text below the dropdown, NOT an option)
+- Available start date: 2026-07-21 (July 21, 2026)
+
+**Experience & compensation**
+- Current title: Senior Software Engineer
+- Current company: Lone Star Payments Inc.
+- Total years of experience: 9
+- Years of .NET experience: 9
+- Salary expectation: $165,000 (if a plain number is required, enter 165000)
+
+**Work history**
+1. Senior Software Engineer — Lone Star Payments Inc., Dallas TX (Mar 2021–Present): C#/.NET 8 microservices processing 3M+ transactions/day at sub-100ms p99; re-architected the ledger with DDD (−70% reconciliation defects); event-driven pipelines on Azure Service Bus + Kafka; SQL tuning cut settlement batch 45m→6m; mentors 4 engineers; on-call.
+2. Software Engineer II — Brazos Software Group, Austin TX (Jun 2018–Feb 2021): ASP.NET Core Web APIs for a B2B invoicing platform (12,000 merchants); migrated a .NET Framework monolith to containerized .NET Core on Azure AKS; gRPC contracts; Azure DevOps CI/CD.
+3. Software Engineer — Trinity Web Solutions, Dallas TX (Jul 2016–May 2018): C#/ASP.NET MVC logistics apps; normalized SQL Server schemas + stored procedures; xUnit tests.
+
+**Skills:** The skills step shows TOGGLE BUTTONS — use click (NOT select_option) on each
+button to select it. Click each of these EXACT button labels (copy text exactly):
+  "C#", ".NET / .NET Core", "ASP.NET Core", "Web API", "Entity Framework Core",
+  "SQL Server", "Azure", "Microservices", "Docker / Kubernetes", "CI/CD", "gRPC",
+  "RabbitMQ / Kafka", "Unit Testing (xUnit/NUnit)", "Domain-Driven Design"
+
+**Education**
+- Degree: Bachelor of Science in Computer Science (if a degree dropdown is shown, pick "Bachelor's Degree")
+- School: The University of Texas at Dallas
+- Field of study: Computer Science
+- Graduation: May 2016
+
+**Additional questions**
+- Why interested: "FlashTec's bet on .NET, Azure, and event-driven architecture to move real money at five-nines reliability is exactly the problem space I have spent my career in. I want to bring my payments and ledger experience to a Dallas-based platform team where I can own high-throughput services end-to-end and mentor the next generation of engineers."
+- How did you hear about us: Company careers page (if a dropdown, pick "Company Website")
+
+**Voluntary self-identification**
+- Gender: Decline to self-identify
+- Ethnicity: Decline to self-identify
+- Veteran status: I am not a protected veteran
+- Disability status: Decline to answer
+
+**Certification / signature**
+- Certify the information is true: Yes
+- Consent to data processing: Yes
+- Signature name: Jason Statham
+
+**Documents to upload** (where the form has a file upload):
+- Resume: `C:\git\vibethinkharnessProto1\test_assets\jason_statham_resume.docx`
+- Cover letter: `C:\git\vibethinkharnessProto1\test_assets\jason_statham_cover_letter.docx`
+- Use the `upload` tool on the file input ref. Do NOT drag-drop.
+
+## Steps
+1. Open the application form.
+2. Fill EVERY field using the candidate information above.
+3. Upload the resume and cover letter where the form allows.
+4. Review the form for accuracy, then submit; confirm it was submitted.
+
+Rules: use ONLY the information above; do NOT invent details. If a required field
+has no value here, note it rather than making one up.
+
+## How this form works (READ THIS — it is an 8-step wizard)
+The form has EIGHT steps shown in the left "Application progress" list:
+  1. Personal Information   2. Work Eligibility   3. Experience & Skills
+  4. Education   5. Resume & Cover Letter   6. Additional Questions
+  7. Voluntary Self-Identification   8. Review & Submit
+You advance by clicking the "Continue →" button at the bottom of each step. After you
+click Continue, the page is REPLACED with the next step and EVERY element ref changes.
+
+CRITICAL rules for getting through all 8 steps:
+- ONE DROPDOWN AT A TIME: each select_option call either (a) completes the selection in one shot, or (b) opens the dropdown and tells you to click the matching option. In case (b), click the option BEFORE calling any other tool — never call select_option on a second field while a dropdown is still visually open from a previous call, or the overlay will block the second click.
+- After clicking "Continue →" (or "← Back"), the refs from the previous step are GONE.
+  Element refs are NOT sequential and you must NEVER guess or increment a ref
+  (e.g. do NOT try e208 just because you used e207). ALWAYS re-read the live page
+  snapshot and copy a ref EXACTLY as shown before acting.
+- IGNORE the two decoy fields labelled "Company website" and "Home fax" — they appear on
+  every step and are NOT part of the candidate's data. NEVER type anything into them.
+  In particular do NOT put the LinkedIn, GitHub, or Portfolio URLs there.
+- The candidate's LinkedIn / GitHub / Portfolio URLs go ONLY in the real, clearly
+  LABELLED URL fields on the "Experience & Skills" step ("LinkedIn profile URL" and
+  "Portfolio / GitHub URL"). Leave the LinkedIn URL for the LinkedIn field; put the
+  GitHub or Portfolio URL in the "Portfolio / GitHub URL" field.
+- Dropdowns (State, Country, work-authorization, etc.) are custom comboboxes: use
+  select_option(target=<ref>, value="<exact option text>"), never fill/type.
+- The "Earliest available start date" is a date picker: use
+  select_option(target=<ref>, value="2026-07-21") — the harness navigates the calendar
+  for you. Confirm the date is set before clicking Continue (the step will not advance
+  while a required field is empty).
+- Years-of-experience are number STEPPERS (spinbutton). NEVER use fill or select_option
+  on the spinbutton ref — that does nothing. Instead click the INCREASE BUTTON that is
+  shown as a sibling in the snapshot with aria-label "Increase Total years of professional
+  experience" (or "Increase Years of C# / .NET experience"). Click it NINE times for each
+  field. You can batch all 9 clicks in a single turn. Do NOT click the spinbutton container
+  itself (that only focuses it without changing the value).
+- Skills are toggle buttons: click each skill button that matches the candidate's skills.
+- On each step, fill EVERY required field, then click "Continue →". On the final
+  "Review & Submit" step, tick the certification/consent checkboxes, enter the signature
+  name, then click the Submit button and confirm the submission succeeded.
