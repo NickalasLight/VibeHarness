@@ -314,5 +314,35 @@ class EndToEndProviderTest(unittest.TestCase):
         self.assertEqual(len(sig.parameters), 1)
 
 
+class PinnedNumCtxFitsHeavyPageTest(unittest.TestCase):
+    """ISSUE #77 interaction with #43: lowering the default num_ctx 131072 -> 32768
+    shrinks the dynamic snapshot budget. That is a CORRECTION (the 131072 window was
+    never actually delivered by the 8 GB GPU). Confirm the DEFAULT config still leaves
+    real room and a representative heavy page still fits whole."""
+
+    def test_default_num_ctx_is_the_pinned_value(self):
+        self.assertEqual(Config().num_ctx, 32768)
+
+    def test_default_input_budget_is_positive_and_sane(self):
+        # 32768 - (2048 + 16384) - 1024 = 13312 input tokens after the output
+        # reservation and safety margin: positive, with thousands of tokens for the
+        # prompt + a snapshot.
+        self.assertEqual(input_budget_tokens(Config()), 13_312)
+
+    def test_heavy_youtube_snapshot_fits_under_default(self):
+        # The diagnosed worst case: a ~45k-char YouTube watch ARIA snapshot ≈ ~11k
+        # tokens at 4 chars/token. With a modest prompt it still injects WHOLE.
+        cfg = Config()  # real defaults: num_ctx=32768
+        rest = "p" * 4_000          # ~1k-token system prompt + per-turn message
+        heavy_snapshot = "s" * 45_000
+        b = compute_snapshot_budget(cfg, rest)
+        self.assertFalse(b.overflow)
+        self.assertGreaterEqual(b.budget_chars, len(heavy_snapshot),
+                                msg="heavy YouTube snapshot no longer fits at num_ctx=32768")
+        rendered = render_budgeted_snapshot(heavy_snapshot, b.budget_chars)
+        self.assertEqual(rendered, heavy_snapshot)   # whole, no truncation marker
+        self.assertNotIn("truncated", rendered)
+
+
 if __name__ == "__main__":
     unittest.main()
