@@ -28,6 +28,7 @@ import re
 import shutil
 import subprocess
 import sys
+import uuid
 from typing import Callable
 
 from .config import Config
@@ -35,6 +36,33 @@ from .toolset import Toolset
 from .tools import Param, Tool, ToolResult
 
 BINARY = "playwright-cli"
+
+# The Config default for ``web_session``. When the resolved config still carries this
+# sentinel, the session name was NOT explicitly chosen (CLI/settings), so each run is
+# given a fresh unique name instead (issues #111/#112) — see :func:`resolve_web_session`.
+DEFAULT_WEB_SESSION = "vibe"
+
+
+def resolve_web_session(config: Config) -> str:
+    """The per-RUN Playwright session name (issues #111/#112).
+
+    The persistent playwright-cli is a client/daemon keyed by session NAME: every
+    wrapper bound to the same name talks to (and tears down) the SAME daemon. When
+    ``config.web_session`` was a single constant (``"vibe"``), every concurrent run
+    shared ONE daemon, so one run's teardown (``close``) killed another run's browser
+    mid-run — the root cause of the "browser is not open" daemon deaths (#101/#111).
+
+    To make runs isolated, we mint a UNIQUE name per run — ``vibe-<short-guid>`` — so
+    concurrent runs never collide on the daemon. An explicitly-set name (anything other
+    than the :data:`DEFAULT_WEB_SESSION` sentinel, e.g. from saved settings) is honoured
+    verbatim as an override; only the default triggers a generated name. Resolve ONCE
+    per run and thread the result through ``config.web_session`` so every web tool and
+    both snapshot providers share the exact same name.
+    """
+    name = config.web_session
+    if name and name != DEFAULT_WEB_SESSION:
+        return name
+    return f"{DEFAULT_WEB_SESSION}-{uuid.uuid4().hex[:8]}"
 
 # A snapshot ref token, as it appears in the auto-injected live page view, e.g.
 # "[e163] button ...". We accept it bare (``e163``) or bracketed (``[e163]``).
@@ -157,6 +185,42 @@ class SessionState:
 
     def may_resume(self) -> bool:
         return self.resumes < self.max_resumes
+
+
+# Run-scoped registry of the ONE ``SessionState`` per session name (issue #113). The
+# three places a run builds a ``PlaywrightCli`` for its session — ``create_tools`` (every
+# discrete web tool), ``setup`` (the run's lifecycle CLI), and the two snapshot providers
+# — are created at different points in cli.py and cannot easily be handed a single object
+# at construction. Keying the shared state by session NAME instead means every wrapper
+# bound to the run's (now unique, issue #112) name transparently gets the SAME state, so
+# recovery bookkeeping (open_flags/last_url/resumes) written by any tool is visible to all
+# of them. Because each run mints a unique name, entries never collide across runs;
+# ``WebToolset.teardown`` drops the run's entry so the registry does not accumulate.
+_SESSION_STATES: "dict[str, SessionState]" = {}
+
+
+def shared_session_state(session: str, open_flags: "list[str] | None" = None) -> SessionState:
+    """Return the ONE run-scoped :class:`SessionState` for ``session`` (issue #113).
+
+    The first caller for a given session name creates the state (seeding ``open_flags``);
+    every later caller for the SAME name gets that same instance, so all web tools and
+    both snapshot providers in one run share recovery bookkeeping. ``open_flags`` is only
+    applied when the state is first created (or was empty), never overwriting flags an
+    earlier caller already seeded.
+    """
+    state = _SESSION_STATES.get(session)
+    if state is None:
+        state = SessionState(open_flags)
+        _SESSION_STATES[session] = state
+    elif open_flags and not state.open_flags:
+        state.open_flags = list(open_flags)
+    return state
+
+
+def drop_session_state(session: str) -> None:
+    """Forget the shared :class:`SessionState` for ``session`` (called on teardown) so
+    the per-run registry does not grow unbounded across the process's lifetime."""
+    _SESSION_STATES.pop(session, None)
 
 
 # Pull the "Page URL: <url>" line the CLI prints in snapshots / nav results so a
@@ -874,10 +938,13 @@ def make_raw_snapshot_provider(config: Config) -> Callable[[], str]:
     Uses the run's existing session (same name/timeout from ``config``) so it reflects
     the page the model acts on. Seeded with the run's open flags so a snapshot that
     hits a dead session can self-heal it too (issue #102) — snapshots run every turn
-    and are a major resume surface.
+    and are a major resume surface. Shares the run-scoped :class:`SessionState` (keyed
+    by session name) with every web tool, so a resume the snapshot triggers heals the
+    session for the discrete tools too (issue #113).
     """
     cli = PlaywrightCli(config.web_session, config.web_cli_timeout,
-                        open_flags=open_flags_for(config))
+                        open_flags=open_flags_for(config),
+                        state=shared_session_state(config.web_session, open_flags_for(config)))
     return lambda: capture_page_snapshot_raw(cli)
 
 
@@ -896,7 +963,8 @@ def make_snapshot_provider(config: Config) -> Callable[[], str]:
     budget so the snapshot is sized against the full message each turn.
     """
     cli = PlaywrightCli(config.web_session, config.web_cli_timeout,
-                        open_flags=open_flags_for(config))
+                        open_flags=open_flags_for(config),
+                        state=shared_session_state(config.web_session, open_flags_for(config)))
     return lambda: capture_page_snapshot(cli, config.web_snapshot_char_limit)
 
 
@@ -953,9 +1021,13 @@ class WebToolset(Toolset):
     def create_tools(self, config: Config) -> list[Tool]:
         # Carry the run's open flags so a tool that has to reopen a dead session
         # (auto-recovery or `open_browser`, issues #101/#75) restores the SAME
-        # headed/channel browser the run started with — not a default one.
+        # headed/channel browser the run started with — not a default one. Bind the
+        # run-scoped shared SessionState (keyed by the run's unique session name) so
+        # recovery bookkeeping is shared across every web tool and both snapshot
+        # providers, not private per wrapper (issue #113).
         cli = PlaywrightCli(config.web_session, config.web_cli_timeout,
-                            open_flags=open_flags_for(config))
+                            open_flags=open_flags_for(config),
+                            state=shared_session_state(config.web_session, open_flags_for(config)))
         limit = config.web_observation_char_limit
         return [cls(cli, limit) for cls in _WEB_TOOL_CLASSES]
 
@@ -974,8 +1046,11 @@ class WebToolset(Toolset):
     def setup(self, config: Config) -> None:
         # Open the browser once for the run. Headed by default so a human can watch.
         # The same flags are stored on the CLI so any reopen restores this browser.
+        # Bind the run-scoped shared SessionState (issue #113) so the lifecycle CLI and
+        # every web tool/snapshot provider share one recovery state for this session.
         self._cli = PlaywrightCli(config.web_session, config.web_cli_timeout,
-                                  open_flags=open_flags_for(config))
+                                  open_flags=open_flags_for(config),
+                                  state=shared_session_state(config.web_session, open_flags_for(config)))
         # Defensive last-resort reaper: if the run is hard-killed (Ctrl-C escaping the
         # cli finally, os._exit, an unhandled signal) the toolset's teardown may never
         # run. Registering close() with atexit ensures the browser tree is still reaped
@@ -1004,3 +1079,9 @@ class WebToolset(Toolset):
             pass
         finally:
             self._cli = None
+            # Forget this run's shared SessionState so the per-run registry (keyed by
+            # the run's unique session name) does not accumulate across runs (#113).
+            try:
+                drop_session_state(config.web_session)
+            except Exception:
+                pass

@@ -34,7 +34,7 @@ from .toolset import (
     default_catalog,
 )
 from .validation import LLMValidator
-from .web import make_raw_snapshot_provider
+from .web import make_raw_snapshot_provider, resolve_web_session
 from .snapshot_prose import aria_yaml_to_prose
 
 
@@ -227,7 +227,13 @@ def resolve_config(args: argparse.Namespace) -> Config:
         overrides["web_headless"] = True
     if getattr(args, "web_snapshot_prose", False):
         overrides["web_snapshot_prose"] = True
-    return replace(cfg, **overrides) if overrides else cfg
+    cfg = replace(cfg, **overrides) if overrides else cfg
+    # Mint a UNIQUE per-run Playwright session name (issues #111/#112) so concurrent
+    # runs never share — and tear down — one another's browser daemon. An explicitly
+    # set name (settings) is honoured as an override; only the default is replaced.
+    # Resolved ONCE here so every web tool and both snapshot providers (all read
+    # ``config.web_session``) share the exact same name for this run.
+    return replace(cfg, web_session=resolve_web_session(cfg))
 
 
 def cmd_list_toolsets() -> int:
