@@ -110,8 +110,8 @@ class OllamaClient(LLMClient):
             "raw": True,
             "prompt": prompt,
             "format": action_schema,
-            "options": {**self._options(), "num_predict": self._cfg.action_tokens,
-                        "stop": ["<|im_end|>"]},
+            "options": {**self._options(), "temperature": self._cfg.action_temperature,
+                        "num_predict": self._cfg.action_tokens, "stop": ["<|im_end|>"]},
         }, on_token)
         return text.strip()
 

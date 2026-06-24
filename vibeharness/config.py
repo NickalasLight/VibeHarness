@@ -7,7 +7,8 @@ from dataclasses import dataclass
 class Config:
     # model / sampling
     model: str = "vibethinker"
-    temperature: float = 0.3          # 0.3 gave clean content in our experiments
+    temperature: float = 0.3          # phase-1 reasoning temperature (some diversity helps)
+    action_temperature: float = 0.0   # phase-2 action: greedy, for verbatim string fidelity
     top_p: float = 0.95
     top_k: int = 0
     num_gpu: int = 99                 # force full GPU offload (NVIDIA via CUDA)
