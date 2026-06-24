@@ -88,14 +88,24 @@ class ToolsetCatalog:
     def build_registry(self, toolsets: list[Toolset], config: Config) -> ToolRegistry:
         from .validation import ValidateTool
         tools: list[Tool] = [ValidateTool()]   # core: present in every toolset
+        seen = {t.name for t in tools}
         for ts in toolsets:
-            tools.extend(ts.create_tools(config))
+            for tool in ts.create_tools(config):
+                # De-duplicate by name: a toolset may *declare* the core `validate`
+                # tool (the validator toolset does, issue #31) so its toolset is an
+                # honest, self-describing unit — but the registry still holds exactly
+                # one tool per name. The core injection above wins.
+                if tool.name in seen:
+                    continue
+                seen.add(tool.name)
+                tools.append(tool)
         return ToolRegistry(tools)
 
 
 def default_catalog() -> ToolsetCatalog:
+    from .validation import ValidatorToolset
     from .web import WebToolset
-    return ToolsetCatalog([FilesystemToolset(), WebToolset()])
+    return ToolsetCatalog([FilesystemToolset(), WebToolset(), ValidatorToolset()])
 
 
 # An "agent type" is a NAMED DEFAULT TOOLSET SELECTION — nothing more. The agent's

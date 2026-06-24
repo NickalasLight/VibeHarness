@@ -32,6 +32,8 @@ class AgentDefaultToolsetMappingTest(unittest.TestCase):
         mapping = agent_default_toolsets()
         self.assertEqual(mapping["web"], ["web"])
         self.assertEqual(mapping["fs"], ["fs"])
+        # The validator is a first-class agent type too (issue #31).
+        self.assertEqual(mapping["validator"], ["validator"])
 
     def test_mapping_stays_in_lockstep_with_catalog(self):
         self.assertEqual(set(agent_default_toolsets()), set(default_catalog().names()))
@@ -129,6 +131,11 @@ class ListAgentsTest(unittest.TestCase):
         out = buf.getvalue()
         self.assertIn("web", out)
         self.assertIn("fs", out)
+        # The validator is listed as a first-class agent type (issue #31).
+        self.assertIn("validator", out)
+
+    def test_validator_is_a_valid_agent(self):
+        self.assertIsNone(cli.agent_error("validator"))
 
 
 class AgentHelpTest(unittest.TestCase):
