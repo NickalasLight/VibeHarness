@@ -1,6 +1,10 @@
 import unittest
 
+from vibeharness.config import Config
+from vibeharness.toolset import (Toolset, agent_default_toolsets,
+                                 default_catalog)
 from vibeharness.validation import (LLMValidator, ValidateTool,
+                                    ValidatorToolset, VALIDATOR_SYSTEM,
                                     build_validator_prompt)
 
 from tests._fakes import ScriptedVerdictClient as ScriptedClient
@@ -65,6 +69,67 @@ class ValidateToolTest(unittest.TestCase):
         schema = tool.call_schema()
         self.assertEqual(schema["properties"]["tool"]["const"], "validate")
         self.assertIn("summary", schema["properties"]["args"]["properties"])
+
+
+class ValidatorAgentTypeTest(unittest.TestCase):
+    """The validator is declared as a first-class agent type via the SAME
+    framework as web/fs (issue #31): prompt via system_guidance, verdict tool via
+    create_tools, registered in the catalog so it is a recognized agent type."""
+
+    def test_validator_toolset_is_a_toolset(self):
+        self.assertIsInstance(ValidatorToolset(), Toolset)
+        self.assertEqual(ValidatorToolset().name, "validator")
+
+    def test_validator_is_a_recognized_agent_type(self):
+        # agent_default_toolsets() (and therefore --agent / --list-agents) knows it.
+        mapping = agent_default_toolsets()
+        self.assertIn("validator", mapping)
+        self.assertEqual(mapping["validator"], ["validator"])
+        self.assertIn("validator", default_catalog().names())
+
+    def test_prompt_is_exposed_via_the_framework(self):
+        # The validator's PROMPT is surfaced through #19's system_guidance hook,
+        # and it is the very same VALIDATOR_SYSTEM that drives live validation.
+        self.assertEqual(ValidatorToolset().system_guidance(), VALIDATOR_SYSTEM)
+
+    def test_verdict_tool_is_exposed_via_the_framework(self):
+        tools = ValidatorToolset().create_tools(Config())
+        self.assertEqual([t.name for t in tools], ["validate"])
+        self.assertIsInstance(tools[0], ValidateTool)
+
+    def test_selecting_validator_toolset_builds_a_registry_with_validate(self):
+        # Even though the validator toolset declares `validate` AND the catalog
+        # injects it as the core tool, the registry holds exactly one (de-duped).
+        catalog = default_catalog()
+        registry = catalog.build_registry(catalog.select(["validator"]), Config())
+        self.assertEqual(registry.names(), ["validate"])
+
+
+class ValidatorExecutionUnchangedTest(unittest.TestCase):
+    """The single-shot validate execution must be UNCHANGED by the #31 declaration:
+    LLMValidator.validate still issues one pass/fail decision using VALIDATOR_SYSTEM
+    directly — it is NOT routed through the main agent's tool loop."""
+
+    def test_validate_is_single_shot_using_validator_system_prompt(self):
+        from vibeharness.llm import Decision, LLMClient
+
+        calls = {"count": 0, "system": None}
+
+        class RecordingClient(LLMClient):
+            def decide(self, system, user, constraint, on_reason=None, on_action=None):
+                calls["count"] += 1
+                calls["system"] = system
+                return Decision(reasoning="", action_json='{"verdict":"pass","reason":"ok"}')
+
+        verdict = LLMValidator(RecordingClient()).validate("task", "history", "claim")
+        # Exactly one model call (single-shot, not a loop) ...
+        self.assertEqual(calls["count"], 1)
+        # ... driven by the SAME prompt the framework now declares ...
+        self.assertEqual(calls["system"], VALIDATOR_SYSTEM)
+        self.assertEqual(ValidatorToolset().system_guidance(), calls["system"])
+        # ... and the verdict behavior is the parsed pass/fail.
+        self.assertTrue(verdict.passed)
+        self.assertEqual(verdict.reason, "ok")
 
 
 if __name__ == "__main__":
