@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import sys
 
 from .config import Config
 from .toolset import Toolset
@@ -35,20 +36,87 @@ class PlaywrightCli:
         return self._binary is not None
 
     def run(self, *args: str) -> tuple[bool, str]:
-        """Run one CLI command in this session. Returns (ok, combined_output)."""
+        """Run one CLI command in this session. Returns (ok, combined_output).
+
+        Every command is HARD-BOUNDED by ``self._timeout``. On timeout the whole
+        process tree is killed and a clear error is returned — the call never
+        hangs (issue #4).
+
+        We drive the child with Popen + ``communicate(timeout=...)`` rather than
+        ``subprocess.run(timeout=...)`` on purpose: ``playwright-cli`` is a Node
+        process that spawns a *browser grandchild* which inherits the captured
+        stdout/stderr pipe handles. ``subprocess.run``'s timeout path kills only
+        the direct child and then re-reads the pipes to drain them; while the
+        browser grandchild is still alive holding the write-end, those pipes
+        never reach EOF and that post-kill read blocks *forever* — so the
+        ``TimeoutExpired`` is never delivered and the agent turn wedges. Killing
+        the whole tree first lets the drain complete (or be skipped) promptly.
+        """
         if not self._binary:
             return False, f"{BINARY} is not installed"
-        cmd = [self._binary, f"-s={self._session}", *args]
+        cmd = self._command(*args)
+        # Put the child in its own process group/session so that, on timeout, we
+        # can signal the WHOLE tree (its browser grandchildren too) without
+        # touching the harness's own group.
+        popen_kw = {}
+        if sys.platform == "win32":
+            popen_kw["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+        else:
+            popen_kw["start_new_session"] = True
+        # Force UTF-8 decoding: page snapshots contain emoji/unicode that the
+        # default Windows codec (cp1252) cannot decode, which would otherwise
+        # crash the reader thread and return empty output.
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=True, encoding="utf-8", errors="replace", **popen_kw)
         try:
-            # Force UTF-8 decoding: page snapshots contain emoji/unicode that the
-            # default Windows codec (cp1252) cannot decode, which would otherwise
-            # crash the reader thread and return empty output.
-            proc = subprocess.run(cmd, capture_output=True, text=True,
-                                  encoding="utf-8", errors="replace", timeout=self._timeout)
+            stdout, stderr = proc.communicate(timeout=self._timeout)
         except subprocess.TimeoutExpired:
+            # Kill the entire tree (child + browser grandchildren) so the pipe
+            # write-ends close; only then can we drain without re-blocking.
+            self._kill_tree(proc)
+            try:
+                proc.communicate(timeout=self._kill_grace)
+            except subprocess.TimeoutExpired:
+                pass  # drained best-effort; never block the agent turn on it
             return False, f"command timed out after {self._timeout}s"
-        out = ((proc.stdout or "") + (proc.stderr or "")).strip()
+        out = ((stdout or "") + (stderr or "")).strip()
         return proc.returncode == 0, out
+
+    def _command(self, *args: str) -> list[str]:
+        """Build the argv for one CLI invocation. Isolated as a seam so the
+        bounded-execution path in ``run`` can be exercised against a stand-in
+        command (e.g. a deliberately slow process) without a live browser."""
+        return [self._binary, f"-s={self._session}", *args]
+
+    # Grace period to reap a killed process tree before giving up the drain.
+    _kill_grace = 5
+
+    @staticmethod
+    def _kill_tree(proc: "subprocess.Popen") -> None:
+        """Best-effort kill of ``proc`` and every descendant it spawned.
+
+        ``proc.kill()`` only terminates the direct child; the Node-launched
+        browser would survive and keep the captured pipes open. We use the OS
+        process-tree killers (``taskkill /T`` on Windows, process-group signal
+        on POSIX) and always fall back to a plain ``proc.kill()``.
+        """
+        try:
+            if sys.platform == "win32":
+                subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                               capture_output=True)
+            else:
+                import os
+                import signal
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
+        except Exception:
+            pass
+        try:
+            proc.kill()
+        except Exception:
+            pass
 
 
 # action -> (CLI arg builder, required params, past-tense verb)
