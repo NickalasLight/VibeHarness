@@ -1,11 +1,23 @@
 """LLM client.
 
 The agent depends on the `LLMClient` abstraction (DIP); `OllamaClient` is one
-implementation. It performs the two-phase generation that converts noperator's
-vLLM structural-tag idea to Ollama:
+implementation. It performs a two-phase generation:
   phase 1 - free reasoning, stopped at </think>  (discarded by the caller)
-  phase 2 - raw continuation prefilled past </think>, constrained by a JSON
-            schema via Ollama's `format` field -> a guaranteed-valid action.
+  phase 2 - raw continuation prefilled past </think>, parsed by the active codec.
+
+Whether phase 2 is CONSTRAINED depends entirely on the active codec's
+``DecodeConstraint``: only when ``constraint.json_schema is not None`` is Ollama's
+`format` field set (see ``_act``). The default `json` codec supplies a JSON-schema and
+is constrained; the `hermes` codec (the mythos_fast fine-tune's native tool-call
+dialect) supplies ``json_schema=None`` and is therefore UNCONSTRAINED end to end —
+parsing of its ``<tool_call>`` blocks is done by the codec, not a decode constraint.
+
+BUG mythos #2 (BUG_mythos_garbled_toolcalls_0{1,2}_*.md): the previous docstring
+claimed phase 2 was ALWAYS constrained by a JSON schema. That described the old
+always-`json` design and was stale/misleading on this branch (default codec is
+`hermes`). The mythos #1 analysis confirmed the constraint is correctly OFF for hermes;
+it must stay off. (The native-template `tools=[]` transport upgrade is tracked as a
+follow-up — see that bug file's IMPLEMENTATION section for the transport decision.)
 
 Both phases stream token-by-token so callers can render generation live.
 """
@@ -33,7 +45,8 @@ class OllamaUnavailable(RuntimeError):
 @dataclass(frozen=True)
 class Decision:
     reasoning: str        # phase-1 text (discarded by the agent, kept for logs)
-    action_json: str      # phase-2 constrained action payload (parsed by the codec)
+    action_json: str      # phase-2 action payload (parsed by the codec; constrained
+                          # only if the codec supplies a json_schema — see module docs)
 
 
 class LLMClient(ABC):

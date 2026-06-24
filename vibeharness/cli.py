@@ -609,8 +609,20 @@ def main(argv: list[str] | None = None) -> int:
         except KeyError as e:
             print(f"error: unknown toolset {e}. Available: {', '.join(catalog.names())}")
             return 2
+        # BUG mythos #2: resolve the ACTIVE codec (Config default is `hermes` on this
+        # branch) so --print-system shows the codec-native prompt the model actually
+        # receives — i.e. the bare <tools> block + native <tool_call> instructions —
+        # not the json-codec Markdown fallback. resolve_config() applies the same
+        # defaults < saved settings < CLI-flag precedence (incl. --codec) the real run
+        # uses, so the printed prompt matches what the agent would build.
+        cfg = resolve_config(args)
+        try:
+            codec = get_codec(cfg.codec)
+        except UnknownCodec as e:
+            print(f"error: {e}")
+            return 2
         print(SystemPromptBuilder(
-            catalog.build_registry(toolsets, Config()),
+            catalog.build_registry(toolsets, cfg), cfg.max_actions_per_turn, codec,
             guidance=SystemPromptBuilder.assemble_guidance(toolsets)).build())
         return 0
     if not args.task and not args.task_file:

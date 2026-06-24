@@ -50,12 +50,20 @@ class ToolRegistry:
         The default Markdown rendering lives in :meth:`docs`; this is the seam a
         codec uses when the model was fine-tuned to read tool definitions in a
         non-Markdown shape. ``style="hermes"`` emits the Qwen2.5 / Hermes
-        ``<tools>...</tools>`` block: one OpenAI-nested function schema per line —
-        ``{"type":"function","function":{"name",description","parameters":<args schema>}}``
-        — built from each tool's ``_args_schema()`` (the SAME parameter source the
-        JSON-schema constraint uses, so the two can never drift). This is the exact
-        tool-definition format mythos_fast's embedded template renders, and the card
-        states tool-use performance "depends heavily" on it.
+        ``<tools>...</tools>`` block: one **bare** function schema per line —
+        ``{"name", "description", "parameters":<args schema>}`` — built from each
+        tool's ``_args_schema()`` (the SAME parameter source the JSON-schema
+        constraint uses, so the two can never drift).
+
+        BUG mythos #2 (see BUG_mythos_garbled_toolcalls_0{1,2}_*.md): this block
+        was previously emitted in the OpenAI-NESTED shape
+        ``{"type":"function","function":{...}}``. The analysis captured the model's
+        real trained dialect from its embedded chat template (rendered live in the
+        HF chat-template playground): the template renders each tool with a BARE
+        ``tool | tojson`` — i.e. ``{"name", "description", "parameters"}`` with NO
+        ``type``/``function`` envelope. The card warns tool-use quality "depends
+        heavily on the format of tool definitions", so we emit the bare shape the
+        ~2M-sample fine-tune was actually trained on.
 
         Open/closed: adding a style adds a branch here; the existing ``docs()``
         Markdown path and the other codecs are untouched.
@@ -65,13 +73,12 @@ class ToolRegistry:
 
             lines = ["<tools>"]
             for t in self._tools.values():
+                # BUG mythos #2: bare {"name","description","parameters"} — the exact
+                # shape the model's native template renders via `tool | tojson`.
                 fn = {
-                    "type": "function",
-                    "function": {
-                        "name": t.name,
-                        "description": t.description,
-                        "parameters": t._args_schema(),
-                    },
+                    "name": t.name,
+                    "description": t.description,
+                    "parameters": t._args_schema(),
                 }
                 lines.append(json.dumps(fn, ensure_ascii=False))
             lines.append("</tools>")

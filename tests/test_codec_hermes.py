@@ -54,27 +54,32 @@ class HermesCodecTest(unittest.TestCase):
         for name in self.registry.names():
             self.assertIn(name, block)
 
-    def test_tools_block_lines_are_openai_function_schemas(self):
+    def test_tools_block_lines_are_bare_function_schemas(self):
+        # BUG mythos #2: lines are the BARE {"name","description","parameters"} shape the
+        # model's native template renders via `tool | tojson` — NOT the OpenAI-nested
+        # {"type":"function","function":{...}} envelope.
         block = self.registry.tools_block(style="hermes")
         inner = block.splitlines()[1:-1]  # strip <tools>/</tools>
         self.assertEqual(len(inner), len(self.registry.all()))
         for line in inner:
             obj = json.loads(line)
-            self.assertEqual(obj["type"], "function")
-            fn = obj["function"]
-            self.assertIn("name", fn)
-            self.assertIn("description", fn)
-            self.assertIn("parameters", fn)
-            self.assertEqual(fn["parameters"]["type"], "object")
-            self.assertIn("properties", fn["parameters"])
+            # bare shape: top-level keys are exactly name/description/parameters
+            self.assertNotIn("type", obj)
+            self.assertNotIn("function", obj)
+            self.assertIn("name", obj)
+            self.assertIn("description", obj)
+            self.assertIn("parameters", obj)
+            self.assertEqual(obj["parameters"]["type"], "object")
+            self.assertIn("properties", obj["parameters"])
 
     def test_tools_block_parameters_match_args_schema(self):
+        # parameters come straight from each tool's _args_schema() (single source of
+        # truth shared with the JSON constraint), so docs and schema can never drift.
         block = self.registry.tools_block(style="hermes")
-        by_name = {json.loads(l)["function"]["name"]: json.loads(l)
+        by_name = {json.loads(l)["name"]: json.loads(l)
                    for l in block.splitlines()[1:-1]}
         for tool in self.registry.all():
-            self.assertEqual(by_name[tool.name]["function"]["parameters"],
-                             tool._args_schema())
+            self.assertEqual(by_name[tool.name]["parameters"], tool._args_schema())
 
     def test_unknown_tools_block_style_rejected(self):
         with self.assertRaises(ValueError):

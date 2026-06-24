@@ -1,14 +1,23 @@
 """The Hermes / Qwen2.5 native tool-call codec (issue #105).
 
-This codec speaks the format ``Shadow0482/mythos_fast`` (a VibeThinker-3B fine-tune
-on ~2M tool-call samples) was trained on — the standard Qwen2.5 / Hermes convention:
+This codec speaks the format ``Shadow0482/mythos_fast`` (a VibeThinker/Qwen2.5-3B
+fine-tune on ~2M tool-call samples) was trained on — the standard Qwen2.5 / Hermes
+convention:
 
-  * tool DEFINITIONS are presented as OpenAI-nested JSON function schemas wrapped in a
+  * tool DEFINITIONS are presented as **bare** JSON function schemas
+    ``{"name", "description", "parameters"}`` — ONE per line — wrapped in a
     ``<tools>...</tools>`` block (supplied via :meth:`tool_definitions`, which the
     SystemPromptBuilder substitutes for the default Markdown docs), and
   * each tool CALL is a JSON object ``{"name": <tool>, "arguments": {...}}`` wrapped in
     its own ``<tool_call>...</tool_call>`` tag; the model emits one or more consecutive
     blocks per turn.
+
+BUG mythos #2 (BUG_mythos_garbled_toolcalls_0{1,2}_*.md): an earlier version of this
+docstring (and ``registry.tools_block``) wrongly claimed the tool DEFINITIONS are
+OpenAI-NESTED ``{"type":"function","function":{...}}``. The mythos #1 analysis captured
+the model's real embedded chat template live and confirmed it renders each tool with a
+BARE ``tool | tojson`` (no ``type``/``function`` envelope). The shape was corrected to
+bare; that mismatch was a strong contributor to the garbled tool calls.
 
 The model card warns that tool-use performance "depends heavily on the format and
 structure of tool definitions provided at inference time", so aligning BOTH the tool
@@ -47,17 +56,24 @@ class HermesCodec(ToolCallCodec):
     name = "hermes"
 
     def format_instructions(self, max_actions: int) -> str:
+        # BUG mythos #2: lead with the model's NATIVE instruction wording, verbatim from
+        # its embedded chat template (captured live in mythos #1). Under the harness's
+        # hand-rolled ChatML transport the native template never fires, so the model only
+        # sees what we put here; reproducing the trained instruction string keeps the
+        # model on its fine-tuned single-pass <tools>/<tool_call> distribution. The
+        # harness-specific batching guidance follows, clearly separated.
         cap = (f" You may emit at most {max_actions} tool calls per turn."
                if max_actions and max_actions > 0 else "")
         return (
-            "- Each turn, emit one or more tool calls. Return EACH call as a JSON object "
-            'of the form {"name": <tool-name>, "arguments": {...}} wrapped in its own '
-            "<tool_call></tool_call> tags, like:\n"
-            "    <tool_call>\n"
-            '    {"name": "write_file", "arguments": {"path": "notes/todo.txt", '
-            '"content": "buy milk"}}\n'
-            "    </tool_call>\n"
-            "  Emit consecutive <tool_call> blocks to make several calls; they run in "
+            "You may call one or more functions to assist with the user query. You are "
+            "provided with function signatures within <tools></tools> XML tags (see the "
+            "# Tools section below).\n"
+            "For each function call, return a json object with function name and arguments "
+            "within <tool_call></tool_call> XML tags:\n"
+            "<tool_call>\n"
+            '{"name": <function-name>, "arguments": <args-json-object>}\n'
+            "</tool_call>\n"
+            "- Emit consecutive <tool_call> blocks to make several calls; they run in "
             "order. Use only the functions listed in the <tools> block below.\n"
             "- Batch independent or predictable calls in one turn (e.g. write a file then "
             "read it back); emit a single call when you must see its result before deciding."
@@ -69,14 +85,20 @@ class HermesCodec(ToolCallCodec):
                 "</tool_call> blocks.")
 
     def tool_definitions(self, registry: ToolRegistry) -> str | None:
-        """Render tools as the Hermes ``<tools>`` function-schema block instead of the
-        default Markdown docs — the exact tool-definition format mythos_fast expects."""
+        """Render tools as the Hermes ``<tools>`` block (BARE per-line function schemas)
+        instead of the default Markdown docs — the exact tool-definition format
+        mythos_fast was fine-tuned on (see BUG mythos #2; shape corrected from nested)."""
         return registry.tools_block(style="hermes")
 
     def constraint(self, registry: ToolRegistry, max_actions: int) -> DecodeConstraint:
         # The <tool_call> tag wrapper isn't expressible as a JSON-schema `format`, so
         # decoding is left unconstrained and validated by parse(). The model is
         # fine-tuned to emit this shape natively. (GBNF would be a backend-gated upgrade.)
+        #
+        # BUG mythos #2: keep this UNCONSTRAINED. The mythos #1 analysis confirmed the
+        # JSON-schema constraint is NOT the cause of the garbling (it is already inert for
+        # hermes: _act only sends `format` when json_schema is not None — llm.py). Do NOT
+        # re-introduce a `format` constraint here; it would fight the native dialect.
         return DecodeConstraint(json_schema=None)
 
     def parse(self, raw: str) -> "tuple[list[ToolCall] | None, str | None]":
