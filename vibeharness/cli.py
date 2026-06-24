@@ -93,7 +93,42 @@ current default temperature: {saved_temp}
     p.add_argument("--list-toolsets", action="store_true", help="list available toolsets and exit")
     p.add_argument("--list-agents", action="store_true", help="list available agent types and exit")
     p.add_argument("--print-system", action="store_true", help="print the system prompt and exit")
+    p.add_argument("--version", action="store_true",
+                   help="print the package version + git build identity and exit")
     return p
+
+
+def build_identity() -> str:
+    """A one-line build identity: package version + git short-sha of the source tree.
+
+    The sha is read at RUNTIME from the git checkout this package lives in, so an
+    EDITABLE install (``pip install -e .``) reports the exact commit you are running
+    — the whole point of issue #51's "am I on a stale build?" check. Falls back to
+    'unknown' when git or the repo is unavailable (e.g. a wheel install), and never
+    raises.
+    """
+    from . import __version__
+
+    sha = "unknown"
+    try:
+        import subprocess
+        from pathlib import Path
+
+        repo = Path(__file__).resolve().parent.parent
+        out = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=str(repo), capture_output=True, text=True, timeout=5,
+        )
+        if out.returncode == 0 and out.stdout.strip():
+            sha = out.stdout.strip()
+    except Exception:
+        pass
+    return f"vibe {__version__} (build {sha})"
+
+
+def cmd_version() -> int:
+    print(build_identity())
+    return 0
 
 
 def selected_toolset_names(args: argparse.Namespace) -> list[str]:
@@ -527,6 +562,8 @@ def main(argv: list[str] | None = None) -> int:
 
     args = parser.parse_args(argv)
 
+    if args.version:
+        return cmd_version()
     if args.show_config:
         return cmd_show_config()
     if args.reset_config:

@@ -1,12 +1,22 @@
-"""Web toolset: a stateful browser exposed through one `browse` tool.
+"""Web toolset: a stateful browser exposed through discrete, first-class tools.
 
 Wraps the Playwright **Agent CLI** (`playwright-cli`, from `@playwright/cli`),
 which keeps a browser alive between calls within a named session, so navigation,
-clicks, and content extraction all share state. Following the same minimal-but-
-powerful principle as the filesystem toolset, a single `browse` tool covers the
-whole browser via an `action` parameter.
+clicks, and content extraction all share state.
 
-`snapshot` is the agent's eyes: it is the only way to observe the page.
+Each basic browser operation the CLI supports is its own ``Tool`` subclass
+(``goto``, ``click``, ``fill``, ``type``, ``press_key``, ``select_option``,
+``hover``, ``navigate_back``, ``evaluate``, …) — see :class:`WebToolset`. This
+replaces the old monolithic ``browse(action=...)`` dispatcher: every operation is
+now its own named tool with its own typed parameters and description, so the model
+chooses a tool the same way it chooses ``read_file`` vs ``write_file``.
+
+The agent does NOT request the page contents. There is no agent-callable
+``snapshot`` tool: the live page is captured automatically every turn and injected
+into the system prompt under '# Current page (live snapshot — provided
+automatically)'. The internal capture helpers (:func:`capture_page_snapshot`,
+:func:`capture_page_snapshot_raw`, :func:`make_snapshot_provider`,
+:func:`make_raw_snapshot_provider`) drive that auto-injection and are NOT tools.
 
 Install the backend with:  npm install -g @playwright/cli@latest
 """
@@ -152,85 +162,54 @@ class PlaywrightCli:
             self._last_proc = None
 
 
-# action -> (CLI arg builder, required params, past-tense verb)
-_ACTIONS = {
-    "goto":       (lambda p: ["goto", p["url"]],                ["url"],            "navigated to"),
-    "snapshot":   (lambda p: ["snapshot"],                      [],                "read"),
-    "click":      (lambda p: ["click", p["target"]],            ["target"],        "clicked"),
-    "fill":       (lambda p: ["fill", p["target"], p["text"]],  ["target", "text"], "filled"),
-    "type":       (lambda p: ["type", p["text"]],               ["text"],          "typed into"),
-    "select":     (lambda p: ["select", p["target"], p["value"]], ["target", "value"], "selected an option in"),
-    "check":      (lambda p: ["check", p["target"]],            ["target"],        "checked"),
-    "uncheck":    (lambda p: ["uncheck", p["target"]],          ["target"],        "unchecked"),
-    "upload":     (lambda p: ["upload", p["file"]],             ["file"],          "uploaded a file to"),
-    "hover":      (lambda p: ["hover", p["target"]],            ["target"],        "hovered over"),
-    "press":      (lambda p: ["press", p["key"]],               ["key"],           "pressed a key on"),
-    "drag":       (lambda p: ["drag", p["target"], p["end"]],   ["target", "end"], "dragged on"),
-    "eval":       (lambda p: ["eval", p["expression"]],         ["expression"],    "evaluated JavaScript on"),
-    "screenshot": (lambda p: ["screenshot"] + ([p["target"]] if p.get("target") else []), [], "screenshotted"),
-    "back":       (lambda p: ["go-back"],                       [],                "went back on"),
-    "forward":    (lambda p: ["go-forward"],                    [],                "went forward on"),
-    "reload":     (lambda p: ["reload"],                        [],                "reloaded"),
-}
+# Shared element-targeting guidance, woven into every tool that takes a `target`.
+# NOTE: deliberately does NOT embed the page-section heading text verbatim — that
+# heading is a structural marker tests use to detect the auto-injected page section,
+# and repeating it inside a tool description would create false matches.
+_REF_NOTE = (
+    "Target an element by the stable ref shown for it in the live page view "
+    "(e.g. 'e6'), or by a CSS selector. That page view is provided to you "
+    "automatically each turn — never guess a ref."
+)
 
 
-class BrowseTool(Tool):
-    name = "browse"
-    description = (
-        "Drive one stateful browser — page, cookies, and history persist between calls. "
-        "Pick what to do with `action`.\n"
-        "SEEING THE PAGE: `snapshot` is your eyes — the ONLY way to observe a page. It returns "
-        "the visible text, every link with its URL, every form field, and a stable ref per "
-        "element (like `e6`). Snapshot after you navigate or change the page, read it, then act "
-        "on an element by passing its ref (or a CSS selector) as `target`.\n"
-        "FLOW: goto -> snapshot -> interact (click/fill/...) using refs -> snapshot again -> repeat.\n"
-        "ACTIONS: goto (open `url`); snapshot (read the page); click (`target`); fill (set "
-        "`target` to `text`, clearing it first); type (`text` into the focused element); select "
-        "(option `value` in `target`); check / uncheck (`target`); upload (`file` to the active "
-        "file input); hover (`target`); press (`key`, e.g. 'Enter'); drag (`target` -> `end`); "
-        "eval (run JS `expression`); screenshot (save a PNG); back / forward / reload."
-    )
+class _WebTool(Tool):
+    """Base for every discrete browser tool.
+
+    Each concrete subtool declares its ``name``, ``description``, ``parameters``,
+    a past-tense ``_verb`` for the narrative observation, and a ``_build`` that maps
+    validated args to the ``playwright-cli`` argv. The base owns the shared run
+    machinery: missing-param guard, bounded CLI invocation, error/success
+    observation phrasing, and output truncation. New operations = one tiny subclass.
+    """
+
+    _verb: str = "acted on"          # past-tense narrative verb
+    _required: tuple[str, ...] = ()  # arg names that must be present + non-empty
 
     def __init__(self, cli: PlaywrightCli, observation_limit: int):
         self._cli = cli
         self._limit = observation_limit
 
-    @property
-    def parameters(self):
-        return [
-            Param("action", "string", "What to do in the browser.", enum=tuple(_ACTIONS.keys())),
-            Param("url", "string", "URL to open. Required for goto.", required=False),
-            Param("target", "string", "Element ref from a snapshot (e.g. 'e6') or a CSS selector. "
-                  "Required for click/fill/select/check/uncheck/hover/drag.", required=False),
-            Param("text", "string", "Text to enter. Required for fill and type.", required=False),
-            Param("value", "string", "Option to choose. Required for select.", required=False),
-            Param("file", "string", "Absolute path of the file to upload. Required for upload.",
-                  required=False),
-            Param("key", "string", "Keyboard key, e.g. 'Enter' or 'Tab'. Required for press.",
-                  required=False),
-            Param("end", "string", "Destination element ref/selector. Required for drag.",
-                  required=False),
-            Param("expression", "string", "JavaScript function to evaluate, e.g. "
-                  "\"() => document.title\". Required for eval.", required=False),
-        ]
+    # ---- subclasses implement these two ----
+    def _build(self, args: dict) -> list[str]:
+        """Map validated args to the playwright-cli argv for this operation."""
+        raise NotImplementedError
+
+    def _subject(self, args: dict) -> str:
+        """The thing acted on, for the narrative observation. Override as needed."""
+        return args.get("url") or args.get("target") or "the page"
 
     def run(self, args: dict) -> ToolResult:
-        action = args.get("action")
-        spec = _ACTIONS.get(action)
-        if spec is None:
-            return ToolResult(False, f"you requested an unknown browser action '{action}'.")
-        build_args, required, verb = spec
-        missing = [p for p in required if not args.get(p)]
+        missing = [p for p in self._required if not args.get(p)]
         if missing:
-            return ToolResult(False, f"you tried to '{action}' but did not provide: "
+            return ToolResult(False, f"you called `{self.name}` but did not provide: "
                               f"{', '.join(missing)}.")
-
-        ok, output = self._cli.run(*build_args(args))
-        subject = args.get("url") or args.get("target") or "the page"
+        ok, output = self._cli.run(*self._build(args))
+        subject = self._subject(args)
         if not ok:
-            return ToolResult(False, f"you tried to {verb} {subject} but it failed: "
+            return ToolResult(False, f"you tried to {self._verb} {subject} but it failed: "
                               f"{self._trim(output)}")
-        return ToolResult(True, f"you {verb} {subject}. Result:\n{self._trim(output)}")
+        return ToolResult(True, f"you {self._verb} {subject}. Result:\n{self._trim(output)}")
 
     def _trim(self, text: str) -> str:
         if len(text) <= self._limit:
@@ -238,13 +217,270 @@ class BrowseTool(Tool):
         return text[:self._limit] + f"\n…[+{len(text) - self._limit} chars truncated]"
 
 
+# ---------------------------------------------------------------------------
+# Discrete, first-class browser tools — one per basic playwright-cli operation.
+# Each is registered by WebToolset.create_tools and appears in the prompt + the
+# codec call-schema in its own right. There is NO `snapshot` tool: the page is
+# auto-injected every turn (see the module docstring + capture_* helpers).
+# ---------------------------------------------------------------------------
+
+
+class GotoTool(_WebTool):
+    name = "goto"
+    description = "Navigate the browser to a URL. The page, cookies and history persist."
+    _verb = "navigated to"
+    _required = ("url",)
+
+    @property
+    def parameters(self):
+        return [Param("url", "string", "The URL to open, e.g. 'https://example.com'.")]
+
+    def _build(self, args):
+        return ["goto", args["url"]]
+
+
+class ClickTool(_WebTool):
+    name = "click"
+    description = "Click an element (a link, button, checkbox, …). " + _REF_NOTE
+    _verb = "clicked"
+    _required = ("target",)
+
+    @property
+    def parameters(self):
+        return [Param("target", "string", "Element ref (e.g. 'e6') or CSS selector to click.")]
+
+    def _build(self, args):
+        return ["click", args["target"]]
+
+
+class FillTool(_WebTool):
+    name = "fill"
+    description = ("Set a text input / textarea to an exact value, clearing it first. " + _REF_NOTE)
+    _verb = "filled"
+    _required = ("target", "text")
+
+    @property
+    def parameters(self):
+        return [
+            Param("target", "string", "Element ref or CSS selector of the field to fill."),
+            Param("text", "string", "The exact text to put in the field."),
+        ]
+
+    def _build(self, args):
+        return ["fill", args["target"], args["text"]]
+
+
+class TypeTool(_WebTool):
+    name = "type"
+    description = ("Type text into the currently focused element, keystroke by keystroke "
+                  "(use `fill` to set a field's value directly).")
+    _verb = "typed into"
+    _required = ("text",)
+
+    def _subject(self, args):
+        return "the focused element"
+
+    @property
+    def parameters(self):
+        return [Param("text", "string", "The text to type into the focused element.")]
+
+    def _build(self, args):
+        return ["type", args["text"]]
+
+
+class PressKeyTool(_WebTool):
+    name = "press_key"
+    description = "Press a single keyboard key, e.g. 'Enter', 'Tab', 'ArrowLeft', 'Escape'."
+    _verb = "pressed a key on"
+    _required = ("key",)
+
+    @property
+    def parameters(self):
+        return [Param("key", "string", "The key to press, e.g. 'Enter' or 'Tab'.")]
+
+    def _build(self, args):
+        return ["press", args["key"]]
+
+
+class SelectOptionTool(_WebTool):
+    name = "select_option"
+    description = "Choose an option in a <select> dropdown. " + _REF_NOTE
+    _verb = "selected an option in"
+    _required = ("target", "value")
+
+    @property
+    def parameters(self):
+        return [
+            Param("target", "string", "Element ref or CSS selector of the dropdown."),
+            Param("value", "string", "The option value or visible label to select."),
+        ]
+
+    def _build(self, args):
+        return ["select", args["target"], args["value"]]
+
+
+class CheckTool(_WebTool):
+    name = "check"
+    description = "Check a checkbox or radio button (no-op if already checked). " + _REF_NOTE
+    _verb = "checked"
+    _required = ("target",)
+
+    @property
+    def parameters(self):
+        return [Param("target", "string", "Element ref or CSS selector of the checkbox/radio.")]
+
+    def _build(self, args):
+        return ["check", args["target"]]
+
+
+class UncheckTool(_WebTool):
+    name = "uncheck"
+    description = "Uncheck a checkbox (no-op if already unchecked). " + _REF_NOTE
+    _verb = "unchecked"
+    _required = ("target",)
+
+    @property
+    def parameters(self):
+        return [Param("target", "string", "Element ref or CSS selector of the checkbox.")]
+
+    def _build(self, args):
+        return ["uncheck", args["target"]]
+
+
+class HoverTool(_WebTool):
+    name = "hover"
+    description = "Move the mouse over an element (e.g. to reveal a menu). " + _REF_NOTE
+    _verb = "hovered over"
+    _required = ("target",)
+
+    @property
+    def parameters(self):
+        return [Param("target", "string", "Element ref or CSS selector to hover over.")]
+
+    def _build(self, args):
+        return ["hover", args["target"]]
+
+
+class DragTool(_WebTool):
+    name = "drag"
+    description = "Drag one element and drop it onto another. " + _REF_NOTE
+    _verb = "dragged"
+    _required = ("target", "end")
+
+    @property
+    def parameters(self):
+        return [
+            Param("target", "string", "Element ref or CSS selector to drag FROM."),
+            Param("end", "string", "Element ref or CSS selector to drop ONTO."),
+        ]
+
+    def _build(self, args):
+        return ["drag", args["target"], args["end"]]
+
+
+class UploadTool(_WebTool):
+    name = "upload"
+    description = "Upload one or more files to the active file input."
+    _verb = "uploaded a file to"
+    _required = ("file",)
+
+    def _subject(self, args):
+        return "the file input"
+
+    @property
+    def parameters(self):
+        return [Param("file", "string", "Absolute path of the file to upload.")]
+
+    def _build(self, args):
+        return ["upload", args["file"]]
+
+
+class EvaluateTool(_WebTool):
+    name = "evaluate"
+    description = ("Run a JavaScript function on the page and return its result, e.g. "
+                  "\"() => document.title\".")
+    _verb = "evaluated JavaScript on"
+    _required = ("expression",)
+
+    @property
+    def parameters(self):
+        return [Param("expression", "string", "A JS function to evaluate, e.g. "
+                      "\"() => document.title\".")]
+
+    def _build(self, args):
+        return ["eval", args["expression"]]
+
+
+class ScreenshotTool(_WebTool):
+    name = "screenshot"
+    description = "Save a PNG screenshot of the current page (or of one element if `target` is given)."
+    _verb = "screenshotted"
+
+    @property
+    def parameters(self):
+        return [Param("target", "string", "Optional element ref/selector to screenshot just that "
+                      "element instead of the whole page.", required=False)]
+
+    def _build(self, args):
+        return ["screenshot"] + ([args["target"]] if args.get("target") else [])
+
+
+class NavigateBackTool(_WebTool):
+    name = "navigate_back"
+    description = "Go back to the previous page in the browser history."
+    _verb = "went back on"
+
+    @property
+    def parameters(self):
+        return []
+
+    def _build(self, args):
+        return ["go-back"]
+
+
+class NavigateForwardTool(_WebTool):
+    name = "navigate_forward"
+    description = "Go forward to the next page in the browser history."
+    _verb = "went forward on"
+
+    @property
+    def parameters(self):
+        return []
+
+    def _build(self, args):
+        return ["go-forward"]
+
+
+class ReloadTool(_WebTool):
+    name = "reload"
+    description = "Reload the current page."
+    _verb = "reloaded"
+
+    @property
+    def parameters(self):
+        return []
+
+    def _build(self, args):
+        return ["reload"]
+
+
+# The full, ordered set of discrete web tools the toolset exposes. One per basic
+# playwright-cli operation; NO snapshot (page is auto-injected every turn).
+_WEB_TOOL_CLASSES: tuple[type[_WebTool], ...] = (
+    GotoTool, ClickTool, FillTool, TypeTool, PressKeyTool, SelectOptionTool,
+    CheckTool, UncheckTool, HoverTool, DragTool, UploadTool, EvaluateTool,
+    ScreenshotTool, NavigateBackTool, NavigateForwardTool, ReloadTool,
+)
+
+
 def capture_page_snapshot(cli: PlaywrightCli, char_limit: int) -> str:
     """Capture a fresh `snapshot` of the live page from an EXISTING session and
     return its text, truncated to ``char_limit`` (issue #24).
 
     Reuses the supplied :class:`PlaywrightCli` — i.e. the SAME named session the
-    agent's `browse` tool drives — so the captured snapshot reflects the actual
-    page the model is acting on; it never launches a second browser. On any failure
+    agent's discrete browser tools (goto/click/fill/…) drive — so the captured
+    snapshot reflects the actual page the model is acting on; it never launches a
+    second browser. This is internal auto-injection, NOT an agent tool. On any failure
     (no session open yet, CLI error, timeout) it returns "" so the caller simply
     renders no page section that turn rather than crashing the run.
 
@@ -281,18 +517,6 @@ def capture_page_snapshot_raw(cli: PlaywrightCli) -> str:
     return (output or "").strip()
 
 
-def make_raw_snapshot_provider(config: Config) -> Callable[[], str]:
-    """Build a per-turn provider of the RAW, untruncated page snapshot (issues #37, #43).
-
-    Mirrors :func:`make_snapshot_provider` but returns the full snapshot with no char
-    cap — for #37 diagnostic ground-truth sizing and #43's dynamic-budget truncation.
-    Uses the run's existing session (same name/timeout from ``config``) so it reflects
-    the page the model acts on.
-    """
-    cli = PlaywrightCli(config.web_session, config.web_cli_timeout)
-    return lambda: capture_page_snapshot_raw(cli)
-
-
 def make_snapshot_provider(config: Config) -> Callable[[], str]:
     """Build a per-turn page-snapshot provider bound to the run's web session.
 
@@ -300,7 +524,8 @@ def make_snapshot_provider(config: Config) -> Callable[[], str]:
     each time it is called (once per turn, at prompt-build time), captures a FRESH
     snapshot from the run's existing Playwright session and returns it truncated to
     ``config.web_snapshot_char_limit``. The session name and timeout come from
-    ``config`` so the snapshot CLI shares the exact session the `browse` tool uses.
+    ``config`` so the snapshot CLI shares the exact session the discrete browser
+    tools use.
 
     NOTE (#43): this fixed-cap provider is retained for backward compatibility and
     tests; the live run now uses :func:`make_raw_snapshot_provider` plus the dynamic
@@ -312,13 +537,17 @@ def make_snapshot_provider(config: Config) -> Callable[[], str]:
 
 class WebToolset(Toolset):
     name = "web"
-    description = ("Browse the web with a stateful browser: navigate, read page content and "
-                   "links via snapshot, click, fill forms, upload files, and screenshot.")
+    description = ("Browse the web with a stateful browser: navigate, click, fill forms, "
+                   "select options, hover, press keys, upload files, run JS, and screenshot. "
+                   "The page is shown to you automatically each turn.")
 
     def system_guidance(self) -> str | None:
         return (
-            "The current page is shown to you each turn under '# Current page (live snapshot)' — "
-            "read it before deciding what to do next. "
+            "Each turn the current page is shown to you automatically under "
+            "'# Current page (live snapshot — provided automatically)' — you do NOT and CANNOT "
+            "request it; just read it before deciding what to do next. "
+            "There is no tool to fetch the page; use the discrete browser tools (goto, click, "
+            "fill, type, select_option, hover, press_key, navigate_back, evaluate, …) to ACT. "
             "Act only on elements present in that snapshot, referencing them by their "
             "ref — never guess a selector or element id. "
             "If a cookie/consent banner or modal dialog blocks what you need, clear it first: "
@@ -328,7 +557,8 @@ class WebToolset(Toolset):
 
     def create_tools(self, config: Config) -> list[Tool]:
         cli = PlaywrightCli(config.web_session, config.web_cli_timeout)
-        return [BrowseTool(cli, config.web_observation_char_limit)]
+        limit = config.web_observation_char_limit
+        return [cls(cli, limit) for cls in _WEB_TOOL_CLASSES]
 
     def check_prerequisites(self) -> list[str]:
         if shutil.which(BINARY) is None:

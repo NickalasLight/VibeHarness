@@ -94,8 +94,11 @@ class PerAgentTypePromptDumpTest(unittest.TestCase):
     def test_web_agent_prompt_describes_web_tools_and_guidance(self):
         dumped = self._dumped_prompt(["web"])
         self.assertIn("# Working with your tools", dumped)
-        self.assertIn("browse", dumped)                       # the web tool
-        self.assertIn("# Current page (live snapshot)", dumped)  # web guidance hook
+        self.assertIn("goto", dumped)                         # a discrete web subtool (#51)
+        self.assertIn("click", dumped)                        # another discrete web subtool
+        self.assertNotIn("### `browse`", dumped)              # monolith gone (#51)
+        self.assertNotIn("### `snapshot`", dumped)            # snapshot tool gone (#51)
+        self.assertIn("# Current page (live snapshot", dumped)  # web guidance hook
         self.assertNotIn("create_file", dumped)               # NOT the fs tools
 
     def test_fs_agent_prompt_describes_fs_tools_and_guidance(self):
@@ -103,7 +106,8 @@ class PerAgentTypePromptDumpTest(unittest.TestCase):
         self.assertIn("# Working with your tools", dumped)
         self.assertIn("create_file", dumped)                  # an fs tool
         self.assertIn("write_file", dumped)                   # fs guidance mentions it
-        self.assertNotIn("browse", dumped)                    # NOT the web tool
+        self.assertNotIn("### `goto`", dumped)                # NOT the web subtools (#51)
+        self.assertNotIn("### `click`", dumped)
 
 
 if __name__ == "__main__":
