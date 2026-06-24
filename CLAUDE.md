@@ -74,15 +74,29 @@ back for review.
 - "**open/link a PR with `Closes #NN`**; the orchestrator will review";
 - **protected-file rules** (§6) and the commit / PR conventions above.
 
-## 6. Branch governance
-- `main` ← `beta` ← feature/fix branches. CODEOWNERS enforces review on protected branches;
-  CI runs via `.github/workflows/ci.yml`.
-- **`beta_mythos_fast` is an isolated line for the mythos_fast fine-tune.** Sync is
-  **one-way: `beta → beta_mythos_fast` only — never the reverse.** Preserve the protected
-  files listed in `MYTHOS_DIVERGENCE.md` (codec, the `<tools>` seam, config defaults, chat
-  template). Prefer the `mythos-sync` agent (`.claude/agents/mythos-sync.md`). PRs into this
-  branch must include `DIVERGENCE-REVIEWED` (enforced by
-  `.github/workflows/mythos-divergence-check.yml`).
+## 6. Branches & cross-branch sync (CRITICAL — read before ANY cross-branch change)
+We run parallel long-lived branches, each a harness around a DIFFERENT model. **`beta` is
+the hub:** shared harness features and fixes land on `beta` FIRST, then propagate **one-way,
+outward, per-feature** — never a bulk merge, and **nothing ever merges back into `beta`.**
+
+| Branch | Model / role | Sync rule |
+|---|---|---|
+| `main` | **Barebones** VibeThink harness | Curated one-way `beta → main`: only selected, stable, generic fixes. Most beta features deliberately do NOT flow to main. Never bulk-merge. |
+| `beta` | **Feature-rich** VibeThink harness — the **hub** | Canonical line; all shared harness work starts here. Nothing merges INTO `beta` (not from `main`, not from any model branch). |
+| `beta_mythos_fast` | VibeThink **fine-tune** (`mythos_fast`, 3B) for tool-calling | One-way `beta → beta_mythos_fast`, careful per-feature merge preserving the protected divergences in `MYTHOS_DIVERGENCE.md`. Never merges back. Use the `mythos-sync` agent; PRs need `DIVERGENCE-REVIEWED` (enforced by `.github/workflows/mythos-divergence-check.yml`). |
+| `beta_qwen3coder` *(planned — #123)* | **Qwen3-Coder (~3B)** harness — fork of `beta`, model fully replaced | Same as mythos: forks from `beta`, one-way `beta → beta_qwen3coder`, preserve model-specific divergences (`QWEN3CODER_DIVERGENCE.md`), never merges back. Kept ~3B for apples-to-apples parity with VibeThinker-3B. |
+
+**Hard rules:**
+- **Direction:** sync flows OUTWARD from `beta` only (`beta → main`, `beta → model branch`).
+  **Never** merge `main` or a model branch back into `beta`, or into each other.
+- **Never bulk-merge.** Apply each change carefully, per-feature, preserving the target
+  branch's intentional divergences (model default, chat template, tool-call codec, prompts,
+  config defaults).
+- **Generic harness fixes belong on `beta` first,** then sync outward — do NOT fix a shared
+  bug on a model branch and expect it to reach the others.
+- A change touching a model branch's protected files MUST keep that branch's model-specific
+  version (see its divergence manifest).
+- CODEOWNERS enforces review on protected branches; CI runs via `.github/workflows/ci.yml`.
 
 ## 7. `gh` setup
 - Install: `scoop install gh` (or winget / choco).
