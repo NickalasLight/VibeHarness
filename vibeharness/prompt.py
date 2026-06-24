@@ -85,26 +85,44 @@ class SystemPromptBuilder:
                 notes.append(text)
         return "\n".join(f"- {note}" for note in notes)
 
-    def build(self, task: str = "", workspace: str = "", page: str = "") -> str:
-        # Render the per-toolset guidance section only when there is guidance to show,
-        # so a no-guidance build leaves no empty "# Working with your tools" heading.
-        tool_guidance = ""
-        if self._guidance.strip():
-            tool_guidance = f"# Working with your tools\n{self._guidance.strip()}\n\n"
-        body = _SYSTEM_TEMPLATE.format(
-            docs=self._registry.docs(),
-            tool_guidance=tool_guidance,
-            format_instructions=self._codec.format_instructions(self._max_actions))
+    def build(self, task: str = "", workspace: str = "", page: str = "",
+              include_tool_guidance: bool = True) -> str:
+        """Render the full system prompt: header (task + workspace + page) + body.
+
+        When ``include_tool_guidance`` is False, the body — the `# How the loop works`
+        / codec format-instruction block, the `# Tools` docs, AND the
+        `# Working with your tools` guidance — is omitted entirely, leaving ONLY the
+        header (task + workspace + the `# Current page (live snapshot)` section). This
+        is the validator's view (issue #57): it must see the SAME task/workspace/page
+        context the main agent had, but NOT the tool descriptions or format rules,
+        because it is judging the work, not producing tool calls. The header uses the
+        SAME rendering as the full prompt, so the already-#43-budgeted snapshot is
+        reused verbatim.
+        """
+        body = ""
+        if include_tool_guidance:
+            # Render the per-toolset guidance section only when there is guidance to show,
+            # so a no-guidance build leaves no empty "# Working with your tools" heading.
+            tool_guidance = ""
+            if self._guidance.strip():
+                tool_guidance = f"# Working with your tools\n{self._guidance.strip()}\n\n"
+            body = _SYSTEM_TEMPLATE.format(
+                docs=self._registry.docs(),
+                tool_guidance=tool_guidance,
+                format_instructions=self._codec.format_instructions(self._max_actions))
         header = ""
         if task:
             # Anchor the task at the very front of the context (primacy / authoritative
             # system instruction). Combined with the recency reminder in the turn prompt,
             # the task is pinned at both high-attention ends, resisting mid-context drift.
+            # The closing sentence references "the tools and rules below", which only
+            # exist when the body is rendered; drop it for the tool-less validator view.
+            tail = (" Everything below explains the tools and rules for accomplishing it."
+                    if include_tool_guidance else "")
             header = (
                 f"# YOUR ASSIGNED TASK\n{task}\n\n"
                 f"Keep this EXACT task in mind at all times — do not paraphrase, summarize, "
-                f"or drift from it. Everything below explains the tools and rules for "
-                f"accomplishing it.\n\n---\n\n"
+                f"or drift from it.{tail}\n\n---\n\n"
             )
         if workspace:
             # A snapshot of the working directory, refreshed every turn so newly
