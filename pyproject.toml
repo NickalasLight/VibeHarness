@@ -31,3 +31,14 @@ vibe = "vibeharness.cli:main"
 
 [tool.setuptools]
 packages = ["vibeharness"]
+
+[tool.pytest.ini_options]
+# Markers are registered so `pytest` emits no unknown-marker warnings. The
+# DEFAULT test selection is intentionally NOT filtered here (no addopts = -m ...):
+# the fast unit lane stays exactly what it was. Opt into the real-environment
+# suite explicitly, e.g. `pytest -m needs_ollama` or `pytest -m slow`.
+markers = [
+    "needs_ollama: requires a live Ollama server",
+    "needs_web: requires playwright-cli + the demo web app at localhost:3000",
+    "slow: slow / real-model test (not part of the fast unit lane)",
+]

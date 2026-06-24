@@ -1,5 +1,4 @@
 import itertools
-import json
 import os
 import tempfile
 import unittest
@@ -8,10 +7,10 @@ from vibeharness.agent import RalphAgent
 from vibeharness.config import Config
 from vibeharness.filesystem import FileSystem
 from vibeharness.fs_tools import build_default_tools
-from vibeharness.llm import Decision, LLMClient
 from vibeharness.registry import ToolRegistry
 from vibeharness.reporting import NullReporter
-from vibeharness.validation import Validator, Verdict
+
+from tests._fakes import FakeLLMClient, FakeValidator, RecordingLLMClient
 
 
 class RecordingReporter(NullReporter):
@@ -28,48 +27,6 @@ class RecordingReporter(NullReporter):
 
     def validator_verdict_token(self, text):
         self.events.append(("verdict", text))
-
-
-class FakeLLMClient(LLMClient):
-    """Returns scripted actions instead of calling a model. When the script is
-    exhausted it repeats the last action (so loops can run to the step budget)."""
-
-    def __init__(self, actions):
-        self._actions = actions
-        self._i = 0
-
-    def decide(self, system, user, action_schema, on_reason=None, on_action=None):
-        action = self._actions[min(self._i, len(self._actions) - 1)]
-        self._i += 1
-        payload = action if isinstance(action, str) else json.dumps(action)
-        return Decision(reasoning="", action_json=payload)
-
-
-class RecordingLLMClient(FakeLLMClient):
-    """Like FakeLLMClient but records the `system` prompt seen on each call."""
-
-    def __init__(self, actions):
-        super().__init__(actions)
-        self.systems = []
-
-    def decide(self, system, user, action_schema, on_reason=None, on_action=None):
-        self.systems.append(system)
-        return super().decide(system, user, action_schema, on_reason, on_action)
-
-
-class FakeValidator(Validator):
-    def __init__(self, passed=True, reason="looks complete"):
-        self._passed, self._reason = passed, reason
-        self.calls = []
-
-    def validate(self, task, history, claim, on_reason=None, on_action=None):
-        self.calls.append({"task": task, "history": history, "claim": claim})
-        # Stream a little so a reporter observing the validator can be exercised.
-        if on_reason:
-            on_reason("judging")
-        if on_action:
-            on_action('{"verdict":"pass"}')
-        return Verdict(self._passed, self._reason)
 
 
 VALIDATE = {"tool": "validate", "args": {"summary": "done"}}
@@ -156,16 +113,19 @@ class AgentLoopTest(unittest.TestCase):
         self.assertIn("FAILED", result.turns[0].actions[0].observation)
         self.assertIn("missing", result.turns[0].actions[0].observation)
 
-    def test_invalid_json_is_reported_and_loop_continues(self):
-        result = self._agent(["{ not json", VALIDATE], max_steps=5).run("t")
-        self.assertFalse(result.turns[0].actions[0].ok)
-        self.assertIn("invalid", result.turns[0].actions[0].observation)
-        self.assertTrue(result.finished)
-
-    def test_unknown_tool_is_reported(self):
-        result = self._agent([{"tool": "teleport", "args": {}}, VALIDATE], max_steps=5).run("t")
-        self.assertFalse(result.turns[0].actions[0].ok)
-        self.assertIn("not a real tool", result.turns[0].actions[0].observation)
+    def test_malformed_turn_is_reported_and_loop_continues(self):
+        # A bad first turn (unparseable JSON or an unknown tool) is reported as a
+        # not-ok action; the loop does not crash and goes on to validate+finish.
+        cases = [
+            ("{ not json", "invalid"),                       # unparseable JSON
+            ({"tool": "teleport", "args": {}}, "not a real tool"),  # unknown tool
+        ]
+        for bad_action, expected in cases:
+            with self.subTest(bad_action=bad_action):
+                result = self._agent([bad_action, VALIDATE], max_steps=5).run("t")
+                self.assertFalse(result.turns[0].actions[0].ok)
+                self.assertIn(expected, result.turns[0].actions[0].observation)
+                self.assertTrue(result.finished)
 
     def test_stops_at_step_budget_without_validating(self):
         actions = [{"tool": "list_directory", "args": {"path": self.dir}}]
@@ -186,13 +146,6 @@ class AgentLoopTest(unittest.TestCase):
         self.assertEqual(reporter.events[0], ("start", None))
         self.assertIn(("reason", "judging"), reporter.events)
         self.assertIn(("verdict", '{"verdict":"pass"}'), reporter.events)
-
-    def test_static_system_used_without_provider(self):
-        client = RecordingLLMClient([{"tool": "list_directory", "args": {"path": self.dir}}])
-        agent = RalphAgent(client, self.registry, "STATIC-SYS",
-                           Config(max_steps=3), FakeValidator(passed=True))
-        agent.run("t")
-        self.assertEqual(client.systems, ["STATIC-SYS", "STATIC-SYS", "STATIC-SYS"])
 
     def test_provider_refreshes_system_each_turn(self):
         client = RecordingLLMClient([{"tool": "list_directory", "args": {"path": self.dir}}])

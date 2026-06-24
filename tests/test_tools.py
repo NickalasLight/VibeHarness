@@ -3,9 +3,8 @@ import tempfile
 import unittest
 
 from vibeharness.filesystem import FileSystem
-from vibeharness.fs_tools import (CreateFileTool, ListDirectoryTool,
-                                  ManagePathTool, ReadFileTool, ReadTracker,
-                                  SearchTool, WriteFileTool,
+from vibeharness.fs_tools import (CreateFileTool, ManagePathTool, ReadFileTool,
+                                  ReadTracker, WriteFileTool,
                                   build_default_tools)
 
 
@@ -31,62 +30,45 @@ class ToolsTest(unittest.TestCase):
     def _create(self, path, content):
         return CreateFileTool(self.fs).run({"path": path, "content": content})
 
-    def test_write_then_read_observations(self):
-        self._create(self.p("a.txt"), "old")
-        self._reader().run({"path": self.p("a.txt")})
-        w = self._writer().run({"path": self.p("a.txt"), "content": "hi there"})
-        self.assertTrue(w.ok)
-        self.assertIn("you wrote the file", w.observation)
+    def test_write_observation_verb_per_mode(self):
+        # The wrapper layer's value is the observation VERB it adds per write mode.
+        # (That bytes actually land on disk is FileSystem's spec, in
+        # test_filesystem.py.)
+        cases = [
+            (None, "you wrote the file"),     # default overwrite
+            ("append", "appended to"),
+            ("prepend", "prepended to"),
+        ]
+        for mode, verb in cases:
+            with self.subTest(mode=mode):
+                self._create(self.p("a.txt"), "seed")
+                self._reader().run({"path": self.p("a.txt")})  # satisfy overwrite guard
+                args = {"path": self.p("a.txt"), "content": "x"}
+                if mode:
+                    args["mode"] = mode
+                res = self._writer().run(args)
+                self.assertTrue(res.ok)
+                self.assertIn(verb, res.observation)
+                ManagePathTool(self.fs).run({"action": "delete", "path": self.p("a.txt")})
 
+    def test_read_returns_file_content_in_observation(self):
+        # Wrapper-specific: ReadFileTool surfaces the file content in its observation.
+        self._create(self.p("a.txt"), "hi there")
         r = self._reader().run({"path": self.p("a.txt")})
         self.assertTrue(r.ok)
         self.assertIn("hi there", r.observation)
-
-    def test_write_append_observation_verb(self):
-        self._create(self.p("a.txt"), "a")
-        res = self._writer().run({"path": self.p("a.txt"), "content": "b", "mode": "append"})
-        self.assertIn("appended to", res.observation)
 
     def test_read_missing_is_error(self):
         res = self._reader().run({"path": self.p("nope.txt")})
         self.assertFalse(res.ok)
         self.assertIn("error", res.observation)
 
-    def test_list_directory(self):
-        self._create(self.p("a.txt"), "x")
-        res = ListDirectoryTool(self.fs, 1000).run({"path": self.dir})
-        self.assertTrue(res.ok)
-        self.assertIn("a.txt", res.observation)
-
-    def test_search_tool(self):
-        self._create(self.p("a.txt"), "find ME")
-        res = SearchTool(self.fs, 1000).run({"query": "me", "path": self.dir})
-        self.assertTrue(res.ok)
-        self.assertIn("a.txt", res.observation)
-
-    def test_manage_make_delete_move(self):
-        mp = ManagePathTool(self.fs)
-        self.assertTrue(mp.run({"action": "make_directory", "path": self.p("d")}).ok)
-        self._create(self.p("d", "a.txt"), "x")
-        moved = mp.run({"action": "move", "path": self.p("d", "a.txt"),
-                        "destination": self.p("b.txt")})
-        self.assertTrue(moved.ok)
-        self.assertIn("moved", moved.observation)
-        self.assertTrue(mp.run({"action": "delete", "path": self.p("b.txt")}).ok)
-
+    # NOTE: deep behaviour of list/search/copy/move/delete is owned by
+    # test_filesystem.py. Here we only keep the wrapper-specific guards that have
+    # no FileSystem equivalent (missing-destination errors on manage_path).
     def test_manage_move_without_destination_fails(self):
         res = ManagePathTool(self.fs).run({"action": "move", "path": self.p("a.txt")})
         self.assertFalse(res.ok)
-
-    def test_manage_copy(self):
-        mp = ManagePathTool(self.fs)
-        self._create(self.p("a.txt"), "data")
-        res = mp.run({"action": "copy", "path": self.p("a.txt"),
-                      "destination": self.p("b.txt")})
-        self.assertTrue(res.ok)
-        self.assertIn("copied", res.observation)
-        self.assertEqual(self.fs.read(self.p("a.txt")), "data")
-        self.assertEqual(self.fs.read(self.p("b.txt")), "data")
 
     def test_manage_copy_without_destination_fails(self):
         res = ManagePathTool(self.fs).run({"action": "copy", "path": self.p("a.txt")})
@@ -142,35 +124,18 @@ class ToolsTest(unittest.TestCase):
         self.assertTrue(res.ok)
         self.assertEqual(self.fs.read(self.p("a.txt")), "new")
 
-    def test_append_without_read_ok(self):
-        self._create(self.p("a.txt"), "A")
-        res = self._writer().run({"path": self.p("a.txt"), "content": "B", "mode": "append"})
-        self.assertTrue(res.ok)
-        self.assertEqual(self.fs.read(self.p("a.txt")), "AB")
-
-    def test_prepend_without_read_ok(self):
-        # prepend, like append, adds content without discarding the rest, so it
-        # bypasses the read-before-overwrite guard even on an unread file.
-        self._create(self.p("a.txt"), "A")
-        res = self._writer().run({"path": self.p("a.txt"), "content": "B", "mode": "prepend"})
-        self.assertTrue(res.ok)
-        self.assertEqual(self.fs.read(self.p("a.txt")), "BA")
-
-    def test_write_prepend_observation_verb(self):
-        self._create(self.p("a.txt"), "a")
-        res = self._writer().run({"path": self.p("a.txt"), "content": "b", "mode": "prepend"})
-        self.assertIn("prepended to", res.observation)
-
-    def test_manage_copy_existing_destination_errors(self):
-        mp = ManagePathTool(self.fs)
-        self._create(self.p("a.txt"), "data")
-        self._create(self.p("b.txt"), "other")
-        res = mp.run({"action": "copy", "path": self.p("a.txt"),
-                      "destination": self.p("b.txt")})
-        self.assertFalse(res.ok)
-        self.assertIn("error", res.observation)
-        # the original destination is untouched
-        self.assertEqual(self.fs.read(self.p("b.txt")), "other")
+    def test_non_destructive_modes_bypass_read_guard(self):
+        # append and prepend add content without discarding the rest, so they
+        # bypass the read-before-overwrite guard even on an unread file.
+        cases = [("append", "AB"), ("prepend", "BA")]
+        for mode, expected in cases:
+            with self.subTest(mode=mode):
+                self._create(self.p("a.txt"), "A")
+                res = self._writer().run(
+                    {"path": self.p("a.txt"), "content": "B", "mode": mode})
+                self.assertTrue(res.ok)
+                self.assertEqual(self.fs.read(self.p("a.txt")), expected)
+                ManagePathTool(self.fs).run({"action": "delete", "path": self.p("a.txt")})
 
     def test_read_tracker_marks_and_reports(self):
         tracker = ReadTracker()

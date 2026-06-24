@@ -18,25 +18,11 @@ from vibeharness.agent import RalphAgent
 from vibeharness.config import Config
 from vibeharness.filesystem import FileSystem
 from vibeharness.fs_tools import build_default_tools
-from vibeharness.llm import Decision, LLMClient
 from vibeharness.registry import ToolRegistry
 from vibeharness.runlog import RunLogger
-from vibeharness.validation import Validator, Verdict
 
-
-class _ScriptedClient(LLMClient):
-    def __init__(self, actions):
-        self._actions, self._i = actions, 0
-
-    def decide(self, system, user, action_schema, on_reason=None, on_action=None):
-        a = self._actions[min(self._i, len(self._actions) - 1)]
-        self._i += 1
-        return Decision(reasoning="", action_json=json.dumps(a))
-
-
-class _PassValidator(Validator):
-    def validate(self, task, history, claim, on_reason=None, on_action=None):
-        return Verdict(True, "looks complete")
+from tests._fakes import FakeLLMClient as _ScriptedClient
+from tests._fakes import FakeValidator as _PassValidator
 
 
 class StreamingLogTest(unittest.TestCase):

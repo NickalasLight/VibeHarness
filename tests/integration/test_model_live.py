@@ -8,22 +8,15 @@ The generation tests auto-skip when Ollama isn't reachable (so CI stays green); 
 error-path test always runs (it points at a dead port and needs no server).
 """
 import unittest
-import urllib.request
 from dataclasses import replace
+
+import pytest
 
 from vibeharness.config import Config
 from vibeharness.llm import OllamaClient, OllamaUnavailable
 
 
-def _ollama_up() -> bool:
-    try:
-        with urllib.request.urlopen(Config().ollama_url + "/api/version", timeout=2):
-            return True
-    except Exception:
-        return False
-
-
-@unittest.skipUnless(_ollama_up(), "Ollama not reachable — start it with `ollama serve`")
+@pytest.mark.needs_ollama
 class ModelGenerationTest(unittest.TestCase):
     def test_model_generates_text(self):
         text = OllamaClient(Config()).generate(

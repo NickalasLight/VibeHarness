@@ -23,27 +23,25 @@ class JSONCodecTest(unittest.TestCase):
         self.registry = catalog.build_registry(catalog.select(["fs"]), Config())
         self.codec = get_codec("json")
 
-    def test_format_instructions_render_the_cap(self):
-        text = self.codec.format_instructions(3)
-        self.assertIn("JSON ARRAY", text)
-        self.assertIn("at most 3 actions", text)
-
-    def test_format_instructions_omit_cap_when_unbounded(self):
+    def test_format_instructions_render_cap_and_format(self):
+        # The instructions name the JSON-array format and render the cap when one
+        # is given, and omit it when unbounded.
+        capped = self.codec.format_instructions(3)
+        self.assertIn("JSON ARRAY", capped)
+        self.assertIn("at most 3 actions", capped)
+        self.assertIn("JSON array", self.codec.turn_action_hint())
         self.assertNotIn("at most", self.codec.format_instructions(0))
 
-    def test_turn_action_hint_mentions_json(self):
-        self.assertIn("JSON array", self.codec.turn_action_hint())
-
-    def test_constraint_is_a_json_schema_with_maxitems(self):
+    def test_constraint_delegates_to_registry_action_schema(self):
+        # The codec owns turning a registry + cap into a DecodeConstraint; the
+        # detailed schema SHAPE (oneOf/maxItems/required) is owned and asserted by
+        # test_registry_schema.py. Here we only prove the codec delegates: the
+        # constraint carries the registry's capped action schema as json_schema
+        # (and no gbnf for the json codec).
         c = self.codec.constraint(self.registry, 2)
         self.assertIsInstance(c, DecodeConstraint)
-        self.assertIsNotNone(c.json_schema)
-        self.assertEqual(c.json_schema.get("maxItems"), 2)
+        self.assertEqual(c.json_schema, self.registry.action_schema(max_items=2))
         self.assertIsNone(c.gbnf)
-
-    def test_constraint_unbounded_has_no_maxitems(self):
-        c = self.codec.constraint(self.registry, 0)
-        self.assertNotIn("maxItems", c.json_schema)
 
     def test_parse_single_object_is_one_action(self):
         actions, err = self.codec.parse('{"tool": "list_directory", "args": {"path": "."}}')
@@ -56,20 +54,18 @@ class JSONCodecTest(unittest.TestCase):
         self.assertIsNone(err)
         self.assertEqual(actions, [("a", {}), ("b", {"x": 1})])
 
-    def test_parse_invalid_json_reports_error(self):
-        actions, err = self.codec.parse("{ not json")
-        self.assertIsNone(actions)
-        self.assertIn("not valid JSON", err)
-
-    def test_parse_missing_tool_field_reports_error(self):
-        actions, err = self.codec.parse('[{"args": {}}]')
-        self.assertIsNone(actions)
-        self.assertIn("tool", err)
-
-    def test_parse_non_object_args_reports_error(self):
-        actions, err = self.codec.parse('[{"tool": "a", "args": 5}]')
-        self.assertIsNone(actions)
-        self.assertIn("'args'", err)
+    def test_parse_error_cases_report_a_reason(self):
+        # Each malformed payload yields no actions and an error naming the problem.
+        cases = [
+            ("{ not json", "not valid JSON"),       # unparseable JSON
+            ('[{"args": {}}]', "tool"),              # missing tool field
+            ('[{"tool": "a", "args": 5}]', "'args'"),  # non-object args
+        ]
+        for payload, fragment in cases:
+            with self.subTest(payload=payload):
+                actions, err = self.codec.parse(payload)
+                self.assertIsNone(actions)
+                self.assertIn(fragment, err)
 
 
 if __name__ == "__main__":
