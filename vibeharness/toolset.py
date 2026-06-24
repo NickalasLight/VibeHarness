@@ -122,3 +122,30 @@ def agent_default_toolsets(catalog: ToolsetCatalog | None = None) -> dict[str, l
     """
     cat = catalog or default_catalog()
     return {name: [name] for name in cat.names()}
+
+
+# Per-agent-type DEFAULT cap on tool calls emitted per turn (issue #52). The
+# agent-type framework owns this alongside `agent_default_toolsets`, so adding an
+# agent picks BOTH its default toolset(s) and its default actions-per-turn.
+#
+# Why these defaults:
+#   - fs:        MULTIPLE actions/turn (keep the global Config default). Filesystem
+#                steps are predictable enough to batch (write a file, read it back).
+#   - web:       EXACTLY 1 action/turn. Web actions depend on the page changing after
+#                each one; emitting several in a turn acts on STALE refs before a fresh
+#                snapshot (root of #41). One web action/turn ⇒ a fresh snapshot next
+#                turn ⇒ the next action targets the CURRENT refs.
+#   - validator: 1 (single-shot pass/fail; never batches).
+#
+# Any agent NOT listed here falls back to the global Config default (so new agents
+# inherit sensible behaviour without an entry). Resolution precedence lives in the
+# CLI (`resolve_max_actions`): explicit flag / saved setting > this map > global default.
+def agent_default_max_actions(
+    default: int = Config.max_actions_per_turn,
+) -> dict[str, int]:
+    """Map agent type -> its default max actions per turn.
+
+    ``default`` is the global Config default and is used for the ``fs`` agent so the
+    multi-action batching it ships with stays driven by one source of truth.
+    """
+    return {"fs": default, "web": 1, "validator": 1}
