@@ -117,14 +117,16 @@ class HermesCodec(ToolCallCodec):
             "provided with function signatures within <tools></tools> XML tags (see the "
             "# Tools section below).\n"
             "For each function call, return a json object with function name and arguments "
-            "within <tool_call></tool_call> XML tags:\n"
+            "within <tool_call></tool_call> XML tags with NO other text. "
+            "Do not include any backticks or ```json:\n"
             "<tool_call>\n"
             '{"name": <function-name>, "arguments": <args-json-object>}\n'
             "</tool_call>\n"
             "- Emit consecutive <tool_call> blocks to make several calls; they run in "
             "order. Use only the functions listed in the <tools> block below.\n"
-            "- Batch independent or predictable calls in one turn (e.g. write a file then "
-            "read it back); emit a single call when you must see its result before deciding."
+            "- Batch independent or predictable calls in one turn (e.g. fill several "
+            "fields, then click Next); emit a single call when you must see its result "
+            "before deciding."
             + cap
         )
 
