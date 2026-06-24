@@ -163,6 +163,40 @@ class FileSystemTest(unittest.TestCase):
         self.assertFalse(os.path.exists(self.p("a.txt")))
         self.assertEqual(self.fs.read(self.p("b.txt")), "x")
 
+    # ---- tree ----
+    def test_tree_lists_files_dirs_and_sizes(self):
+        self.fs.write(self.p("a.txt"), "hello")        # 5 bytes
+        self.fs.make_directory(self.p("sub"))
+        self.fs.write(self.p("sub", "nested.txt"), "x")
+        out = self.fs.tree(self.dir)
+        self.assertIn("a.txt", out)
+        self.assertIn("sub/", out)                     # dir marker
+        self.assertIn("(5B)", out)                     # file size
+        self.assertIn("nested.txt", out)               # recursed into sub
+        # dirs are listed before files at the same level
+        self.assertLess(out.index("sub/"), out.index("a.txt"))
+
+    def test_tree_empty_dir(self):
+        self.assertEqual(self.fs.tree(self.dir), "(empty)")
+
+    def test_tree_respects_max_entries(self):
+        for i in range(20):
+            self.fs.write(self.p(f"f{i:02d}.txt"), "x")
+        out = self.fs.tree(self.dir, max_entries=5)
+        self.assertEqual(out.count(".txt"), 5)
+        self.assertIn("more", out)                     # truncation marker
+
+    def test_tree_respects_max_depth(self):
+        self.fs.write(self.p("deep", "x.txt"), "x")
+        out = self.fs.tree(self.dir, max_depth=1)
+        self.assertIn("deep/", out)
+        self.assertNotIn("x.txt", out)                 # depth cap stops recursion
+        self.assertIn("more", out)
+
+    def test_tree_missing_dir_raises(self):
+        with self.assertRaises(FileSystemError):
+            self.fs.tree(self.p("nope"))
+
 
 if __name__ == "__main__":
     unittest.main()

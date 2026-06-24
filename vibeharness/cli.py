@@ -17,6 +17,7 @@ from pathlib import Path
 
 from .agent import RalphAgent
 from .config import Config
+from .filesystem import FileSystem, FileSystemError
 from .llm import OllamaClient, OllamaUnavailable
 from .prompt import SystemPromptBuilder
 from .reporting import ConsoleReporter
@@ -173,7 +174,24 @@ def run_agent(args: argparse.Namespace) -> int:
 
     client = OllamaClient(config)
     validator = LLMValidator(client)
-    agent = RalphAgent(client, registry, system_prompt, config, validator, reporter=reporter)
+
+    # Refresh the system prompt every turn so its "# Workspace" section reflects
+    # files the agent creates as it goes. Scanning Path.cwd() each call (rather
+    # than a cached tree) is what makes newly written files appear next turn.
+    builder = SystemPromptBuilder(registry)
+    fs = FileSystem()
+
+    def render_workspace() -> str:
+        cwd = Path.cwd()
+        try:
+            tree = fs.tree(str(cwd))
+        except FileSystemError as e:
+            tree = f"(could not list: {e})"
+        return f"Working directory: {cwd}\n{tree}"
+
+    system_prompt_provider = lambda: builder.build(task, workspace=render_workspace())
+    agent = RalphAgent(client, registry, system_prompt, config, validator,
+                       reporter=reporter, system_prompt_provider=system_prompt_provider)
 
     started = datetime.now()
     logger = RunLogger(workdir, started)

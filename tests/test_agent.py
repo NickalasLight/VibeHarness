@@ -1,3 +1,4 @@
+import itertools
 import json
 import os
 import tempfile
@@ -42,6 +43,18 @@ class FakeLLMClient(LLMClient):
         self._i += 1
         payload = action if isinstance(action, str) else json.dumps(action)
         return Decision(reasoning="", action_json=payload)
+
+
+class RecordingLLMClient(FakeLLMClient):
+    """Like FakeLLMClient but records the `system` prompt seen on each call."""
+
+    def __init__(self, actions):
+        super().__init__(actions)
+        self.systems = []
+
+    def decide(self, system, user, action_schema, on_reason=None, on_action=None):
+        self.systems.append(system)
+        return super().decide(system, user, action_schema, on_reason, on_action)
 
 
 class FakeValidator(Validator):
@@ -99,7 +112,7 @@ class AgentLoopTest(unittest.TestCase):
     def test_over_limit_batch_runs_only_first_n(self):
         # Five writes in one batch, but the cap is 2 -> only the first 2 files appear,
         # and the model is told the extras were ignored. The run never crashes.
-        batch = [{"tool": "write_file",
+        batch = [{"tool": "create_file",
                   "args": {"path": self.p(f"f{n}.txt"), "content": "x"}} for n in range(5)]
         client = FakeLLMClient([batch])
         agent = RalphAgent(client, self.registry, "SYSTEM",
@@ -112,7 +125,7 @@ class AgentLoopTest(unittest.TestCase):
         # one note action + two executed writes
         obs = [a.observation for a in result.turns[0].actions]
         self.assertTrue(any("per-turn limit" in o for o in obs))
-        executed = [a for a in result.turns[0].actions if a.tool == "write_file"]
+        executed = [a for a in result.turns[0].actions if a.tool == "create_file"]
         self.assertEqual(len(executed), 2)
 
     def test_multiple_actions_in_one_turn(self):
@@ -173,6 +186,25 @@ class AgentLoopTest(unittest.TestCase):
         self.assertEqual(reporter.events[0], ("start", None))
         self.assertIn(("reason", "judging"), reporter.events)
         self.assertIn(("verdict", '{"verdict":"pass"}'), reporter.events)
+
+    def test_static_system_used_without_provider(self):
+        client = RecordingLLMClient([{"tool": "list_directory", "args": {"path": self.dir}}])
+        agent = RalphAgent(client, self.registry, "STATIC-SYS",
+                           Config(max_steps=3), FakeValidator(passed=True))
+        agent.run("t")
+        self.assertEqual(client.systems, ["STATIC-SYS", "STATIC-SYS", "STATIC-SYS"])
+
+    def test_provider_refreshes_system_each_turn(self):
+        client = RecordingLLMClient([{"tool": "list_directory", "args": {"path": self.dir}}])
+        counter = itertools.count(1)
+        provider = lambda: f"SYS-{next(counter)}"
+        agent = RalphAgent(client, self.registry, "STATIC-SYS",
+                           Config(max_steps=3), FakeValidator(passed=True),
+                           system_prompt_provider=provider)
+        agent.run("t")
+        # each turn saw a freshly regenerated system prompt, not the static one
+        self.assertEqual(client.systems, ["SYS-1", "SYS-2", "SYS-3"])
+        self.assertNotIn("STATIC-SYS", client.systems)
 
     def test_transcript_and_to_dict(self):
         result = self._agent([VALIDATE]).run("t")

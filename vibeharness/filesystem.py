@@ -195,6 +195,59 @@ class FileSystem:
         except OSError as e:
             raise FileSystemError(f"could not copy '{src}' to '{dst}': {e}")
 
+    # ---- compact tree summary (for prompt context) ----
+    def tree(self, path: str = ".", max_depth: int = 3, max_entries: int = 100) -> str:
+        """A compact directory listing for embedding in a prompt.
+
+        Lists dirs (with a trailing ``/``) and files (with their byte size),
+        dirs first then files, alphabetical within each group. Recurses up to
+        ``max_depth`` and emits at most ``max_entries`` lines total, appending
+        ``… (N more)`` when either cap truncates the listing. Kept deliberately
+        terse — it is refreshed into the system prompt every turn.
+        """
+        root = self.resolve(path)
+        if not os.path.isdir(root):
+            raise FileSystemError(f"'{path}' is not a directory or does not exist")
+        lines: list[str] = []
+        truncated = [0]  # entries not shown (depth/cap)
+
+        def walk(base: str, depth: int, indent: str) -> None:
+            try:
+                names = os.listdir(base)
+            except OSError:
+                return
+            dirs = sorted(n for n in names if os.path.isdir(os.path.join(base, n)))
+            files = sorted(n for n in names if not os.path.isdir(os.path.join(base, n)))
+            for d in dirs:
+                if len(lines) >= max_entries:
+                    truncated[0] += 1
+                    continue
+                lines.append(f"{indent}{d}/")
+                if depth + 1 < max_depth:
+                    walk(os.path.join(base, d), depth + 1, indent + "  ")
+                else:
+                    sub = os.path.join(base, d)
+                    try:
+                        truncated[0] += len(os.listdir(sub))
+                    except OSError:
+                        pass
+            for f in files:
+                if len(lines) >= max_entries:
+                    truncated[0] += 1
+                    continue
+                try:
+                    size = os.path.getsize(os.path.join(base, f))
+                except OSError:
+                    size = 0
+                lines.append(f"{indent}{f} ({size}B)")
+
+        walk(root, 0, "")
+        if not lines:
+            return "(empty)"
+        if truncated[0]:
+            lines.append(f"… ({truncated[0]} more)")
+        return "\n".join(lines)
+
     @staticmethod
     def _read_or_empty(full: str) -> str:
         if os.path.isfile(full):
