@@ -301,8 +301,15 @@ class RalphAgent:
     def _execute(self, tool_name: str | None, args: dict) -> Action:
         tool = self._registry.get(tool_name) if tool_name else None
         if tool is None:
+            # An unknown/invalid tool name (e.g. a removed tool like `snapshot`, or a
+            # hallucinated one) must NEVER silently succeed: surface an explicit error
+            # back into the loop naming the bad tool and the tools that DO exist, so
+            # the model can correct course next turn (issue #51).
+            available = ", ".join(self._registry.names())
             return Action(tool_name, args,
-                          f"you tried to use '{tool_name}', which is not a real tool.", ok=False)
+                          f"ERROR: '{tool_name}' is not a valid tool — it is unknown or "
+                          f"unavailable, so nothing was done. Use only these tools: "
+                          f"{available}.", ok=False)
         result = tool.run(args)
         return Action(tool_name, args, result.observation, ok=result.ok, final=result.is_final)
 

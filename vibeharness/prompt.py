@@ -113,11 +113,13 @@ class SystemPromptBuilder:
         if page:
             # A fresh snapshot of the live browser page, regenerated every turn
             # (issue #24) so the model always sees the CURRENT page state (consent
-            # banners, modals, …) without having to issue a `snapshot` action. Because
-            # the whole system prompt is rebuilt each turn, only the latest snapshot is
-            # ever present — the prior one disappears (stale-dropping by regeneration,
-            # never accumulated in narrative memory).
-            header += f"# Current page (live snapshot)\n{page}\n\n---\n\n"
+            # banners, modals, …). This is PROVIDED AUTOMATICALLY: there is no agent
+            # tool to request it (the old `snapshot` action was removed, issue #51).
+            # Because the whole system prompt is rebuilt each turn, only the latest
+            # snapshot is ever present — the prior one disappears (stale-dropping by
+            # regeneration, never accumulated in narrative memory).
+            header += ("# Current page (live snapshot — provided automatically)\n"
+                       f"{page}\n\n---\n\n")
         return header + body if header else body
 
 
