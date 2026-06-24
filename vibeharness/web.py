@@ -100,21 +100,73 @@ def output_signals_no_match(output: str) -> bool:
     return False
 
 
+# Substrings playwright-cli emits (in its error text) when the named session has no
+# live daemon/browser to act on — i.e. the persistent session has died or was never
+# opened. The CLI's exact phrasing is "The browser '<name>' is not open, please run
+# open first ...". When a per-turn web action hits this we can transparently reopen
+# the session and retry, rather than dead-ending the agent (issues #101, #75).
+_SESSION_CLOSED_MARKERS: tuple[str, ...] = (
+    "is not open",
+    "please run open first",
+    "browser is not open",
+    "no browser is open",
+    "session closed",
+    "session is closed",
+    "not open, please run open",
+)
+
+
+def output_signals_session_closed(output: str) -> bool:
+    """True when playwright-cli's output indicates the *whole session/daemon* is
+    gone (not merely a missing element) — the "browser 'vibe' is not open" class of
+    failure seen when the persistent daemon dies mid-run (issue #101). Distinct from
+    :func:`output_signals_no_match`, which is a per-element miss on a live page.
+    Matched case-insensitively so callers can decide to reopen + retry (issue #75).
+    """
+    low = (output or "").lower()
+    return any(marker in low for marker in _SESSION_CLOSED_MARKERS)
+
+
 class PlaywrightCli:
     """Thin, injectable wrapper around the stateful `playwright-cli` binary."""
 
-    def __init__(self, session: str, timeout: int):
+    def __init__(self, session: str, timeout: int, open_flags: "list[str] | None" = None):
         self._session = session
         self._timeout = timeout
         self._binary = shutil.which(BINARY)
+        # The flags an ``open`` should be (re)launched with for THIS session — e.g.
+        # ``--headed``, ``--browser chrome``. Captured at setup so that an automatic
+        # reopen after a mid-run daemon death (issue #101/#75) restores the SAME
+        # browser the run started with, not a default one.
+        self._open_flags: list[str] = list(open_flags or [])
         # Handle to the most recent child this wrapper spawned. Retained so that a
         # later ``close()`` can tree-kill any browser daemon/grandchildren that the
         # session left alive (issue #15) — not just the direct CLI child.
         self._last_proc: "subprocess.Popen | None" = None
 
     @property
+    def session(self) -> str:
+        return self._session
+
+    @property
+    def open_flags(self) -> list[str]:
+        return list(self._open_flags)
+
+    @property
     def available(self) -> bool:
         return self._binary is not None
+
+    def open(self, *flags: str) -> tuple[bool, str]:
+        """(Re)open the persistent browser for this session.
+
+        Idempotent from the agent's view: ``playwright-cli open`` on an
+        already-open session simply re-opens it. Uses the session's captured
+        ``open_flags`` (``--headed``/``--browser …``) when no explicit flags are
+        passed so an automatic recovery reopen restores the original browser
+        (issues #101, #75). Returns ``(ok, output)`` like :meth:`run`.
+        """
+        use = list(flags) if flags else self._open_flags
+        return self.run("open", *use)
 
     def run(self, *args: str) -> tuple[bool, str]:
         """Run one CLI command in this session. Returns (ok, combined_output).
@@ -282,6 +334,31 @@ class _WebTool(Tool):
             if guard is not None:
                 return guard
         ok, output = self._cli.run(*self._build(args))
+        # AUTO-RECOVERY (issues #101, #75): the persistent browser daemon can die
+        # mid-run (e.g. a shared session torn down by a concurrent run, or an
+        # external reaper). When that happens the CLI fails every action with
+        # "browser '<session>' is not open". Rather than dead-ending the agent —
+        # which, being web-only, has no other way back — transparently reopen the
+        # session ONCE and replay this exact action. A real per-element miss
+        # (issue #73) is NOT this case and is left to the no-match path below.
+        if not ok and output_signals_session_closed(output):
+            reopened, reopen_out = self._cli.open()
+            if reopened:
+                ok, output = self._cli.run(*self._build(args))
+                if not (ok and not output_signals_session_closed(output)):
+                    # Reopen happened but the replay still can't reach the page —
+                    # surface a clear, actionable recovery message (never a bare error).
+                    return ToolResult(
+                        False,
+                        f"the browser session had closed; it was reopened but the page "
+                        f"state was lost, so `{self.name}` could not be replayed. "
+                        f"Re-`goto` the URL you were on, then continue.")
+            else:
+                return ToolResult(
+                    False,
+                    f"the browser session was closed and could not be reopened "
+                    f"automatically ({self._trim(reopen_out)}). Call `open_browser` to "
+                    f"restore the session, then retry.")
         subject = self._subject(args)
         # The CLI exits 0 even when the ref/selector matched no element, embedding
         # the failure as text. Treat that as a real failure (issue #73): a no-match
@@ -592,9 +669,49 @@ class ReloadTool(_WebTool):
         return ["reload"]
 
 
+class OpenBrowserTool(_WebTool):
+    """(Re)open the persistent browser session (issues #101, #75).
+
+    The harness opens the browser once at run start, but the persistent daemon can
+    die mid-run (a shared session torn down by a concurrent run, an external
+    chrome/node reaper, etc.). The other web tools auto-recover by reopening on a
+    "not open" failure, but the agent also needs an explicit lever: this tool
+    ensures the session is alive so the page can be navigated again. Calling it on an
+    already-open session is harmless (it simply re-opens). After opening, the page is
+    blank — `goto` your target URL next."""
+
+    name = "open_browser"
+    description = ("Open (or re-open) the browser session. Use this if a web action reports the "
+                   "browser is not open / the session was closed, or when there is no current "
+                   "page to act on. After opening, the page is blank — call `goto` with your "
+                   "target URL next.")
+    _verb = "opened the browser"
+
+    @property
+    def parameters(self):
+        return []
+
+    def _subject(self, args):
+        return "the browser session"
+
+    def run(self, args: dict) -> ToolResult:
+        ok, output = self._cli.open()
+        if not ok:
+            return ToolResult(False, f"you tried to open the browser session but it failed: "
+                              f"{self._trim(output)}")
+        return ToolResult(True, "you opened the browser session (the page is now blank — "
+                          f"`goto` your target URL next). Result:\n{self._trim(output)}")
+
+    def _build(self, args):  # pragma: no cover - run() is overridden, never reached
+        return ["open"]
+
+
 # The full, ordered set of discrete web tools the toolset exposes. One per basic
 # playwright-cli operation; NO snapshot (page is auto-injected every turn).
+# ``open_browser`` (issues #101/#75) lets the agent restore a dead persistent
+# session — it is the one tool that works when no page is currently open.
 _WEB_TOOL_CLASSES: tuple[type[_WebTool], ...] = (
+    OpenBrowserTool,
     GotoTool, ClickTool, FillTool, TypeTool, PressKeyTool, SelectOptionTool,
     CheckTool, UncheckTool, HoverTool, DragTool, UploadTool,
     ScreenshotTool, NavigateBackTool, NavigateForwardTool, ReloadTool,
@@ -675,6 +792,21 @@ def make_snapshot_provider(config: Config) -> Callable[[], str]:
     return lambda: capture_page_snapshot(cli, config.web_snapshot_char_limit)
 
 
+def open_flags_for(config: Config) -> list[str]:
+    """The ``playwright-cli open`` flags implied by ``config`` (headed/browser).
+
+    Single source of truth so the run's initial open (``setup``) and any automatic
+    or agent-driven REOPEN (issues #101/#75) launch the SAME browser — headed by
+    default so a human can watch, on the configured channel.
+    """
+    flags: list[str] = []
+    if not config.web_headless:
+        flags.append("--headed")
+    if config.web_browser:
+        flags += ["--browser", config.web_browser]
+    return flags
+
+
 class WebToolset(Toolset):
     name = "web"
     description = ("Browse the web with a stateful browser: navigate, click, fill forms, "
@@ -688,6 +820,9 @@ class WebToolset(Toolset):
             "request it; just read it before deciding what to do next. "
             "There is no tool to fetch the page; use the discrete browser tools (goto, click, "
             "fill, type, select_option, hover, press_key, navigate_back, …) to ACT. "
+            "If there is NO current page shown, or a web action reports the browser is not open / "
+            "the session was closed, call `open_browser` to (re)open the session, then `goto` "
+            "your target URL again before continuing — never give up because the page is missing. "
             "When a tool takes a target element you MUST pass the element's ref (e.g. 'e163') "
             "exactly as it appears in the current snapshot. NEVER guess a CSS selector, class, "
             "id or tag (e.g. '.ytd-play-button'): such targets are rejected before the browser "
@@ -698,7 +833,11 @@ class WebToolset(Toolset):
         )
 
     def create_tools(self, config: Config) -> list[Tool]:
-        cli = PlaywrightCli(config.web_session, config.web_cli_timeout)
+        # Carry the run's open flags so a tool that has to reopen a dead session
+        # (auto-recovery or `open_browser`, issues #101/#75) restores the SAME
+        # headed/channel browser the run started with — not a default one.
+        cli = PlaywrightCli(config.web_session, config.web_cli_timeout,
+                            open_flags=open_flags_for(config))
         limit = config.web_observation_char_limit
         return [cls(cli, limit) for cls in _WEB_TOOL_CLASSES]
 
@@ -716,7 +855,9 @@ class WebToolset(Toolset):
 
     def setup(self, config: Config) -> None:
         # Open the browser once for the run. Headed by default so a human can watch.
-        self._cli = PlaywrightCli(config.web_session, config.web_cli_timeout)
+        # The same flags are stored on the CLI so any reopen restores this browser.
+        self._cli = PlaywrightCli(config.web_session, config.web_cli_timeout,
+                                  open_flags=open_flags_for(config))
         # Defensive last-resort reaper: if the run is hard-killed (Ctrl-C escaping the
         # cli finally, os._exit, an unhandled signal) the toolset's teardown may never
         # run. Registering close() with atexit ensures the browser tree is still reaped
@@ -725,12 +866,7 @@ class WebToolset(Toolset):
         import atexit
         self._atexit_hook = self._cli.close
         atexit.register(self._atexit_hook)
-        flags: list[str] = []
-        if not config.web_headless:
-            flags.append("--headed")
-        if config.web_browser:
-            flags += ["--browser", config.web_browser]
-        self._cli.run("open", *flags)
+        self._cli.open()
 
     def teardown(self, config: Config) -> None:
         """Close the session AND reap its whole browser process tree. Must never raise
