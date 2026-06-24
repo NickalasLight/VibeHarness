@@ -537,6 +537,19 @@ def _run_locked(args, task, config, registry, codec, names, workdir, logger,
         raw_snapshot_provider = lambda: annotate_filled_snapshot(
             _inner_for_fill(), filled_controls)
 
+    # Snapshot deduplication: when the agent explicitly calls the `snapshot` tool,
+    # suppress the auto-injected snapshot on the NEXT turn (it would be redundant
+    # since the explicit tool result IS the fresh state). SnapshotTool sets a class-
+    # level flag; we reset it here after consuming it for the next turn's provider.
+    from .web import SnapshotTool as _SnapshotTool
+    if raw_snapshot_provider is not None:
+        _inner_for_dedup = raw_snapshot_provider
+        def raw_snapshot_provider():
+            if _SnapshotTool._called:
+                _SnapshotTool._called = False  # reset: only suppress ONE turn
+                return ""  # auto-snapshot suppressed — agent saw it as tool result
+            return _inner_for_dedup()
+
     # The per-turn provider applies #43's dynamic snapshot budget AND, given the
     # logger, performs #37's per-turn diagnostic dump (raw snapshot + injected prompt).
     system_prompt_provider = make_system_prompt_provider(

@@ -229,14 +229,23 @@ class RalphAgent:
                                               f"could not be run: {error}.", ok=False), memory)
                 else:
                     # Defensive guard: even if a batch slips past the schema cap, only the
-                    # first `limit` actions run. Record a brief note so the model knows.
+                    # first `limit` actions run. Explicitly list the dropped calls so the
+                    # model can re-issue them with the SAME tools on the next turn — silent
+                    # dropping caused the Country combobox to be re-attempted with fill
+                    # instead of select_option in iter3 (13 wasted turns).
                     if limit > 0 and len(actions) > limit:
-                        dropped = len(actions) - limit
+                        dropped_calls = actions[limit:]
                         actions = actions[:limit]
-                        self._record(turn, Action(None, {}, f"you emitted more than the "
-                                                  f"per-turn limit of {limit} actions; only the "
-                                                  f"first {limit} were run ({dropped} ignored).",
-                                                  ok=False), memory)
+                        dropped_desc = "; ".join(
+                            f"{t}({', '.join(f'{k}={repr(v)[:40]}' for k, v in (a or {}).items())})"
+                            for t, a in dropped_calls
+                        )
+                        self._record(turn, Action(None, {}, (
+                            f"ERROR: you emitted {limit + len(dropped_calls)} actions but the "
+                            f"per-turn limit is {limit}. The following {len(dropped_calls)} "
+                            f"action(s) were NOT executed — re-issue them on your NEXT turn "
+                            f"with the SAME tools and exact values: {dropped_desc}"
+                        ), ok=False), memory)
                     for tool_name, args in actions:
                         if tool_name == "validate":
                             self._validate(args, turn, memory, result, user)

@@ -38,9 +38,13 @@ _SYSTEM = (
     "2. Observe before concluding. Do not assume why something failed — "
     "recommend evaluate or click to confirm the element type first if uncertain.\n"
     "3. Reason from evidence. Cite turn numbers, tool names, refs, and error text.\n"
-    "4. Distinguish stuck from done. If fields are already filled, direct the agent "
+    "4. Detect and break loops. If you see the same tool+target pair appearing 2 or "
+    "more times in the recent history — especially with FAILED or WARNING results — "
+    "the agent is stuck in a loop. Name the exact looping call, explain why it will "
+    "never work, and give 2-3 concrete alternative calls the agent should try instead.\n"
+    "5. Distinguish stuck from done. If fields are already filled, direct the agent "
     "to the next UNFILLED field or page navigation, not backward.\n"
-    "5. Be concise. 3-6 plain-English sentences. No JSON, no code blocks, no bullet lists. "
+    "6. Be concise. 3-6 plain-English sentences. No JSON, no code blocks, no bullet lists. "
     "Speak directly to the agent as 'you'."
 )
 

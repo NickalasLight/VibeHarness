@@ -69,6 +69,56 @@ def resolve_web_session(config: Config) -> str:
 _REF_RE = re.compile(r"\be(\d+)\b")
 _REF_TOKEN_RE = re.compile(r"\[?\be(\d+)\b\]?")
 
+# Roles/patterns that make a snapshot line interactable for text or selection.
+_INTERACTABLE_ROLES = frozenset({
+    "textbox", "combobox", "listbox", "checkbox", "radio", "spinbutton",
+    "searchbox", "button", "link", "menuitem", "option", "switch",
+})
+
+# Playwright error substring that signals a non-interactable element was targeted.
+_NOT_INTERACTABLE_PHRASES = (
+    "element is not an <input>",
+    "element is not a <textarea>",
+    "does not have a role allowing",
+    "element is not an <input>, <textarea>",
+)
+
+# Pattern to extract the HTML snippet from Playwright's "locator resolved to <...>" error.
+_RESOLVED_TO_RE = re.compile(
+    r"locator resolved to (<[^>]+>[^<]{0,120}(?:</[^>]+>)?|<[^>]+/>|<[^>]+>)",
+    re.DOTALL,
+)
+
+
+def _nearby_interactable_refs(failed_ref: str, snapshot: str, window: int = 12) -> str:
+    """Return a short description of interactable refs near ``failed_ref`` in the snapshot.
+
+    Searches ±``window`` ref-numbers from the failed ref and returns the first 5
+    interactable lines found, formatted as "eN (description)".
+    """
+    if not failed_ref or not snapshot:
+        return "(could not determine nearby refs)"
+    m = re.match(r"e(\d+)$", failed_ref)
+    if not m:
+        return "(could not determine nearby refs)"
+    center = int(m.group(1))
+    candidates = []
+    for line in snapshot.splitlines():
+        rm = _REF_RE.search(line)
+        if not rm:
+            continue
+        ref_num = int(rm.group(1))
+        if abs(ref_num - center) > window:
+            continue
+        ref = f"e{ref_num}"
+        if ref == failed_ref:
+            continue
+        line_lower = line.lower()
+        if any(role in line_lower for role in _INTERACTABLE_ROLES):
+            candidates.append(f"{ref} ({line.strip()[:80]})")
+    candidates.sort(key=lambda s: abs(int(s[1:s.index(" ")]) - center))
+    return ", ".join(candidates[:5]) or "(none found nearby)"
+
 # Substrings playwright-cli emits in its (exit-0) output when a target/ref did NOT
 # resolve to a real element. The CLI exits 0 and embeds the failure as text, so the
 # only way to detect a no-match is to scan the output (issue #73). Matched
@@ -684,6 +734,30 @@ class FillTool(_WebTool):
     def _build(self, args):
         return ["fill", args["target"], args["text"]]
 
+    def run(self, args: dict) -> ToolResult:
+        result = super().run(args)
+        if not result.ok:
+            obs_lower = (result.observation or "").lower()
+            if any(p in obs_lower for p in _NOT_INTERACTABLE_PHRASES):
+                target = args.get("target", "")
+                # Extract the HTML snippet Playwright gives us.
+                m = _RESOLVED_TO_RE.search(result.observation or "")
+                html_snippet = m.group(1).strip() if m else "(unknown element type)"
+                # Find nearby interactable refs from a fresh snapshot.
+                snapshot = capture_page_snapshot_raw(self._cli) or ""
+                nearby = _nearby_interactable_refs(target, snapshot)
+                obs = (
+                    f"ERROR: '{target}' is NOT interactable for text input. "
+                    f"Playwright resolved it to: {html_snippet}  "
+                    f"This element cannot accept fill/type — it is a label, div, span, "
+                    f"or other non-input element. "
+                    f"Nearby interactable elements: {nearby}. "
+                    f"Pick one of those refs instead, or use select_option/click if "
+                    f"it is a dropdown or combobox."
+                )
+                return ToolResult(False, obs)
+        return result
+
 
 class TypeTool(_WebTool):
     name = "type"
@@ -1036,15 +1110,60 @@ class OpenBrowserTool(_WebTool):
         return ["open"]
 
 
-# The full, ordered set of discrete web tools the toolset exposes. One per basic
-# playwright-cli operation; NO snapshot (page is auto-injected every turn).
-# ``open_browser`` (issues #101/#75) lets the agent restore a dead persistent
-# session — it is the one tool that works when no page is currently open.
+class SnapshotTool(_WebTool):
+    """Explicitly request a fresh page snapshot.
+
+    The page snapshot is auto-injected into the system prompt every turn, but when
+    you interact with a dynamic element (e.g. click opens a dropdown, a page section
+    expands, a field validates), calling snapshot lets you see the CURRENT DOM in the
+    tool result sequence — useful when you need to find the refs of newly appeared
+    options or changed elements mid-turn BEFORE deciding the next action.
+
+    When you call snapshot this turn, the auto-injected snapshot is SUPPRESSED from
+    the next turn's system prompt (since your explicit snapshot IS the fresh state).
+    Use it after clicking a combobox/dropdown to find the option refs you need to click.
+    """
+
+    name = "snapshot"
+    description = (
+        "Capture a fresh page snapshot now and return it as a tool result. "
+        "Use this after clicking a dropdown, combobox, or dynamic element to see the "
+        "updated DOM (including new option refs) before deciding your next action. "
+        "The auto-injected page snapshot in the system prompt is suppressed on the "
+        "following turn since your explicit snapshot is the fresh state. "
+        "Do NOT call this every turn — it is only needed when the page changed mid-turn "
+        "and you need to find newly appeared refs."
+    )
+    _verb = "took a snapshot of"
+
+    # Set to True when run() is called this turn; read by cli.py's snapshot provider
+    # to suppress the auto-injected snapshot on the NEXT turn (no duplication).
+    _called: bool = False
+
+    @property
+    def parameters(self):
+        return []
+
+    def _build(self, args):  # pragma: no cover
+        return ["snapshot"]
+
+    def run(self, args: dict) -> ToolResult:
+        SnapshotTool._called = True
+        ok, output = self._cli.run("snapshot")
+        if not ok:
+            return ToolResult(False, f"snapshot failed: {self._trim(output)}")
+        return ToolResult(True, f"Current page snapshot:\n{self._trim(output)}")
+
+
+# The full, ordered set of discrete web tools the toolset exposes.
+# ``open_browser`` lets the agent restore a dead persistent session.
+# ``snapshot`` lets the agent explicitly request a fresh page view mid-turn.
 _WEB_TOOL_CLASSES: tuple[type[_WebTool], ...] = (
     OpenBrowserTool,
     GotoTool, ClickTool, FillTool, TypeTool, PressKeyTool, SelectOptionTool,
     CheckTool, UncheckTool, HoverTool, DragTool, UploadTool,
-    EvaluateTool, ScreenshotTool, NavigateBackTool, NavigateForwardTool, ReloadTool,
+    EvaluateTool, SnapshotTool, NavigateBackTool, NavigateForwardTool, ReloadTool,
+    # ScreenshotTool intentionally excluded — model is not visual.
 )
 
 
