@@ -187,10 +187,54 @@ repeat, so identical repeats are now steered. (goto with a DIFFERENT url is a di
 and still runs.) +1 test locking the exemption set; agent suite 18 passed. Commit: `fix(#125):
 only exempt advancing-navigation from the anti-loop guard (open_browser loop)`.
 
-### Iteration 10 — IN PROGRESS
-Re-run. Watching for: open_browser loop is now steered after 1 call → model proceeds to goto +
-form; combobox fix finally gets exercised on the State field; field-fill progress resumes
-(expect ~5-8 fields like iters 6/8). This iteration also re-confirms the combobox path.
+### Iteration 10 — DONE (task bndq91tlh) — open_browser regression fixed; combobox validated offline
+The open_browser loop is gone (steered after 1 call). The model reached the State combobox
+(`clicked e65`) but used `click`, not `select_option`, so the new fallback wasn't exercised in
+the run. Filled 3 fields this run (variance: iters 6/8 = 7-8, iters 7/10 = 3). 30 success-repeat
+steers; never advanced to step 2.
+
+**Combobox fix VALIDATED directly against the live page** (independent of model behaviour): a
+single `select_option('e65','TX')` returns ok=True — "selected 'TX' in the 'e65' combobox (opened
+it and clicked option e125)". The fallback opens the custom `<div role=listbox>`, matches the
+option ("TX" abbreviation), and clicks it. Works end-to-end.
+
+---
+
+## FINAL ASSESSMENT (after 10 iterations)
+
+### PRIMARY GOALS — ALL MET ✅
+- **GPU generation on the NVIDIA RTX 3080** (NOT iGPU/CPU): `ollama ps` = 100% GPU, 2.2 GB VRAM,
+  136 tok/s. Verified.
+- **Encoding correct**: tool calls parse cleanly every turn (tolerant hermes parser).
+- **Generating properly**: single-phase native generation; clean one-action-per-turn; real
+  browser automation.
+- The agent reliably opens the browser, navigates, and fills form fields; the State combobox is
+  operable via `select_option`.
+
+### Nine harness fixes (each surfaced by a run, tested, committed) — full test suite 555 green
+1. Tolerant `hermes` parser (accept fenced/bare/array JSON; model omits `<tool_call>` tags).
+2. Single-phase generation (`two_phase=False`) — kills the discarded phase-1 duplicate call.
+3. Prose snapshot default ON — model picks correct input refs (not labels).
+4. Anti-loop guard: steer repeated SUCCESSFUL actions.
+5. `--max-steps 0` for runs — use the full 3-min budget, not 15 turns.
+6. Anti-loop guard: also steer repeated FAILED actions (kill e163/e68 retry loops).
+7. Actionable steer: list already-handled refs, tell model to pick an unhandled one.
+8. `select_option` drives CUSTOM comboboxes (open + click option) — validated live.
+9. Anti-loop exemption fixed to only advancing-navigation (open_browser 63x loop).
+
+### REMAINING GAP = the 3B MODEL's planning ceiling (NOT a harness bug)
+Across runs the model fills ~3-8 simple text fields (high run-to-run variance even at temp 0.0),
+reaches the State combobox, but: does not reliably choose `select_option` for it, re-targets
+already-done fields (→ many steers), and NEVER clicks Continue/Next to advance the 8-step wizard.
+These are reasoning/planning limits of a 3B coder model on a long multi-step form.
+
+### Recommended follow-ups (for a return visit)
+- Try a larger model on `beta_qwen3coder` for full completion (the harness is model-agnostic now).
+- Snapshot scoping to the current step/section (#28/#29) to reduce off-target picking on long forms.
+- Multi-step guidance ("fill visible fields, then click Continue to reveal the next step") — but
+  this is shared web guidance; keep model-specific tweaks out of `beta`.
 
 ## Current status
-RUNNING iteration 10 (3-min cap, max-steps 0). Awaiting completion notification.
+HARNESS VALIDATION COMPLETE — all primary goals met; 9 fixes committed + pushed; remaining gap is
+the model-planning ceiling (documented). Rapid 3-min loop paused at this clean checkpoint to avoid
+burning budget on variance-bound re-runs; ready to resume or swap models on request.
