@@ -581,39 +581,43 @@ class CliFinallyTeardownContractTest(unittest.TestCase):
         self.assertTrue(fs.torn_down)             # reached despite web's teardown raising
 
 
-class _ReopenableCli:
+class _ReopenableCli(PlaywrightCli):
     """A PlaywrightCli stand-in modelling a session whose persistent daemon has
     DIED: until ``open`` is called, every command (snapshot included) fails with the
-    real "browser is not open" text; after ``open`` it answers normally. Records all
-    calls so a test can prove the reopen + retry sequence (issues #101, #75)."""
+    real "browser is not open" text; after ``open`` it answers normally.
+
+    It is a REAL ``PlaywrightCli`` subclass overriding only the low-level
+    ``_run_once`` seam, so the genuine self-healing ``run`` (detect close -> reopen
+    -> re-navigate -> retry) is exercised end to end (issues #101/#75/#102). Records
+    every low-level command for sequence assertions."""
 
     NOT_OPEN = "The browser 'vibe' is not open, please run open first playwright-cli -s=vibe open"
 
     def __init__(self, snapshot_after_open="Page: \"X\"\n[e1] textbox\n",
-                 result_after_open="### Page\nok", *, open_succeeds=True):
-        self._open = False
+                 result_after_open="### Page\nok", *, open_succeeds=True,
+                 open_flags=("--headed",)):
+        super().__init__(session="vibe", timeout=5, open_flags=list(open_flags))
+        self._binary = "fake-binary"          # mark installed so _run_once is reached
+        self._is_open = False
         self._open_succeeds = open_succeeds
         self._snapshot = snapshot_after_open
         self._result = result_after_open
         self.calls = []
 
-    # mirror PlaywrightCli's surface the tools use
-    @property
-    def open_flags(self):
-        return ["--headed"]
-
-    def open(self, *flags):
-        self.calls.append(["open", *flags])
-        if not self._open_succeeds:
-            return (False, "open failed: could not launch browser")
-        self._open = True
-        return (True, "### Browser `vibe` opened with pid 1234.")
-
-    def run(self, *args):
+    def _run_once(self, *args):
         self.calls.append(list(args))
-        if not self._open:
+        cmd = args[0] if args else ""
+        if cmd == "open":
+            if not self._open_succeeds:
+                return (False, "open failed: could not launch browser")
+            self._is_open = True
+            return (True, "### Browser `vibe` opened with pid 1234.")
+        if cmd == "close":
+            self._is_open = False
+            return (True, "Browser 'vibe' closed")
+        if not self._is_open:
             return (False, self.NOT_OPEN)
-        if args and args[0] == "snapshot":
+        if cmd == "snapshot":
             return (True, self._snapshot)
         return (True, self._result)
 
@@ -726,17 +730,19 @@ class OpenBrowserToolTest(unittest.TestCase):
 
     def test_open_uses_captured_flags_on_real_cli(self):
         # PlaywrightCli.open() defaults to the session's captured open flags so a
-        # reopen restores the same headed/channel browser (#101/#75).
+        # reopen restores the same headed/channel browser (#101/#75). It goes through
+        # the low-level _run_once seam (never the self-healing run, to avoid recursion).
         recorded = []
         cli = PlaywrightCli(session="vibe", timeout=5, open_flags=["--headed", "--browser", "chrome"])
-        cli.run = lambda *a: (recorded.append(list(a)) or (True, "ok"))
+        cli._run_once = lambda *a: (recorded.append(list(a)) or (True, "ok"))
         cli.open()
         self.assertEqual(recorded, [["open", "--headed", "--browser", "chrome"]])
 
 
 class AutoRecoveryTest(unittest.TestCase):
-    """Issue #101/#75: a web action against a CLOSED session transparently reopens
-    the session and retries once — the agent sees success, not a dead-end error."""
+    """Issue #101/#75/#102: a web action against a CLOSED session transparently
+    reopens (and re-navigates to the last URL) and retries once, at the CLI seam —
+    the agent sees success, not a dead-end "not open" loop."""
 
     def test_fill_reopens_and_retries_on_dead_session(self):
         cli = _ReopenableCli(snapshot_after_open="Page: \"X\"\n[e1] textbox\n",
@@ -744,8 +750,7 @@ class AutoRecoveryTest(unittest.TestCase):
         tool = FillTool(cli, observation_limit=1000)
         res = tool.run({"target": "e1", "text": "hi"})
         self.assertTrue(res.ok, "auto-recovery should make the retried action succeed")
-        # Proof of the sequence: a failed action surfaced "not open", then open() ran,
-        # then the action was replayed and succeeded.
+        # Proof of the sequence: the daemon was reopened, then the action replayed.
         verbs = [c[0] for c in cli.calls]
         self.assertIn("open", verbs)
         self.assertEqual(verbs[-1], "fill")        # last call is the successful replay
@@ -756,8 +761,48 @@ class AutoRecoveryTest(unittest.TestCase):
         tool = GotoTool(cli, observation_limit=1000)
         res = tool.run({"url": "https://example.com"})
         self.assertTrue(res.ok)
-        self.assertEqual([c for c in cli.calls if c[0] == "open"], [["open"]])  # opened once
+        opens = [c for c in cli.calls if c[0] == "open"]
+        self.assertEqual(len(opens), 1)                  # reopened exactly once
+        self.assertEqual(opens[0], ["open", "--headed"])  # with the run's captured flags
         self.assertEqual(cli.calls[-1], ["goto", "https://example.com"])
+
+    def test_resume_renavigates_to_last_url(self):
+        # After a successful goto, last_url is tracked; a later dead-session command
+        # re-navigates there as part of resume (issue #102) so the page is restored.
+        cli = _ReopenableCli(snapshot_after_open="Page: \"X\"\nPage URL: https://example.com/app\n",
+                             result_after_open="### Page\nfilled")
+        # First, a live goto records last_url.
+        cli._is_open = True
+        GotoTool(cli, 1000).run({"url": "https://example.com/app"})
+        self.assertEqual(cli.state.last_url, "https://example.com/app")
+        # Now the session dies; a fill triggers resume which must re-goto last_url.
+        cli._is_open = False
+        FillTool(cli, 1000).run({"target": "e1", "text": "hi"})
+        self.assertIn(["goto", "https://example.com/app"], cli.calls[-3:])
+
+    def test_resume_is_bounded(self):
+        # If reopen never sticks (open "succeeds" but the session stays dead), resume
+        # must be capped across the run so a broken environment terminates instead of
+        # re-opening on every single command forever. Each run() does at most one
+        # resume; once the cap is hit, further dead-session commands stop resuming.
+        cli = _ReopenableCli()
+        # open() claims success but the session stays "closed", forcing repeated death.
+        def _broken(*args):
+            cli.calls.append(list(args))
+            cmd = args[0] if args else ""
+            if cmd in ("open", "close"):
+                return (True, f"{cmd} ok")
+            return (False, _ReopenableCli.NOT_OPEN)
+        cli._run_once = _broken
+        cli._state.max_resumes = 3
+        for _ in range(6):                              # many commands, all dead
+            cli.run("goto", "https://example.com")
+        self.assertEqual(cli._state.resumes, 3)         # capped, did not spin forever
+        # Once capped, later dead-session commands no longer trigger an open.
+        before = sum(1 for c in cli.calls if c[0] == "open")
+        cli.run("goto", "https://example.com")
+        after = sum(1 for c in cli.calls if c[0] == "open")
+        self.assertEqual(before, after)                 # no further reopen attempts
 
     def test_reopen_failure_returns_clear_recovery_path_not_bare_error(self):
         # If the session is dead AND reopening fails, the agent must get an

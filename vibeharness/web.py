@@ -127,18 +127,67 @@ def output_signals_session_closed(output: str) -> bool:
     return any(marker in low for marker in _SESSION_CLOSED_MARKERS)
 
 
+# Commands that are themselves part of session lifecycle/recovery — they must NEVER
+# trigger the auto-resume path (that would recurse: an `open` failing must not try to
+# `open` again from inside the resume). Everything else (goto/click/fill/snapshot/…)
+# is a normal command that resume protects.
+_RECOVERY_COMMANDS: frozenset[str] = frozenset({"open", "close"})
+
+
+class SessionState:
+    """Run-scoped, SHARED across every ``PlaywrightCli`` a single run creates (the
+    discrete tools and both snapshot providers each build their own wrapper bound to
+    the same session name). Holds exactly the state the self-healing resume needs so
+    that a daemon death detected by ANY of them heals the session for ALL of them
+    (issue #102, composing with #101/#75):
+
+    - ``open_flags``: the ``--headed``/``--browser …`` flags ``setup`` opened with, so
+      a reopen restores the same browser;
+    - ``last_url``: the last URL successfully navigated to, so a reopen can re-navigate
+      back to the page the agent was on (refs are re-derived from the fresh snapshot);
+    - ``resumes``/``max_resumes``: a hard bound so a genuinely broken environment
+      terminates instead of looping forever on reopen.
+    """
+
+    def __init__(self, open_flags: "list[str] | None" = None, max_resumes: int = 5):
+        self.open_flags: list[str] = list(open_flags or [])
+        self.last_url: str | None = None
+        self.resumes: int = 0
+        self.max_resumes: int = max_resumes
+
+    def may_resume(self) -> bool:
+        return self.resumes < self.max_resumes
+
+
+# Pull the "Page URL: <url>" line the CLI prints in snapshots / nav results so a
+# resume can re-navigate to where the agent was (issue #102).
+_PAGE_URL_RE = re.compile(r"Page URL:\s*(\S+)", re.IGNORECASE)
+
+
+def parse_page_url(output: str) -> str | None:
+    m = _PAGE_URL_RE.search(output or "")
+    url = m.group(1) if m else None
+    if url and url.lower() != "about:blank":
+        return url
+    return None
+
+
 class PlaywrightCli:
     """Thin, injectable wrapper around the stateful `playwright-cli` binary."""
 
-    def __init__(self, session: str, timeout: int, open_flags: "list[str] | None" = None):
+    def __init__(self, session: str, timeout: int, open_flags: "list[str] | None" = None,
+                 state: "SessionState | None" = None):
         self._session = session
         self._timeout = timeout
         self._binary = shutil.which(BINARY)
-        # The flags an ``open`` should be (re)launched with for THIS session — e.g.
-        # ``--headed``, ``--browser chrome``. Captured at setup so that an automatic
-        # reopen after a mid-run daemon death (issue #101/#75) restores the SAME
-        # browser the run started with, not a default one.
-        self._open_flags: list[str] = list(open_flags or [])
+        # Run-scoped shared state for the self-healing resume (issue #102). When a
+        # caller threads one ``SessionState`` through every wrapper, a daemon death
+        # seen by any tool/snapshot heals the session for all of them; standalone
+        # wrappers (tests, ad-hoc use) get their own private state. ``open_flags``
+        # passed explicitly seed the state so a reopen restores the same browser.
+        self._state = state if state is not None else SessionState(open_flags)
+        if open_flags is not None and state is not None and not self._state.open_flags:
+            self._state.open_flags = list(open_flags)
         # Handle to the most recent child this wrapper spawned. Retained so that a
         # later ``close()`` can tree-kill any browser daemon/grandchildren that the
         # session left alive (issue #15) — not just the direct CLI child.
@@ -149,8 +198,12 @@ class PlaywrightCli:
         return self._session
 
     @property
+    def state(self) -> "SessionState":
+        return self._state
+
+    @property
     def open_flags(self) -> list[str]:
-        return list(self._open_flags)
+        return list(self._state.open_flags)
 
     @property
     def available(self) -> bool:
@@ -163,12 +216,72 @@ class PlaywrightCli:
         already-open session simply re-opens it. Uses the session's captured
         ``open_flags`` (``--headed``/``--browser …``) when no explicit flags are
         passed so an automatic recovery reopen restores the original browser
-        (issues #101, #75). Returns ``(ok, output)`` like :meth:`run`.
+        (issues #101, #75). Returns ``(ok, output)`` like :meth:`run`. Goes through
+        ``_run_once`` (NOT the self-healing ``run``) so it can never recurse into the
+        resume path.
         """
-        use = list(flags) if flags else self._open_flags
-        return self.run("open", *use)
+        use = list(flags) if flags else self._state.open_flags
+        return self._run_once("open", *use)
 
     def run(self, *args: str) -> tuple[bool, str]:
+        """Run one CLI command, self-healing the session if the daemon has died.
+
+        Thin wrapper over :meth:`_run_once` that adds the issue-#102 clean-resume:
+        every discrete tool, the target-ref guard, and both per-turn snapshot
+        providers funnel through here, so wrapping at this single seam makes the
+        WHOLE toolset resilient with no change to any tool subclass.
+
+        Behaviour:
+        - track ``last_url`` on a successful ``goto`` (and from any "Page URL:" line)
+          so a resume can re-navigate back;
+        - if a NORMAL command (not ``open``/``close``) fails with the daemon-death
+          signature, reopen the session (same flags), re-navigate to ``last_url`` if
+          known, and RETRY the command once — transparently, so the agent never sees
+          a dead-end "not open" loop;
+        - bound the number of resumes so an unrecoverable environment still stops.
+        """
+        ok, out = self._run_once(*args)
+        cmd = args[0] if args else ""
+        if ok:
+            url = parse_page_url(out)
+            if cmd == "goto" and len(args) > 1:
+                self._state.last_url = url or args[1]
+            elif url:
+                self._state.last_url = url
+        # Only normal commands self-heal; open/close are the recovery primitives.
+        if ok or cmd in _RECOVERY_COMMANDS or not output_signals_session_closed(out):
+            return ok, out
+        if not self._state.may_resume():
+            return ok, out
+        self._resume()
+        return self._run_once(*args)
+
+    def snapshot(self) -> tuple[bool, str]:
+        """Capture the live page WITHOUT triggering session resume (issue #102).
+
+        Per-turn snapshot capture runs on every turn and through the target-ref
+        guard; it must be DEATH-TOLERANT, not session-fatal — a snapshot that hits a
+        dead daemon should simply return empty so the caller renders no page section,
+        and let the next ACTION (which the agent intends) drive the reopen. Going
+        through ``_run_once`` (not the self-healing ``run``) also keeps a stray
+        snapshot from spawning a browser when none is wanted (e.g. in tests).
+        """
+        return self._run_once("snapshot")
+
+    def _resume(self) -> None:
+        """Bring a dead session back: best-effort reap, reopen with the run's flags,
+        re-navigate to the last known URL. Best-effort and never raises — a failed
+        step just leaves the retry to surface the real error (issue #102)."""
+        self._state.resumes += 1
+        try:
+            self._run_once("close")           # reap a zombie daemon if any
+        except Exception:
+            pass
+        self._run_once("open", *self._state.open_flags)
+        if self._state.last_url:
+            self._run_once("goto", self._state.last_url)
+
+    def _run_once(self, *args: str) -> tuple[bool, str]:
         """Run one CLI command in this session. Returns (ok, combined_output).
 
         Every command is HARD-BOUNDED by ``self._timeout``. On timeout the whole
@@ -334,31 +447,22 @@ class _WebTool(Tool):
             if guard is not None:
                 return guard
         ok, output = self._cli.run(*self._build(args))
-        # AUTO-RECOVERY (issues #101, #75): the persistent browser daemon can die
-        # mid-run (e.g. a shared session torn down by a concurrent run, or an
-        # external reaper). When that happens the CLI fails every action with
-        # "browser '<session>' is not open". Rather than dead-ending the agent —
-        # which, being web-only, has no other way back — transparently reopen the
-        # session ONCE and replay this exact action. A real per-element miss
-        # (issue #73) is NOT this case and is left to the no-match path below.
+        # AUTO-RECOVERY (issues #101, #75, #102): the persistent browser daemon can
+        # die mid-run (a shared session torn down by a concurrent run, an external
+        # reaper, a renderer crash). The CLI layer (PlaywrightCli.run) already
+        # detects that signature, reopens the session, re-navigates to the last URL
+        # and retries the command transparently — so a recoverable death never
+        # reaches here. If the death signature STILL survives that retry, resume was
+        # exhausted/failed: surface a clear, actionable recovery path to the agent
+        # (which, being web-only, must be told how to get unstuck), never a bare
+        # error. A real per-element miss (issue #73) is a different case handled
+        # below by the no-match path.
         if not ok and output_signals_session_closed(output):
-            reopened, reopen_out = self._cli.open()
-            if reopened:
-                ok, output = self._cli.run(*self._build(args))
-                if not (ok and not output_signals_session_closed(output)):
-                    # Reopen happened but the replay still can't reach the page —
-                    # surface a clear, actionable recovery message (never a bare error).
-                    return ToolResult(
-                        False,
-                        f"the browser session had closed; it was reopened but the page "
-                        f"state was lost, so `{self.name}` could not be replayed. "
-                        f"Re-`goto` the URL you were on, then continue.")
-            else:
-                return ToolResult(
-                    False,
-                    f"the browser session was closed and could not be reopened "
-                    f"automatically ({self._trim(reopen_out)}). Call `open_browser` to "
-                    f"restore the session, then retry.")
+            return ToolResult(
+                False,
+                f"you tried to {self._subject(args)} but the browser session is closed and "
+                f"could not be restored automatically. Call `open_browser` to reopen it, then "
+                f"`goto` your target URL and continue.")
         subject = self._subject(args)
         # The CLI exits 0 even when the ref/selector matched no element, embedding
         # the failure as text. Treat that as a real failure (issue #73): a no-match
@@ -733,7 +837,7 @@ def capture_page_snapshot(cli: PlaywrightCli, char_limit: int) -> str:
     canned snapshot text, so the per-turn injection can be exercised with no browser.
     """
     try:
-        ok, output = cli.run("snapshot")
+        ok, output = _capture(cli)
     except Exception:
         return ""
     if not ok:
@@ -754,7 +858,7 @@ def capture_page_snapshot_raw(cli: PlaywrightCli) -> str:
     (no session, CLI error, timeout) so callers record nothing rather than crash.
     """
     try:
-        ok, output = cli.run("snapshot")
+        ok, output = _capture(cli)
     except Exception:
         return ""
     if not ok:
@@ -768,9 +872,12 @@ def make_raw_snapshot_provider(config: Config) -> Callable[[], str]:
     Mirrors :func:`make_snapshot_provider` but returns the full snapshot with no char
     cap — for #37 diagnostic ground-truth sizing and #43's dynamic-budget truncation.
     Uses the run's existing session (same name/timeout from ``config``) so it reflects
-    the page the model acts on.
+    the page the model acts on. Seeded with the run's open flags so a snapshot that
+    hits a dead session can self-heal it too (issue #102) — snapshots run every turn
+    and are a major resume surface.
     """
-    cli = PlaywrightCli(config.web_session, config.web_cli_timeout)
+    cli = PlaywrightCli(config.web_session, config.web_cli_timeout,
+                        open_flags=open_flags_for(config))
     return lambda: capture_page_snapshot_raw(cli)
 
 
@@ -788,8 +895,19 @@ def make_snapshot_provider(config: Config) -> Callable[[], str]:
     tests; the live run now uses :func:`make_raw_snapshot_provider` plus the dynamic
     budget so the snapshot is sized against the full message each turn.
     """
-    cli = PlaywrightCli(config.web_session, config.web_cli_timeout)
+    cli = PlaywrightCli(config.web_session, config.web_cli_timeout,
+                        open_flags=open_flags_for(config))
     return lambda: capture_page_snapshot(cli, config.web_snapshot_char_limit)
+
+
+def _capture(cli: "PlaywrightCli") -> tuple[bool, str]:
+    """Run a death-tolerant page snapshot: prefer the wrapper's resume-free
+    ``snapshot()`` seam (issue #102) so per-turn capture never reopens a browser;
+    fall back to ``run('snapshot')`` for stand-ins that only implement ``run``."""
+    snap = getattr(cli, "snapshot", None)
+    if callable(snap):
+        return snap()
+    return cli.run("snapshot")
 
 
 def open_flags_for(config: Config) -> list[str]:
