@@ -100,7 +100,9 @@ class EvaluateCallIsInvalidToolErrorTest(unittest.TestCase):
         self.assertTrue(result.finished)
 
     def test_remaining_subtools_still_callable_via_registry(self):
-        cli = FakeCli(ok=True, output="### Page\nok")
+        # Output doubles as the snapshot the issue-#73 target guard reads, so it must
+        # list the refs (e1/e2) the targeted subtools are smoked with.
+        cli = FakeCli(ok=True, output="### Page\n[e1] button\n[e2] button\nok")
         tools = [cls(cli, 1000) for cls in _WEB_TOOL_CLASSES]
         registry = ToolRegistry(tools)
         sample_args = {

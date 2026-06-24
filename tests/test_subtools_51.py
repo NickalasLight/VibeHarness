@@ -83,8 +83,10 @@ class SubtoolsRegisteredAndCallableTest(unittest.TestCase):
 
     def test_each_subtool_is_callable_via_registry(self):
         # Build a registry whose web tools are backed by a FakeCli so .run() works
-        # without a browser, then smoke each subtool with minimal valid args.
-        cli = FakeCli(ok=True, output="### Page\nok")
+        # without a browser, then smoke each subtool with minimal valid args. The
+        # output doubles as the snapshot the issue-#73 target guard reads, so it must
+        # list the refs (e1/e2) the targeted subtools are smoked with.
+        cli = FakeCli(ok=True, output="### Page\n[e1] button\n[e2] button\nok")
         tools = [cls(cli, 1000) for cls in _WEB_TOOL_CLASSES]
         registry = ToolRegistry(tools)
         sample_args = {

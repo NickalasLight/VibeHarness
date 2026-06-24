@@ -24,6 +24,7 @@ Install the backend with:  npm install -g @playwright/cli@latest
 """
 from __future__ import annotations
 
+import re
 import shutil
 import subprocess
 import sys
@@ -34,6 +35,69 @@ from .toolset import Toolset
 from .tools import Param, Tool, ToolResult
 
 BINARY = "playwright-cli"
+
+# A snapshot ref token, as it appears in the auto-injected live page view, e.g.
+# "[e163] button ...". We accept it bare (``e163``) or bracketed (``[e163]``).
+_REF_RE = re.compile(r"\be(\d+)\b")
+_REF_TOKEN_RE = re.compile(r"\[?\be(\d+)\b\]?")
+
+# Substrings playwright-cli emits in its (exit-0) output when a target/ref did NOT
+# resolve to a real element. The CLI exits 0 and embeds the failure as text, so the
+# only way to detect a no-match is to scan the output (issue #73). Matched
+# case-insensitively.
+_NO_MATCH_MARKERS: tuple[str, ...] = (
+    "does not match any elements",
+    "no elements match",
+    "ref not found",
+    "no element found",
+    "element not found",
+    "could not find element",
+    "waiting for locator",  # playwright timeout phrasing when a locator never appears
+    "timeout",
+)
+
+
+def parse_snapshot_refs(snapshot: str) -> set[str]:
+    """Extract the set of element refs (``e163`` …) present in a live page snapshot.
+
+    The snapshot is the same auto-injected page view the model sees, where each
+    actionable node is prefixed with a ``[eN]`` token (e.g. ``[e163] button
+    "Accept …"``). We return the bare, normalized ref strings (``{"e163", …}``)
+    for membership checks. Lines that carry no ref (``[-] tooltip``, ``text: …``)
+    simply contribute nothing.
+    """
+    return {f"e{m.group(1)}" for m in _REF_RE.finditer(snapshot or "")}
+
+
+def normalize_ref(target: str) -> str | None:
+    """Normalize a user-supplied ``target`` to a bare ref (``e163``) if it *is* a
+    ref in one of the snapshot's accepted forms (``e163`` or ``[e163]``).
+
+    Returns ``None`` for anything that is not a clean ref token — e.g. a CSS
+    selector (``.ytd-play-button``), an id (``#play``), or a tag — so the caller
+    can reject guessed selectors outright (issue #73).
+    """
+    if not target:
+        return None
+    t = target.strip()
+    m = _REF_TOKEN_RE.fullmatch(t)
+    if m:
+        return f"e{m.group(1)}"
+    return None
+
+
+def output_signals_no_match(output: str) -> bool:
+    """True when playwright-cli's (exit-0) output text indicates the action hit no
+    element — a ref/selector that resolved to nothing. The CLI reports these as an
+    embedded ``### Error`` rather than a non-zero exit, so the web tool used to
+    record them as ``ok=true`` (the issue #73 status bug). Scanning the text lets us
+    flip the ToolResult to ok=False.
+    """
+    low = (output or "").lower()
+    if "### error" in low or "error:" in low:
+        if any(marker in low for marker in _NO_MATCH_MARKERS):
+            return True
+    return False
 
 
 class PlaywrightCli:
@@ -169,9 +233,11 @@ class PlaywrightCli:
 # heading is a structural marker tests use to detect the auto-injected page section,
 # and repeating it inside a tool description would create false matches.
 _REF_NOTE = (
-    "Target an element by the stable ref shown for it in the live page view "
-    "(e.g. 'e6'), or by a CSS selector. That page view is provided to you "
-    "automatically each turn — never guess a ref."
+    "You MUST target an element by the stable ref shown for it in the live page "
+    "view (e.g. 'e163') — the page view is provided to you automatically each "
+    "turn. NEVER guess a CSS selector, class, id or tag: only refs that appear "
+    "in the current snapshot are accepted; anything else is rejected before the "
+    "browser is touched."
 )
 
 
@@ -187,6 +253,11 @@ class _WebTool(Tool):
 
     _verb: str = "acted on"          # past-tense narrative verb
     _required: tuple[str, ...] = ()  # arg names that must be present + non-empty
+    # When True, this tool's ``target`` arg must be a ref present in the CURRENT
+    # live snapshot; a guessed CSS selector / id / unknown ref is rejected without
+    # ever calling playwright (issue #73). Tools without a targeted element
+    # (goto/type/press_key/screenshot-whole-page/navigate_*/reload) leave this off.
+    _validate_target: bool = False
 
     def __init__(self, cli: PlaywrightCli, observation_limit: int):
         self._cli = cli
@@ -206,12 +277,48 @@ class _WebTool(Tool):
         if missing:
             return ToolResult(False, f"you called `{self.name}` but did not provide: "
                               f"{', '.join(missing)}.")
+        if self._validate_target:
+            guard = self._guard_target(args)
+            if guard is not None:
+                return guard
         ok, output = self._cli.run(*self._build(args))
         subject = self._subject(args)
+        # The CLI exits 0 even when the ref/selector matched no element, embedding
+        # the failure as text. Treat that as a real failure (issue #73): a no-match
+        # must be ok=False so the agent (and the validator) sees it failed.
+        if ok and output_signals_no_match(output):
+            ok = False
         if not ok:
             return ToolResult(False, f"you tried to {self._verb} {subject} but it failed: "
                               f"{self._trim(output)}")
         return ToolResult(True, f"you {self._verb} {subject}. Result:\n{self._trim(output)}")
+
+    def _guard_target(self, args: dict) -> ToolResult | None:
+        """Reject a ``target`` that is not a ref present in the current snapshot.
+
+        Returns a ready ok=False :class:`ToolResult` (listing the available refs)
+        when the target is invalid, or ``None`` to let the action proceed. We
+        source the ref set from a FRESH snapshot captured through the SAME session
+        the tool drives (:func:`capture_page_snapshot_raw`), so it reflects the
+        exact page the model is acting on. If the snapshot can't be captured we
+        fail open (proceed) rather than block a legitimate action on a flaky read.
+        """
+        target = args.get("target") or ""
+        ref = normalize_ref(target)
+        snapshot = capture_page_snapshot_raw(self._cli)
+        if not snapshot:
+            return None  # no snapshot to validate against: don't block
+        refs = parse_snapshot_refs(snapshot)
+        if ref is not None and ref in refs:
+            return None  # valid ref present on the page
+        available = ", ".join(sorted(refs, key=lambda r: int(r[1:]))) or "(none)"
+        return ToolResult(
+            False,
+            f"you tried to {self._verb} '{target}' but that is not a valid target: "
+            f"you must pass the ref of an element shown in the current page snapshot "
+            f"(e.g. 'e163'), and never guess a CSS selector, class or id. "
+            f"Available refs on the current page: {available}.",
+        )
 
     def _trim(self, text: str) -> str:
         if len(text) <= self._limit:
@@ -246,10 +353,12 @@ class ClickTool(_WebTool):
     description = "Click an element (a link, button, checkbox, …). " + _REF_NOTE
     _verb = "clicked"
     _required = ("target",)
+    _validate_target = True
 
     @property
     def parameters(self):
-        return [Param("target", "string", "Element ref (e.g. 'e6') or CSS selector to click.")]
+        return [Param("target", "string", "Element ref (e.g. 'e163') from the current page snapshot to "
+                      "click. Must be a ref from the snapshot — never a guessed CSS selector/class/id.")]
 
     def _build(self, args):
         return ["click", args["target"]]
@@ -260,11 +369,13 @@ class FillTool(_WebTool):
     description = ("Set a text input / textarea to an exact value, clearing it first. " + _REF_NOTE)
     _verb = "filled"
     _required = ("target", "text")
+    _validate_target = True
 
     @property
     def parameters(self):
         return [
-            Param("target", "string", "Element ref or CSS selector of the field to fill."),
+            Param("target", "string", "Element ref (e.g. 'e6') from the current snapshot of the field "
+                  "to fill — never a guessed CSS selector/class/id."),
             Param("text", "string", "The exact text to put in the field."),
         ]
 
@@ -309,11 +420,13 @@ class SelectOptionTool(_WebTool):
     description = "Choose an option in a <select> dropdown. " + _REF_NOTE
     _verb = "selected an option in"
     _required = ("target", "value")
+    _validate_target = True
 
     @property
     def parameters(self):
         return [
-            Param("target", "string", "Element ref or CSS selector of the dropdown."),
+            Param("target", "string", "Element ref (e.g. 'e6') from the current snapshot of the "
+                  "dropdown — never a guessed CSS selector/class/id."),
             Param("value", "string", "The option value or visible label to select."),
         ]
 
@@ -326,10 +439,12 @@ class CheckTool(_WebTool):
     description = "Check a checkbox or radio button (no-op if already checked). " + _REF_NOTE
     _verb = "checked"
     _required = ("target",)
+    _validate_target = True
 
     @property
     def parameters(self):
-        return [Param("target", "string", "Element ref or CSS selector of the checkbox/radio.")]
+        return [Param("target", "string", "Element ref (e.g. 'e6') from the current snapshot of the "
+                      "checkbox/radio — never a guessed CSS selector/class/id.")]
 
     def _build(self, args):
         return ["check", args["target"]]
@@ -340,10 +455,12 @@ class UncheckTool(_WebTool):
     description = "Uncheck a checkbox (no-op if already unchecked). " + _REF_NOTE
     _verb = "unchecked"
     _required = ("target",)
+    _validate_target = True
 
     @property
     def parameters(self):
-        return [Param("target", "string", "Element ref or CSS selector of the checkbox.")]
+        return [Param("target", "string", "Element ref (e.g. 'e6') from the current snapshot of the "
+                      "checkbox — never a guessed CSS selector/class/id.")]
 
     def _build(self, args):
         return ["uncheck", args["target"]]
@@ -354,10 +471,12 @@ class HoverTool(_WebTool):
     description = "Move the mouse over an element (e.g. to reveal a menu). " + _REF_NOTE
     _verb = "hovered over"
     _required = ("target",)
+    _validate_target = True
 
     @property
     def parameters(self):
-        return [Param("target", "string", "Element ref or CSS selector to hover over.")]
+        return [Param("target", "string", "Element ref (e.g. 'e6') from the current snapshot to hover "
+                      "over — never a guessed CSS selector/class/id.")]
 
     def _build(self, args):
         return ["hover", args["target"]]
@@ -368,13 +487,36 @@ class DragTool(_WebTool):
     description = "Drag one element and drop it onto another. " + _REF_NOTE
     _verb = "dragged"
     _required = ("target", "end")
+    _validate_target = True
 
     @property
     def parameters(self):
         return [
-            Param("target", "string", "Element ref or CSS selector to drag FROM."),
-            Param("end", "string", "Element ref or CSS selector to drop ONTO."),
+            Param("target", "string", "Element ref (e.g. 'e6') from the current snapshot to drag FROM."),
+            Param("end", "string", "Element ref (e.g. 'e9') from the current snapshot to drop ONTO."),
         ]
+
+    def _guard_target(self, args):
+        """Both endpoints must be refs on the current page. Validate each against
+        the same fresh snapshot; reject (listing available refs) if either is not a
+        known ref, never calling playwright on a guessed selector (issue #73)."""
+        snapshot = capture_page_snapshot_raw(self._cli)
+        if not snapshot:
+            return None
+        refs = parse_snapshot_refs(snapshot)
+        for arg_name in ("target", "end"):
+            raw = args.get(arg_name) or ""
+            ref = normalize_ref(raw)
+            if ref is None or ref not in refs:
+                available = ", ".join(sorted(refs, key=lambda r: int(r[1:]))) or "(none)"
+                return ToolResult(
+                    False,
+                    f"you tried to drag but '{raw}' (the {arg_name}) is not a valid target: "
+                    f"both endpoints must be refs shown in the current page snapshot "
+                    f"(e.g. 'e6'); never guess a CSS selector, class or id. "
+                    f"Available refs on the current page: {available}.",
+                )
+        return None
 
     def _build(self, args):
         return ["drag", args["target"], args["end"]]
@@ -546,8 +688,10 @@ class WebToolset(Toolset):
             "request it; just read it before deciding what to do next. "
             "There is no tool to fetch the page; use the discrete browser tools (goto, click, "
             "fill, type, select_option, hover, press_key, navigate_back, …) to ACT. "
-            "Act only on elements present in that snapshot, referencing them by their "
-            "ref — never guess a selector or element id. "
+            "When a tool takes a target element you MUST pass the element's ref (e.g. 'e163') "
+            "exactly as it appears in the current snapshot. NEVER guess a CSS selector, class, "
+            "id or tag (e.g. '.ytd-play-button'): such targets are rejected before the browser "
+            "is touched, and the rejection lists the refs that are actually available. "
             "If a cookie/consent banner or modal dialog blocks what you need, clear it first: "
             "locate its Accept / Agree / Reject / Dismiss / Continue control in the snapshot and "
             "click that ref before doing anything else."
