@@ -65,6 +65,48 @@ class AgentLoopTest(unittest.TestCase):
         return RalphAgent(client, self.registry, "SYSTEM", Config(max_steps=max_steps),
                           validator or FakeValidator(passed=True), reporter=reporter)
 
+    def test_anti_loop_skips_repeated_successful_action(self):
+        # #125: an identical, already-successful action is NOT re-executed; the model is
+        # steered instead. Guards the small-model loop (e.g. re-filling a filled field).
+        class CountingTool(Tool):
+            name = "ping"
+            description = "counts its runs"
+
+            def __init__(self):
+                self.calls = 0
+
+            @property
+            def parameters(self):
+                return []
+
+            def run(self, args) -> ToolResult:
+                self.calls += 1
+                return ToolResult(True, f"you pinged (#{self.calls}).")
+
+        tool = CountingTool()
+        registry = ToolRegistry([tool])
+        client = FakeLLMClient([
+            {"tool": "ping", "args": {}},   # turn 1: executes
+            {"tool": "ping", "args": {}},   # turn 2: identical -> steered, NOT executed
+            VALIDATE,
+        ])
+        agent = RalphAgent(client, registry, "SYS", Config(max_steps=10),
+                           FakeValidator(passed=True))
+        result = agent.run("ping")
+        self.assertEqual(tool.calls, 1)  # the duplicate did not run
+        self.assertIn("ALREADY did this exact action", result.transcript())
+
+    def test_anti_loop_allows_different_args(self):
+        # Same tool with DIFFERENT args is a different action and must still run.
+        actions = [
+            {"tool": "create_file", "args": {"path": self.p("a.txt"), "content": "x"}},
+            {"tool": "create_file", "args": {"path": self.p("b.txt"), "content": "y"}},
+            VALIDATE,
+        ]
+        self._agent(actions).run("two files")
+        self.assertTrue(os.path.exists(self.p("a.txt")))
+        self.assertTrue(os.path.exists(self.p("b.txt")))
+
     def test_sequential_turns_then_validate_passes(self):
         actions = [
             {"tool": "create_file", "args": {"path": self.p("a.txt"), "content": "hello hello hello"}},

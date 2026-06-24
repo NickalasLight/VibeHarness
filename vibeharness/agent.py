@@ -140,6 +140,13 @@ class RalphAgent:
         result = RunResult(task=task)
         limit = self._cfg.max_actions_per_turn
         constraint = self._codec.constraint(self._registry, limit)
+        # Anti-loop guard (#125): signatures of actions already executed SUCCESSFULLY this
+        # run. A small model (esp. single-phase + greedy over a near-static page snapshot)
+        # tends to re-emit the exact same action forever — e.g. re-filling an already-filled
+        # field, or re-clicking a ref. Repeating an identical successful action never makes
+        # progress, so we do NOT re-run it; we steer the model to a different element / to
+        # advance the form instead. Navigation tools are exempt (see _action_signature).
+        done_signatures: set[str] = set()
 
         # max_steps <= 0 means run until validation passes.
         turns = (itertools.count(1) if self._cfg.max_steps <= 0
@@ -196,7 +203,21 @@ class RalphAgent:
                             if result.finished:
                                 break
                             continue
-                        self._record(turn, self._execute(tool_name, args), memory)
+                        sig = self._action_signature(tool_name, args)
+                        if sig is not None and sig in done_signatures:
+                            self._record(turn, Action(
+                                tool_name, args,
+                                f"you ALREADY did this exact action successfully earlier this "
+                                f"run ({tool_name} {json.dumps(args, ensure_ascii=False)}); "
+                                f"repeating it makes no progress. Do something DIFFERENT now — "
+                                f"act on the NEXT field or element you have not handled yet, or "
+                                f"advance the form (e.g. click a Next/Continue/Submit control).",
+                                ok=False), memory)
+                            continue
+                        action = self._execute(tool_name, args)
+                        self._record(turn, action, memory)
+                        if action.ok and sig is not None:
+                            done_signatures.add(sig)
             except BaseException as exc:
                 # Failsafe: any unexpected mid-turn error (an uncaught tool/validator/
                 # decode exception, a KeyboardInterrupt, …) must NOT discard the work
@@ -322,6 +343,23 @@ class RalphAgent:
             obs = (f"validation FAILED — {verdict.reason} "
                    f"Keep working to address this, then call validate again.")
             self._record(turn, Action("validate", args, obs, ok=False), memory)
+
+    # Tools whose identical repeat can be legitimate (a real reload / (re)open / back
+    # navigation), so they are EXEMPT from the anti-loop dedup guard.
+    _LOOP_EXEMPT_TOOLS = frozenset({"goto", "open_browser", "navigate_back"})
+
+    def _action_signature(self, tool_name: str | None, args: dict) -> str | None:
+        """A stable signature for an executed action, or ``None`` if this tool is exempt
+        from the anti-loop guard. Identical ``(tool, args)`` -> identical signature, so a
+        re-emitted duplicate of a previously-successful action can be detected and steered
+        rather than blindly re-run (#125)."""
+        if not tool_name or tool_name in self._LOOP_EXEMPT_TOOLS:
+            return None
+        try:
+            payload = json.dumps(args, sort_keys=True, ensure_ascii=False)
+        except (TypeError, ValueError):
+            payload = repr(args)
+        return f"{tool_name}|{payload}"
 
     # ---- helpers ----
     def _execute(self, tool_name: str | None, args: dict) -> Action:

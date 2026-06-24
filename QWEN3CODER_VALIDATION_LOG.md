@@ -94,10 +94,27 @@ ref-keyed line per interactable, with fillable affordances (#70) — which small
 the correct ref far more reliably. Updated 2 prose tests to the branch default; suite **548
 passed**. Commit: `fix(#125): default web_snapshot_prose=True for ref comprehension`.
 
-### Iteration 4 — IN PROGRESS
-Re-run with prose snapshot. Watching for: fewer wasted/looped turns; correct input refs chosen
-(input not label); more fields filled per turn; progress toward Next/step 2. Still pending:
-custom State combobox handling (select_option fails on the div-listbox).
+### Iteration 4 — DONE (task bjqs38pdd) — prose fixed ref selection; exposed the LOOP class
+**Prose snapshot worked:** the model now picks CORRECT input refs — First name (e41), **Last
+name (e44, the input, not the label)**, Email (e48), all filled cleanly (turns 5-7). The
+label-vs-input confusion from iter 3 is gone. **But then it looped:** turns 8-15 re-filled e41
+"Jason" eight times. Root cause: single-phase + greedy (temp 0.0) over a snapshot that does NOT
+show field VALUES — a filled field looks identical to an empty one, so greedy decoding
+reproduces the exact same action forever. This loop class has appeared EVERY iteration (e163 ×5,
+select_option ×7, now e41 ×8).
+
+**Fix applied (model-agnostic anti-loop guard, `agent.py`):** track signatures of actions
+executed SUCCESSFULLY this run; if the model re-emits an identical (tool, args), DON'T re-run it
+— record a steering observation ("you ALREADY did this … do something DIFFERENT — next field /
+advance the form"). Navigation tools (goto/open_browser/navigate_back) are exempt. Added 2 unit
+tests (skips duplicate; allows different args). Suite **550 passed**. Commit: `fix(#125):
+anti-loop guard — don't re-run an already-successful action`.
+
+### Iteration 5 — IN PROGRESS
+Re-run with anti-loop guard. Watching for: after filling a field, the model is forced OFF the
+duplicate and onto the NEXT empty field; progress through more Personal-Info fields and toward
+the Continue/Next button (step 1 → 2). Still pending: custom State combobox (select_option fails
+on the div-listbox) — likely the next blocker once field-fill flows.
 
 ## Current status
-RUNNING iteration 4 (3-min cap). Awaiting completion notification.
+RUNNING iteration 5 (3-min cap). Awaiting completion notification.
