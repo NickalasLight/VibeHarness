@@ -6,7 +6,9 @@ clicks, and content extraction all share state.
 
 Each basic browser operation the CLI supports is its own ``Tool`` subclass
 (``goto``, ``click``, ``fill``, ``type``, ``press_key``, ``select_option``,
-``hover``, ``navigate_back``, ``evaluate``, …) — see :class:`WebToolset`. This
+``hover``, ``navigate_back``, …) — see :class:`WebToolset`. There is
+deliberately NO ``evaluate``/JS tool: the limited agent accomplishes web tasks
+using only these discrete subtools, never by executing arbitrary JavaScript. This
 replaces the old monolithic ``browse(action=...)`` dispatcher: every operation is
 now its own named tool with its own typed parameters and description, so the model
 chooses a tool the same way it chooses ``read_file`` vs ``write_file``.
@@ -395,22 +397,6 @@ class UploadTool(_WebTool):
         return ["upload", args["file"]]
 
 
-class EvaluateTool(_WebTool):
-    name = "evaluate"
-    description = ("Run a JavaScript function on the page and return its result, e.g. "
-                  "\"() => document.title\".")
-    _verb = "evaluated JavaScript on"
-    _required = ("expression",)
-
-    @property
-    def parameters(self):
-        return [Param("expression", "string", "A JS function to evaluate, e.g. "
-                      "\"() => document.title\".")]
-
-    def _build(self, args):
-        return ["eval", args["expression"]]
-
-
 class ScreenshotTool(_WebTool):
     name = "screenshot"
     description = "Save a PNG screenshot of the current page (or of one element if `target` is given)."
@@ -468,7 +454,7 @@ class ReloadTool(_WebTool):
 # playwright-cli operation; NO snapshot (page is auto-injected every turn).
 _WEB_TOOL_CLASSES: tuple[type[_WebTool], ...] = (
     GotoTool, ClickTool, FillTool, TypeTool, PressKeyTool, SelectOptionTool,
-    CheckTool, UncheckTool, HoverTool, DragTool, UploadTool, EvaluateTool,
+    CheckTool, UncheckTool, HoverTool, DragTool, UploadTool,
     ScreenshotTool, NavigateBackTool, NavigateForwardTool, ReloadTool,
 )
 
@@ -550,7 +536,7 @@ def make_snapshot_provider(config: Config) -> Callable[[], str]:
 class WebToolset(Toolset):
     name = "web"
     description = ("Browse the web with a stateful browser: navigate, click, fill forms, "
-                   "select options, hover, press keys, upload files, run JS, and screenshot. "
+                   "select options, hover, press keys, upload files, and screenshot. "
                    "The page is shown to you automatically each turn.")
 
     def system_guidance(self) -> str | None:
@@ -559,7 +545,7 @@ class WebToolset(Toolset):
             "'# Current page (live snapshot — provided automatically)' — you do NOT and CANNOT "
             "request it; just read it before deciding what to do next. "
             "There is no tool to fetch the page; use the discrete browser tools (goto, click, "
-            "fill, type, select_option, hover, press_key, navigate_back, evaluate, …) to ACT. "
+            "fill, type, select_option, hover, press_key, navigate_back, …) to ACT. "
             "Act only on elements present in that snapshot, referencing them by their "
             "ref — never guess a selector or element id. "
             "If a cookie/consent banner or modal dialog blocks what you need, clear it first: "

@@ -24,7 +24,7 @@ from tests._fakes import FakeCli, FakeLLMClient, FakeValidator
 # The discrete subtools we expect the web toolset to expose (issue #51).
 EXPECTED_SUBTOOLS = {
     "goto", "click", "fill", "type", "press_key", "select_option", "check",
-    "uncheck", "hover", "drag", "upload", "evaluate", "screenshot",
+    "uncheck", "hover", "drag", "upload", "screenshot",
     "navigate_back", "navigate_forward", "reload",
 }
 
@@ -99,7 +99,6 @@ class SubtoolsRegisteredAndCallableTest(unittest.TestCase):
             "hover": {"target": "e1"},
             "drag": {"target": "e1", "end": "e2"},
             "upload": {"file": "/tmp/f"},
-            "evaluate": {"expression": "() => 1"},
             "screenshot": {},
             "navigate_back": {},
             "navigate_forward": {},
