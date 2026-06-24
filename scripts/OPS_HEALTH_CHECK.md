@@ -6,7 +6,7 @@ session crashes; see the crash analysis). `scripts/leak_check.ps1` warns before 
 
 ## Mitigations
 1. **Commit frequently** — every subagent commits incrementally, so a crash loses at most the last step. (This is the primary mitigation; it replaces an earlier "cap concurrent subagents at 3-4" rule.)
-2. **Memory headroom** — keep ≥ 8 GB free / commit < ~75%. The background watcher alerts when free RAM drops below 8 GB.
+2. **Memory headroom** — aim for ≥ 8 GB free / commit < ~75%. The background watcher only ALERTS at the CRITICAL level (free RAM < 4 GB / near-OOM) to avoid interrupting on routine pressure.
 3. **Leak watch (known bug #32)** — a standalone `llama-server.exe` leaked/faulted. Do NOT kill Ollama or its bundled llama.cpp server (VibeThinker + output constraints depend on it). Tracked for a later sprint.
 4. **Orphan reap (#15)** — after any Playwright/browser run, kill orphaned `chrome`/`node` trees.
 

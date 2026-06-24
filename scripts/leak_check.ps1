@@ -25,10 +25,11 @@ $cl    = @(Get-Process claude -ErrorAction SilentlyContinue).Count
 $ch    = @(Get-Process chrome -ErrorAction SilentlyContinue).Count
 $nd    = @(Get-Process node   -ErrorAction SilentlyContinue).Count
 
-# Alert ONLY on the real crash trigger — low free RAM — with the process breakdown
-# inline (so a high claude/chrome/llama-server count is visible when it actually matters).
-# A high claude.exe count on its own is NOT alerted (too noisy / not itself a problem).
-if ($free -lt 8) {
-    Write-Output ("ALERT LOW-RAM: free={0} GB ({1}% used) | llama-server={2}MB chrome={3} node={4} claude={5}" -f $free,$pct,$llama,$ch,$nd,$cl)
+# Alert ONLY when free RAM is CRITICALLY low (< 4 GB) — the near-OOM danger zone —
+# with the process breakdown inline (so the llama-server/chrome culprit is visible).
+# Higher headroom is still recommended (OPS_HEALTH_CHECK.md), but we only INTERRUPT on a
+# genuinely critical level to avoid noise. A high claude/chrome count alone is NOT alerted.
+if ($free -lt 4) {
+    Write-Output ("ALERT CRITICAL-RAM: free={0} GB ({1}% used) | llama-server={2}MB chrome={3} node={4} claude={5}" -f $free,$pct,$llama,$ch,$nd,$cl)
 }
-# healthy -> no output
+# healthy / non-critical -> no output
