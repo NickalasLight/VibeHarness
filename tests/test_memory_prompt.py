@@ -172,6 +172,46 @@ class ToolsetGuidanceTest(unittest.TestCase):
         self.assertLess(sp.index("# Tools"), sp.index("# Working with your tools"))
         self.assertLess(sp.index("# Working with your tools"), sp.index("# Guidance"))
 
+    def test_web_guidance_reconciled_to_point_at_live_snapshot_section(self):
+        # Issue #24 reconcile (commit "Reconcile web-worker guidance with #24"):
+        # the web guidance must point the model at the auto-injected page section by
+        # its EXACT heading text, rather than telling it to take a fresh snapshot.
+        from vibeharness.web import WebToolset
+        text = WebToolset().system_guidance()
+        self.assertIsNotNone(text)
+        # Names the live-snapshot section verbatim so the model reads it each turn...
+        self.assertIn("# Current page (live snapshot)", text)
+        # ...and still keeps the #23 consent/banner-dismissal guidance.
+        lower = text.lower()
+        self.assertTrue(
+            "consent" in lower and ("dismiss" in lower or "accept" in lower),
+            "reconciled web guidance must still cover consent-banner dismissal",
+        )
+        # ...and still keeps ref-based interaction guidance (act on snapshot refs).
+        self.assertIn("ref", lower)
+        # The reconciled wording must NOT revert to 'take a fresh snapshot yourself'.
+        self.assertNotIn("take a fresh snapshot", lower)
+
+    def test_web_guidance_section_in_built_prompt_points_at_live_snapshot(self):
+        # End to end through the builder: a web-active system prompt's guidance
+        # section references the same heading the snapshot is injected under (#24).
+        sp = self._build(["web"])
+        self.assertIn("# Current page (live snapshot)", sp)
+
+
+class ToolsetGuidanceHookTest(unittest.TestCase):
+    """The #19 hook itself: the base Toolset contributes no guidance by default."""
+
+    def test_base_toolset_system_guidance_defaults_to_none(self):
+        from vibeharness.toolset import Toolset
+
+        class _Bare(Toolset):
+            name = "bare"
+            def create_tools(self, config):
+                return []
+
+        self.assertIsNone(_Bare().system_guidance())
+
 
 if __name__ == "__main__":
     unittest.main()
