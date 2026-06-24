@@ -100,16 +100,15 @@ class ValidateTool(Tool):
     loop intercepts it; `run` is only a safe fallback."""
     name = "validate"
     description = (
-        "Call this ONLY when you believe you have FULLY completed the original task. "
-        "A separate validator will review your work against the task. If it agrees, the "
-        "run ends successfully. If not, you will receive feedback explaining what is still "
-        "missing or wrong — fix it and call validate again. Do not call validate speculatively."
+        "Call ONLY when the task is FULLY done. A separate validator reviews your work: "
+        "if it agrees the run ends, otherwise you get feedback on what is missing — fix it "
+        "and validate again. Never call speculatively."
     )
 
     @property
     def parameters(self):
         return [Param("summary", "string",
-                      "A brief summary of what you accomplished and why the task is now complete.")]
+                      "Brief summary of what you accomplished and why the task is complete.")]
 
     def run(self, args: dict) -> ToolResult:
         return ToolResult(True, "validation requested.")

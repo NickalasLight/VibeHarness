@@ -76,21 +76,18 @@ _ACTIONS = {
 class BrowseTool(Tool):
     name = "browse"
     description = (
-        "Drive a single, stateful web browser — the page, cookies, and history persist "
-        "between calls. Choose what to do with `action`.\n"
-        "SEEING THE PAGE: `snapshot` is your eyes — it is the ONLY way to observe the page. "
-        "It returns the page's visible text, every link with its URL, every form field, and a "
-        "stable ref for each element (like `e6`). Take a `snapshot` right after you navigate or "
-        "change the page, and read it before deciding what to do next. You act on an element by "
-        "passing its ref (or a CSS selector) as `target`.\n"
-        "TYPICAL FLOW: goto a URL -> snapshot to read it -> interact (click/fill/select/...) using "
-        "refs from the snapshot -> snapshot again to see what changed -> repeat.\n"
-        "ACTIONS: goto (open `url`); snapshot (read the current page); click (`target`); "
-        "fill (set `target` field to `text`, clearing it first); type (`text` into the focused "
-        "element); select (option `value` in `target` dropdown); check / uncheck (`target` "
-        "checkbox or radio); upload (file path `file` to the active file input); hover (`target`); "
-        "press (keyboard `key`, e.g. 'Enter'); drag (`target` -> `end`); eval (run JS in "
-        "`expression`); screenshot (save a PNG); back / forward / reload."
+        "Drive one stateful browser — page, cookies, and history persist between calls. "
+        "Pick what to do with `action`.\n"
+        "SEEING THE PAGE: `snapshot` is your eyes — the ONLY way to observe a page. It returns "
+        "the visible text, every link with its URL, every form field, and a stable ref per "
+        "element (like `e6`). Snapshot after you navigate or change the page, read it, then act "
+        "on an element by passing its ref (or a CSS selector) as `target`.\n"
+        "FLOW: goto -> snapshot -> interact (click/fill/...) using refs -> snapshot again -> repeat.\n"
+        "ACTIONS: goto (open `url`); snapshot (read the page); click (`target`); fill (set "
+        "`target` to `text`, clearing it first); type (`text` into the focused element); select "
+        "(option `value` in `target`); check / uncheck (`target`); upload (`file` to the active "
+        "file input); hover (`target`); press (`key`, e.g. 'Enter'); drag (`target` -> `end`); "
+        "eval (run JS `expression`); screenshot (save a PNG); back / forward / reload."
     )
 
     def __init__(self, cli: PlaywrightCli, observation_limit: int):

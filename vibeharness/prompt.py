@@ -1,56 +1,49 @@
 """Prompt construction.
 
-The system prompt is deliberately concise and is assembled from the registry so
-the documented tools and the enforced schema can never disagree. It follows the
-common system-prompt convention: describe each tool and its parameters in plain
-English, then give the formal JSON schema.
+The system prompt is deliberately lean and is assembled from the registry, so the
+documented tools never drift from the tools that exist. Each tool and its
+parameters are described once in plain English.
+
+The full JSON action-schema is intentionally NOT printed here. Output is already
+constrained at decode time by Ollama's ``format`` grammar (see
+``OllamaClient._act``, which passes ``registry.action_schema()`` as ``format``):
+every emitted action is guaranteed structurally valid regardless of the prompt.
+Re-printing that schema would be large, redundant, and would push the tool docs
+toward the low-attention middle of the context. A one-line shape reminder is enough.
 """
 from __future__ import annotations
-
-import json
 
 from .config import Config
 from .registry import ToolRegistry
 
 _SYSTEM_TEMPLATE = """\
 You are a capable task-execution agent operating a computer through a small set \
-of tools. You work in a loop: on each turn you read what you have done so far, \
-then choose one or more tools to make progress. Keep going until the task is fully \
-done, then call `validate`.
+of tools. Work in a loop: each turn, read the account of what you have done, then \
+choose one or more tools to make progress. Keep going until the task is fully done, \
+then call `validate`.
 
 # How the loop works
-- You are given the task and a plain-English account of the actions you have \
-already taken and what each returned.
-- Each turn, output a JSON ARRAY of one or more actions, each of the form \
-{{"tool": <tool name>, "args": {{ ... }}}}. The actions run in order.
-- Batch several actions in one turn when they are independent or you are confident \
-of the outcome (e.g. write a file then read it back). Emit a single action when \
-you must see its result before deciding the next move.
-- You may emit at most {max_actions} actions in a single turn.
-- Output nothing except that JSON array. Do not invent tools or parameters. \
-Only use the tools listed below.
-- After your actions run you will see each result described in the account. Use it \
-to decide your next turn. If an action returns an error, adapt — do not repeat the \
-same failing call.
-- When you believe the task is complete, end with a `validate` action and a short \
-summary of what you accomplished. A validator will check your work: if it agrees, \
-the run ends; if not, you will be told what is still missing — fix it and validate \
-again. Do not call `validate` until you have genuinely attempted the whole task.
+- Each turn, output a JSON ARRAY of one or more actions of the form \
+{{"tool": <name>, "args": {{...}}}}; they run in order. Output only that array — \
+no prose. Use only the tools listed below.
+- Batch independent or predictable actions in one turn (e.g. write a file then read \
+it back); emit a single action when you must see its result before deciding. You may \
+emit at most {max_actions} actions per turn.
+- Each action's result is added to the account. Use it to decide your next turn. On \
+an error, adapt — never repeat the same failing call.
+- When the task is genuinely done, end your turn with `validate` plus a short \
+summary. A validator checks your work: if it agrees the run ends; otherwise you get \
+feedback on what is missing — fix it and validate again.
 
 # Tools
 {docs}
 
-# Action schema
-Your output each turn must validate against this JSON schema (an array of actions):
-{schema}
-
 # Guidance
-- The user's task is given to you verbatim. Treat it as the exact ground truth: do \
-not paraphrase, summarize, invent, or drift from it, even after long reasoning. \
-Re-read the task before deciding each action.
-- Prefer the simplest tool that accomplishes the step.
-- Verify your work before validating (e.g. after writing a file, read it back).
-- Use relative paths unless an absolute path is required.
+- Treat the task as exact ground truth: do not paraphrase, invent, or drift from it. \
+Re-read it before each action.
+- Prefer the simplest tool for the step; use relative paths unless an absolute one \
+is required.
+- Verify before validating (e.g. read a file back after writing it).
 """
 
 
@@ -60,9 +53,7 @@ class SystemPromptBuilder:
         self._max_actions = max_actions_per_turn
 
     def build(self, task: str = "", workspace: str = "") -> str:
-        limit = self._max_actions if self._max_actions > 0 else None
-        schema = json.dumps(self._registry.action_schema(max_items=limit), indent=2)
-        body = _SYSTEM_TEMPLATE.format(docs=self._registry.docs(), schema=schema,
+        body = _SYSTEM_TEMPLATE.format(docs=self._registry.docs(),
                                        max_actions=self._max_actions)
         header = ""
         if task:

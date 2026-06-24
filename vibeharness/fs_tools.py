@@ -34,7 +34,7 @@ class ReadTracker:
 
 class ListDirectoryTool(Tool):
     name = "list_directory"
-    description = "List the files and sub-folders inside a directory."
+    description = "List the files and sub-folders in a directory."
 
     def __init__(self, fs: FileSystem, obs_limit: int):
         self._fs, self._limit = fs, obs_limit
@@ -43,7 +43,7 @@ class ListDirectoryTool(Tool):
     def parameters(self):
         return [
             Param("path", "string", "Directory to list.", required=False, default="."),
-            Param("recursive", "boolean", "List nested contents too.", required=False, default=False),
+            Param("recursive", "boolean", "Also list nested contents.", required=False, default=False),
         ]
 
     def run(self, args: dict) -> ToolResult:
@@ -129,7 +129,7 @@ class WriteFileTool(Tool):
     def parameters(self):
         return [
             Param("path", "string", "Path of the file to write."),
-            Param("content", "string", "The text to write."),
+            Param("content", "string", "Text to write."),
             Param("mode", "string", "How to write the text.", required=False,
                   default="overwrite", enum=("overwrite", "append", "prepend")),
         ]
@@ -154,7 +154,7 @@ class WriteFileTool(Tool):
 
 class SearchTool(Tool):
     name = "search"
-    description = ("Search for text inside files, for file names, or both, under a directory.")
+    description = "Search a directory for text inside files, for file names, or both."
 
     def __init__(self, fs: FileSystem, obs_limit: int):
         self._fs, self._limit = fs, obs_limit
@@ -162,11 +162,11 @@ class SearchTool(Tool):
     @property
     def parameters(self):
         return [
-            Param("query", "string", "Text or filename pattern to look for."),
+            Param("query", "string", "Text or filename pattern to find."),
             Param("path", "string", "Directory to search under.", required=False, default="."),
             Param("target", "string", "What to match.", required=False, default="content",
                   enum=("content", "filename", "both")),
-            Param("max_results", "integer", "Maximum matches to return.", required=False, default=50),
+            Param("max_results", "integer", "Max matches to return.", required=False, default=50),
         ]
 
     def run(self, args: dict) -> ToolResult:
