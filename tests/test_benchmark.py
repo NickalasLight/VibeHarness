@@ -7,41 +7,18 @@ validator that always passes, so the whole harness — fresh temp workdir, task
 setup, agent loop, and the deterministic ``check`` — is exercised with no Ollama
 server and no network.
 """
-import json
 import unittest
 
 from vibeharness.config import Config
-from vibeharness.llm import Decision, LLMClient
-from vibeharness.validation import Validator, Verdict
 
 from benchmarks.tasks import TASKS, get_tasks
 from benchmarks.runner import BenchmarkRunner, available_codecs, main
 
-
-# --------------------------------------------------------------------------- #
-# Scripted fakes (no model / no network).
-# --------------------------------------------------------------------------- #
-class ScriptedClient(LLMClient):
-    """Replays a fixed list of actions as the model's decisions. Each action is a
-    dict/list serialised to the codec's JSON wire format. Once the script runs out
-    it repeats the last action, so the loop can still reach its step budget."""
-
-    def __init__(self, actions):
-        self._actions = actions
-        self._i = 0
-
-    def decide(self, system, user, constraint, on_reason=None, on_action=None):
-        action = self._actions[min(self._i, len(self._actions) - 1)]
-        self._i += 1
-        payload = action if isinstance(action, str) else json.dumps(action)
-        return Decision(reasoning="", action_json=payload)
-
-
-class PassValidator(Validator):
-    """A validator stub that always approves (so the agent's validate() finishes)."""
-
-    def validate(self, task, history, claim, on_reason=None, on_action=None):
-        return Verdict(True, "stub: accepted")
+# Shared scripted fakes (no model / no network) — one canonical copy in
+# tests/_fakes.py. FakeLLMClient streams nothing by default and repeats its last
+# scripted action once exhausted; FakeValidator(passed=True) always approves.
+from tests._fakes import FakeLLMClient as ScriptedClient
+from tests._fakes import FakeValidator as PassValidator
 
 
 VALIDATE = {"tool": "validate", "args": {"summary": "done"}}

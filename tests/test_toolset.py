@@ -37,16 +37,15 @@ class ToolsetCatalogTest(unittest.TestCase):
             ToolsetCatalog([_StubToolset(), _StubToolset()])
 
     def test_build_registry_merges_selected_toolsets_plus_core(self):
+        # The toolset-specific behaviour under test is the MERGE: fs + web tools
+        # plus the always-injected `validate` core tool end up in one registry.
+        # (The action-schema SHAPE that results is owned by test_registry_schema.)
         catalog = default_catalog()
         registry = catalog.build_registry(catalog.select(["fs", "web"]), self.config)
         names = set(registry.names())
         self.assertIn("read_file", names)   # from fs
         self.assertIn("browse", names)      # from web
         self.assertIn("validate", names)    # core, injected into every registry
-        # the merged action schema covers tools from both toolsets + validate
-        consts = {b["properties"]["tool"]["const"]
-                  for b in registry.action_schema()["items"]["oneOf"]}
-        self.assertTrue({"read_file", "browse", "validate"} <= consts)
 
 
 if __name__ == "__main__":

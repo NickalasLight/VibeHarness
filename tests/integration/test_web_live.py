@@ -17,7 +17,8 @@ from __future__ import annotations
 import re
 import shutil
 import unittest
-import urllib.request
+
+import pytest
 
 from vibeharness.web import BrowseTool, PlaywrightCli, WebToolset
 from vibeharness.config import Config
@@ -26,20 +27,7 @@ BASE = "http://localhost:3000"
 CAREERS = BASE + "/careers/senior-net-engineer-dallas-tx-FT-2024-8842"
 
 
-def _server_up() -> bool:
-    try:
-        with urllib.request.urlopen(BASE, timeout=2):
-            return True
-    except Exception:
-        return False
-
-
-def _cli_available() -> bool:
-    return shutil.which("playwright-cli") is not None
-
-
-@unittest.skipUnless(_cli_available() and _server_up(),
-                     "needs playwright-cli + the demo app at localhost:3000")
+@pytest.mark.needs_web
 class WebLiveTest(unittest.TestCase):
     SESSION = "vibe-itest"
 
@@ -131,7 +119,8 @@ class WebLiveTest(unittest.TestCase):
         self.assertIn("url", res.observation)
 
 
-@unittest.skipUnless(_cli_available(), "needs playwright-cli installed")
+@unittest.skipUnless(shutil.which("playwright-cli") is not None,
+                     "needs playwright-cli installed")
 class WebToolsetPrereqTest(unittest.TestCase):
     def test_prerequisites_satisfied_when_cli_present(self):
         self.assertEqual(WebToolset().check_prerequisites(), [])
