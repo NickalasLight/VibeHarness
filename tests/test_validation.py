@@ -26,6 +26,26 @@ class ValidatorTest(unittest.TestCase):
         v = LLMValidator(ScriptedClient("not json at all")).validate("t", "h", "c")
         self.assertFalse(v.passed)
 
+    def test_validator_passes_a_decode_constraint_not_a_raw_schema(self):
+        # Regression (#13): the codec seam changed LLMClient.decide to take a
+        # DecodeConstraint. LLMValidator must wrap VERDICT_SCHEMA, not pass the raw
+        # dict — passing the dict crashed the real OllamaClient with
+        # "AttributeError: 'dict' object has no attribute 'stop'" on every validate.
+        from vibeharness.codec import DecodeConstraint
+        from vibeharness.llm import Decision, LLMClient
+        from vibeharness.validation import VERDICT_SCHEMA
+
+        captured = {}
+
+        class RecordingClient(LLMClient):
+            def decide(self, system, user, constraint, on_reason=None, on_action=None):
+                captured["constraint"] = constraint
+                return Decision(reasoning="", action_json='{"verdict":"pass","reason":"ok"}')
+
+        LLMValidator(RecordingClient()).validate("t", "h", "c")
+        self.assertIsInstance(captured["constraint"], DecodeConstraint)
+        self.assertEqual(captured["constraint"].json_schema, VERDICT_SCHEMA)
+
     def test_validator_prompt_includes_task_history_and_claim(self):
         client = ScriptedClient('{"verdict":"pass","reason":"ok"}')
         LLMValidator(client).validate("ORIGINAL TASK", "AGENT HISTORY", "AGENT CLAIM")
