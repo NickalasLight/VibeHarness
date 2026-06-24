@@ -174,10 +174,23 @@ auto-match, it leaves the list OPEN so the options appear in the next snapshot f
 click — strictly better than the old hard failure. +3 matcher tests; web suite 64, full suite 552.
 Commit: `feat(#125): select_option drives custom comboboxes (open + click option)`.
 
-### Iteration 9 — IN PROGRESS
-Re-run with combobox support. Watching for: does select_option on the State field now open the
-list / select TX (or at least open it so the model can click the option)? Any progress past the
-State field. (Multi-step nav remains a model-ceiling limit, documented separately.)
+### Iteration 9 — DONE (task bwta1fjjq) — REGRESSION: open_browser called 63x (my own exemption bug)
+The combobox fix couldn't be exercised: the model called **`open_browser` 63 times** and never
+reached `goto`/the form (0 fills, 0 steers). Root cause was MY anti-loop exemption list: I had
+exempted `goto`/`open_browser`/`navigate_back` from the guard, so the open_browser loop was never
+steered — and each `open_browser` resets the page to blank (destructive). Run-to-run variance
+turned a normal turn-1 open into a 63-turn catastrophe with nothing to stop it.
+
+**Fix applied (`agent.py`):** the exempt set is now ONLY `{navigate_back, navigate_forward}` —
+tools whose repeat ADVANCES state. `open_browser` / `goto`(same URL) / `reload` reset state on
+repeat, so identical repeats are now steered. (goto with a DIFFERENT url is a different signature
+and still runs.) +1 test locking the exemption set; agent suite 18 passed. Commit: `fix(#125):
+only exempt advancing-navigation from the anti-loop guard (open_browser loop)`.
+
+### Iteration 10 — IN PROGRESS
+Re-run. Watching for: open_browser loop is now steered after 1 call → model proceeds to goto +
+form; combobox fix finally gets exercised on the State field; field-fill progress resumes
+(expect ~5-8 fields like iters 6/8). This iteration also re-confirms the combobox path.
 
 ## Current status
-RUNNING iteration 9 (3-min cap, max-steps 0). Awaiting completion notification.
+RUNNING iteration 10 (3-min cap, max-steps 0). Awaiting completion notification.

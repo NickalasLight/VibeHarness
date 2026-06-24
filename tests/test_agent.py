@@ -127,6 +127,15 @@ class AgentLoopTest(unittest.TestCase):
         self.assertEqual(tool.calls, 1)  # the failed action was not retried
         self.assertIn("already FAILED", result.transcript())
 
+    def test_loop_guard_exemption_only_advancing_navigation(self):
+        # #125 iter 9: open_browser / goto reset state on repeat -> must be guarded
+        # (signature returned). Only navigate_back/forward advance on repeat -> exempt.
+        agent = self._agent([VALIDATE])
+        self.assertIsNone(agent._action_signature("navigate_back", {}))
+        self.assertIsNone(agent._action_signature("navigate_forward", {}))
+        self.assertIsNotNone(agent._action_signature("open_browser", {}))
+        self.assertIsNotNone(agent._action_signature("goto", {"url": "u"}))
+
     def test_anti_loop_allows_different_args(self):
         # Same tool with DIFFERENT args is a different action and must still run.
         actions = [

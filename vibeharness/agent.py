@@ -365,9 +365,13 @@ class RalphAgent:
                    f"Keep working to address this, then call validate again.")
             self._record(turn, Action("validate", args, obs, ok=False), memory)
 
-    # Tools whose identical repeat can be legitimate (a real reload / (re)open / back
-    # navigation), so they are EXEMPT from the anti-loop dedup guard.
-    _LOOP_EXEMPT_TOOLS = frozenset({"goto", "open_browser", "navigate_back"})
+    # Only tools whose identical repeat ADVANCES state (each call goes one step further)
+    # are EXEMPT from the anti-loop guard. open_browser / goto(same URL) / reload do NOT
+    # advance on repeat — they RESET (a fresh blank page, or a reload that wipes a
+    # half-filled form), so an identical repeat is a destructive loop and MUST be steered.
+    # (#125 iter 9: the model called open_browser 63x because it was exempt; each call
+    # reset the page to blank and never reached `goto`.)
+    _LOOP_EXEMPT_TOOLS = frozenset({"navigate_back", "navigate_forward"})
 
     def _action_signature(self, tool_name: str | None, args: dict) -> str | None:
         """A stable signature for an executed action, or ``None`` if this tool is exempt
