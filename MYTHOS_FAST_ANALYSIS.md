@@ -92,6 +92,45 @@ is the default codec, so the re-run can A/B `json` vs `hermes` directly.
 wall-clock seconds, and from saved transcripts — tool-call success and format adherence (did
 the model emit parseable actions in the codec's wire format).
 
+#### #105 three-way alignment sweep — STATUS: NOT COMPLETED (compute-bound)
+
+The #105 alignment (the `hermes` codec + `<tools>` seam + defaults) is implemented,
+unit-tested, and committed. The validating benchmark was set up to compare three configs on
+the file-op ladder, but **did not finish in the available wall-clock budget** and was
+stopped:
+
+| config | model | codec | tool defs | status |
+|---|---|---|---|---|
+| (a) baseline | base VibeThinker | `json` | Markdown docs | partial — 2/7 tasks ran |
+| (b) old contract | mythos_fast | `json` | Markdown docs | not reached |
+| (c) **aligned target** | mythos_fast | **`hermes`** | **`<tools>` schemas** | not reached |
+
+On this 8 GB card the base VibeThinker run alone averaged ~5–11 min/task (long `<think>`
+chains, single GPU runner), so a full 3-config × 7-task sweep is multi-hour; only config (a)
+partially ran (tasks 1–2 PASS) before the run was halted. **No conclusive (c)-vs-(a)/(b)
+numbers were obtained — the alignment payoff is implemented but NOT yet empirically proven.**
+
+The validation tooling is ready for a budgeted re-run: `bench_results/run_sweep.sh` (3-config
+driver), `bench_results/analyze.py` (derives format-adherence + tool-call-success from saved
+transcripts), `bench_results/build_table.py` (consolidated results table). `bench_results/`
+is git-ignored, so these helpers live only in the worktree.
+
+What WAS verified offline (deterministic, no model): the `hermes` system prompt renders the
+`<tools>` OpenAI-nested function-schema block in place of the Markdown `### tool` docs (the
+highest-leverage change the card flags) plus the `<tool_call>{"name","arguments"}` output
+instructions; and the codec round-trips single / multiple / missing-close-tag / malformed
+`<tool_call>` blocks (`tests/test_codec_hermes.py`, full suite 506 green).
+
+**Follow-up to close the acceptance gate:** re-run the 3-way sweep with a larger time budget
+(or fewer tasks / smaller benchmark `reason_tokens`) and fill in the pass-rate / format-
+adherence / turn-efficiency numbers, confirming whether (c) beats (a) and (b).
+
+| config | pass rate | format adherence | tool-call success | total turns | time(s) |
+|---|---|---|---|---|---|
+| (a) base VibeThinker + json | _pending re-run_ | _pending_ | _pending_ | _pending_ | _pending_ |
+| (b) mythos_fast + json (old contract) | _pending re-run_ | _pending_ | _pending_ | _pending_ | _pending_ |
+| (c) mythos_fast + hermes + `<tools>` (aligned) | _pending re-run_ | _pending_ | _pending_ | _pending_ | _pending_ |
+
 ### A.3 Deferred: ashley WEB task
 
 DEFERRED per task instructions. The browser daemon is currently buggy (#101 / #75 in
