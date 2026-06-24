@@ -15,7 +15,7 @@ def _truncate(text: str, limit: int) -> str:
 
 class ListDirectoryTool(Tool):
     name = "list_directory"
-    description = "List the files and sub-folders inside a directory."
+    description = "List the files and sub-folders in a directory."
 
     def __init__(self, fs: FileSystem, obs_limit: int):
         self._fs, self._limit = fs, obs_limit
@@ -24,7 +24,7 @@ class ListDirectoryTool(Tool):
     def parameters(self):
         return [
             Param("path", "string", "Directory to list.", required=False, default="."),
-            Param("recursive", "boolean", "List nested contents too.", required=False, default=False),
+            Param("recursive", "boolean", "Also list nested contents.", required=False, default=False),
         ]
 
     def run(self, args: dict) -> ToolResult:
@@ -39,7 +39,7 @@ class ListDirectoryTool(Tool):
 
 class ReadFileTool(Tool):
     name = "read_file"
-    description = "Read the full text contents of a file."
+    description = "Read the full text content of a file."
 
     def __init__(self, fs: FileSystem, obs_limit: int):
         self._fs, self._limit = fs, obs_limit
@@ -59,8 +59,8 @@ class ReadFileTool(Tool):
 
 class WriteFileTool(Tool):
     name = "write_file"
-    description = ("Write text to a file, creating it (and any parent folders) if needed. "
-                   "Use the mode parameter to overwrite, append, or prepend.")
+    description = ("Write text to a file, creating it and any parent folders if needed. "
+                   "Set `mode` to overwrite, append, or prepend.")
 
     def __init__(self, fs: FileSystem):
         self._fs = fs
@@ -69,7 +69,7 @@ class WriteFileTool(Tool):
     def parameters(self):
         return [
             Param("path", "string", "Path of the file to write."),
-            Param("content", "string", "The text to write."),
+            Param("content", "string", "Text to write."),
             Param("mode", "string", "How to write the text.", required=False,
                   default="overwrite", enum=("overwrite", "append", "prepend")),
         ]
@@ -87,7 +87,7 @@ class WriteFileTool(Tool):
 
 class SearchTool(Tool):
     name = "search"
-    description = ("Search for text inside files, for file names, or both, under a directory.")
+    description = "Search a directory for text inside files, for file names, or both."
 
     def __init__(self, fs: FileSystem, obs_limit: int):
         self._fs, self._limit = fs, obs_limit
@@ -95,11 +95,11 @@ class SearchTool(Tool):
     @property
     def parameters(self):
         return [
-            Param("query", "string", "Text or filename pattern to look for."),
+            Param("query", "string", "Text or filename pattern to find."),
             Param("path", "string", "Directory to search under.", required=False, default="."),
             Param("target", "string", "What to match.", required=False, default="content",
                   enum=("content", "filename", "both")),
-            Param("max_results", "integer", "Maximum matches to return.", required=False, default=50),
+            Param("max_results", "integer", "Max matches to return.", required=False, default=50),
         ]
 
     def run(self, args: dict) -> ToolResult:
@@ -117,8 +117,8 @@ class SearchTool(Tool):
 
 class ManagePathTool(Tool):
     name = "manage_path"
-    description = ("Manage files and folders: create a directory, delete a file/folder, "
-                   "or move/rename a path. Choose with the action parameter.")
+    description = ("Create a directory, delete a file/folder, or move/rename a path. "
+                   "Pick with `action`.")
 
     def __init__(self, fs: FileSystem):
         self._fs = fs
@@ -128,8 +128,8 @@ class ManagePathTool(Tool):
         return [
             Param("action", "string", "Operation to perform.",
                   enum=("make_directory", "delete", "move")),
-            Param("path", "string", "Target path (source path for a move)."),
-            Param("destination", "string", "New path. Required when action is 'move'.",
+            Param("path", "string", "Target path (the source for a move)."),
+            Param("destination", "string", "New path. Required for 'move'.",
                   required=False),
         ]
 

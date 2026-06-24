@@ -24,12 +24,24 @@ class PromptTest(unittest.TestCase):
         catalog = default_catalog()
         self.registry = catalog.build_registry(catalog.select(["fs"]), Config())
 
-    def test_system_prompt_contains_tools_and_schema(self):
+    def test_system_prompt_lists_tools(self):
         sp = SystemPromptBuilder(self.registry).build()
         self.assertIn("write_file", sp)
         self.assertIn("validate", sp)
-        self.assertIn("Action schema", sp)
-        self.assertIn("oneOf", sp)
+
+    def test_system_prompt_renders_every_tool_name_and_description(self):
+        sp = SystemPromptBuilder(self.registry).build()
+        for tool in self.registry.all():
+            self.assertIn(tool.name, sp, f"tool name {tool.name!r} missing from system prompt")
+            self.assertIn(tool.description, sp,
+                          f"description of {tool.name!r} missing from system prompt")
+
+    def test_system_prompt_omits_redundant_json_schema(self):
+        # The action schema is enforced by the decoder's `format` grammar, so it is
+        # deliberately not re-printed in the prompt.
+        sp = SystemPromptBuilder(self.registry).build()
+        self.assertNotIn("Action schema", sp)
+        self.assertNotIn("oneOf", sp)
 
     def test_system_prompt_anchors_task_at_front(self):
         sp = SystemPromptBuilder(self.registry).build("DO THE THING")
