@@ -7,8 +7,8 @@ clicks, and content extraction all share state.
 Each basic browser operation the CLI supports is its own ``Tool`` subclass
 (``goto``, ``click``, ``fill``, ``type``, ``press_key``, ``select_option``,
 ``hover``, ``navigate_back``, …) — see :class:`WebToolset`. There is
-deliberately NO ``evaluate``/JS tool: the limited agent accomplishes web tasks
-using only these discrete subtools, never by executing arbitrary JavaScript. This
+An ``evaluate`` tool allows the agent to run read-only JS to inspect an element
+(e.g. its tagName, type, or option list) before choosing how to interact. This
 replaces the old monolithic ``browse(action=...)`` dispatcher: every operation is
 now its own named tool with its own typed parameters and description, so the model
 chooses a tool the same way it chooses ``read_file`` vs ``write_file``.
@@ -941,6 +941,64 @@ class ReloadTool(_WebTool):
         return ["reload"]
 
 
+class EvaluateTool(_WebTool):
+    """Run JavaScript on the page (or on one element) to inspect its state.
+
+    Use this when you need to understand what kind of element a ref points to before
+    deciding which interaction tool to use — e.g. inspect whether a combobox is a
+    native <select> or a custom widget, read its current value, list its <option>
+    children, or check a data attribute. Returns the JavaScript return value as text.
+    Does NOT modify the page. Never use it to set values — use fill/select_option/click.
+    """
+
+    name = "evaluate"
+    description = (
+        "Run a JavaScript snippet on the page (or on a specific element) to inspect "
+        "its state. Use to identify element types, list dropdown options, read current "
+        "values, or check attributes before choosing the right interaction tool. "
+        "Example: expression='el => el.tagName + \" \" + el.type' with target='e6' "
+        "inspects element e6. Without a target, the expression runs on the whole page "
+        "(use 'document.title' or 'document.readyState' etc.). "
+        "Does NOT modify the page."
+    )
+    _verb = "evaluated JS on"
+
+    @property
+    def parameters(self):
+        return [
+            Param("expression", "string",
+                  "JavaScript expression or arrow function to evaluate. "
+                  "If target is given, the function receives the DOM element as its first "
+                  "argument: 'el => el.tagName'. Without a target, it runs on the page "
+                  "as a plain expression: 'document.title'."),
+            Param("target", "string",
+                  "Optional element ref (e.g. 'e6') from the current snapshot to pass "
+                  "to the expression as the first argument. Omit to run on the whole page.",
+                  required=False),
+        ]
+
+    def _subject(self, args):
+        return args.get("target") or "the page"
+
+    def _build(self, args):
+        parts = ["eval", args["expression"]]
+        if args.get("target"):
+            parts.append(args["target"])
+        return parts
+
+    def run(self, args: dict) -> ToolResult:
+        if "expression" not in args:
+            return ToolResult(False, "evaluate requires an 'expression' argument.")
+        ok, output = self._cli.run(*self._build(args))
+        subject = self._subject(args)
+        if not ok:
+            return ToolResult(False,
+                              f"you tried to evaluate JS on {subject} but it failed: "
+                              f"{self._trim(output)}")
+        return ToolResult(True,
+                          f"you evaluated JS on {subject}. Result:\n{self._trim(output)}")
+
+
 class OpenBrowserTool(_WebTool):
     """(Re)open the persistent browser session (issues #101, #75).
 
@@ -986,7 +1044,7 @@ _WEB_TOOL_CLASSES: tuple[type[_WebTool], ...] = (
     OpenBrowserTool,
     GotoTool, ClickTool, FillTool, TypeTool, PressKeyTool, SelectOptionTool,
     CheckTool, UncheckTool, HoverTool, DragTool, UploadTool,
-    ScreenshotTool, NavigateBackTool, NavigateForwardTool, ReloadTool,
+    EvaluateTool, ScreenshotTool, NavigateBackTool, NavigateForwardTool, ReloadTool,
 )
 
 

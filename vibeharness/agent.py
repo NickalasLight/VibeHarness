@@ -240,20 +240,26 @@ class RalphAgent:
                             continue
                         sig = self._action_signature(tool_name, args)
                         if sig is not None and sig in attempted:
-                            payload = json.dumps(args, ensure_ascii=False)
+                            target = args.get("target", "")
+                            value = args.get("text") or args.get("value") or ""
                             if attempted[sig]:
-                                obs = (f"you ALREADY did this exact action successfully earlier "
-                                       f"this run ({tool_name} {payload}); repeating it makes no "
-                                       f"progress. Do something DIFFERENT now — act on the NEXT "
-                                       f"field or element you have not handled yet, or advance the "
-                                       f"form (e.g. click a Next/Continue/Submit control).")
+                                obs = (f"WARNING: '{target}' was already successfully set to "
+                                       f"'{value}' earlier this run. You are now trying to set "
+                                       f"it to '{value}' again — the same value. This is a "
+                                       f"no-op: the field already holds that value. If you "
+                                       f"intended a different value, call {tool_name} with the "
+                                       f"corrected value instead. Otherwise move to the NEXT "
+                                       f"unfilled field or click Next/Continue/Submit.")
                             else:
-                                obs = (f"this exact action already FAILED earlier this run "
-                                       f"({tool_name} {payload}) and will fail the same way again. "
-                                       f"Do NOT repeat it — pick a DIFFERENT ref that actually "
-                                       f"appears in the current page snapshot, use a different tool, "
-                                       f"or advance the form. Never reuse a ref that is not in the "
-                                       f"snapshot.")
+                                obs = (f"WARNING: you already attempted {tool_name} on "
+                                       f"'{target}' (value: '{value}') and it FAILED. "
+                                       f"That element may be a dropdown, combobox, date picker, "
+                                       f"file upload, or other non-text component that does not "
+                                       f"accept a direct fill. Try a different approach: "
+                                       f"use select_option to choose from a list, click '{target}' "
+                                       f"to open it first, use evaluate to inspect what kind of "
+                                       f"element it is, or use press_key after clicking it. "
+                                       f"Do NOT call {tool_name} on '{target}' again.")
                             if handled_refs:
                                 obs += (" You have already successfully handled these refs: "
                                         f"{', '.join(sorted(handled_refs))} — pick a fillable/"

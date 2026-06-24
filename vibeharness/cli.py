@@ -88,8 +88,9 @@ current default temperature: {saved_temp}
     p.add_argument("--headless", action="store_true",
                    help="run the web browser headless (default: headed so you can watch)")
     p.add_argument("--advisor", action="store_true",
-                   help="enable VibeThinker advisor: every 5 Qwen turns inject a free-text "
-                        "hint from VibeThinker into the agent's user message (beta_qwen3coder)")
+                   help="enable self-advisor: every 5 Qwen turns inject a free-text hint "
+                        "from the advisor model (default: same model as base agent = Qwen "
+                        "self-advises). Set advisor_model in config to use a different model.")
     p.add_argument("--web-snapshot-prose", action="store_true",
                    help="render the live page snapshot as WebArena-style prose (pruned, "
                         "ref-keyed) instead of raw ARIA-YAML (issue #64; A/B seam)")
@@ -476,13 +477,15 @@ def _run_locked(args, task, config, registry, codec, names, workdir, logger,
     reporter.run_start(task, str(workdir), config)
     print(f" toolsets: {', '.join(names)} (+ validate)")
 
-    # Advisor: use model-swap mode (OLLAMA_MAX_LOADED_MODELS=1) so Qwen and VibeThinker
-    # take turns in VRAM rather than co-existing. With Q8_0 both models at 3.3 GB each
-    # plus KV caches would exceed 8 GB; swapping costs ~15-30s per advisor call but
-    # both models get the full card. ensure_single_runner_env uses setdefault so we
-    # must set this BEFORE OllamaClient is constructed.
+    # Advisor setup.
+    # When advisor_model is "" (default), Qwen self-advises — same model, one VRAM slot.
+    # When advisor_model names a different model (e.g. "vibethinker:latest"), use model-swap
+    # mode (OLLAMA_MAX_LOADED_MODELS=1): only one model in VRAM at a time; swapping costs
+    # ~15-30s per advisor call but avoids the 9.4 GB OOM on the 8 GB card.
     if config.advisor_enabled:
-        os.environ["OLLAMA_MAX_LOADED_MODELS"] = "1"
+        resolved_advisor = config.advisor_model or config.model
+        if resolved_advisor != config.model:
+            os.environ["OLLAMA_MAX_LOADED_MODELS"] = "1"
         advisor = VibeThinkerAdvisor(config)
     else:
         advisor = None

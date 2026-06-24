@@ -1,4 +1,4 @@
-"""VibeThinker Advisor — periodic free-text hint generator for the Qwen base agent.
+"""Periodic free-text hint advisor for the Qwen base agent.
 
 Every N Qwen turns the advisor is called with the task + the last N action turns and
 returns concise plain-English advice: what the agent is doing wrong, what to try next, etc.
@@ -6,11 +6,13 @@ returns concise plain-English advice: what the agent is doing wrong, what to try
 The advice is injected into the Qwen agent's next-turn user message as:
   <user_advice>The human user gives you the following hint: '...'</user_advice>
 
-VibeThinker is called with temperature=1.0 (Config.advisor_temperature) and NO constrained
-output schema — just free reasoning + plain-text continuation.  This is intentional: the
-advisor is a hint channel, not a decision maker.  Two-phase generation is used because
-VibeThinker always emits a <think> chain first; the continuation (phase 2, no JSON schema)
-is the actual advice text.
+When advisor_model is "" (default), the SAME model as the base agent is used — Qwen
+self-advises.  This avoids model-swap overhead and keeps only one model in VRAM.  Set
+advisor_model to "vibethinker:latest" to use VibeThinker as the advisor instead.
+
+The advisor always uses two_phase=False (single-phase, like the base Qwen): it speaks the
+same Hermes <tool_call> dialect but its output is treated as free text — the advisor just
+generates advice tokens and we take the raw output as the hint.
 """
 from __future__ import annotations
 
@@ -19,17 +21,23 @@ from dataclasses import replace
 
 from .config import Config
 from .llm import OllamaClient
-from .codec import DecodeConstraint
 
 _THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
 
 _SYSTEM = (
     "You are an expert web-form automation observer. "
-    "You watch an AI agent filling a job-application form and give it concise, direct advice. "
-    "State specifically: (1) what is going wrong or what progress has been made, "
-    "(2) what the agent should do NEXT to advance the form. "
-    "Be concrete — name field labels, actions, or problems. 2-5 sentences only. "
-    "Plain English. No JSON, no code, no lists."
+    "You watch an AI agent filling a job-application form and give it precise, investigative advice.\n\n"
+    "ADVICE PRINCIPLES:\n"
+    "1. Observe before concluding. Do not assume you know why something failed — "
+    "ask the agent to investigate first using evaluate or screenshot to confirm the element type.\n"
+    "2. Reason from evidence. Cite specific turn numbers, tool names, element refs, "
+    "or observed output when making a diagnosis.\n"
+    "3. Prioritise the next concrete action. After any investigation, name the next tool "
+    "and target the agent should use — don't leave it open-ended.\n"
+    "4. Distinguish stuck from done. Check whether fields already filled still need attention "
+    "or whether the agent should move on to unfilled fields or page navigation.\n"
+    "5. Be concise. 2-5 plain-English sentences. No JSON, no code blocks, no bullet lists. "
+    "Speak directly to the agent as 'you'."
 )
 
 
@@ -102,22 +110,30 @@ class VibeThinkerAdvisor:
     """
 
     def __init__(self, config: Config) -> None:
+        # Resolve empty advisor_model to the base model (Qwen self-advising).
+        # Empty string = same model as the base agent; this keeps only one model in VRAM
+        # and avoids model-swap overhead.  Explicit model name = use that model instead
+        # (e.g. "vibethinker:latest" for the VibeThinker advisor — requires model-swap).
+        resolved_model = config.advisor_model or config.model
+        self._self_advising = (resolved_model == config.model)
         # num_ctx=4096: the advisor only sees ~5 turns of history (~1-2k tokens).
-        # Cutting from 32768 → 4096 saves ~1.2 GB of KV-cache VRAM on the advisor model,
-        # allowing it to co-exist with Q8_0 Qwen via OLLAMA_MAX_LOADED_MODELS=1 (swap).
+        # Cutting from 32768 → 4096 saves ~1.2 GB of KV-cache VRAM on a separate advisor
+        # model.  When self-advising, Qwen is already loaded so ctx size matters less, but
+        # we keep it small so the advisor call is fast (short prompt → quick response).
         advisor_cfg = replace(
             config,
-            model=config.advisor_model,
+            model=resolved_model,
             temperature=config.advisor_temperature,
             action_temperature=config.advisor_temperature,
-            reason_tokens=1024,   # advisor reasoning cap (shorter CoT — advice is simple)
+            reason_tokens=1024,   # advisor reasoning cap
             action_tokens=512,    # advice text cap
-            two_phase=True,       # VibeThinker must reason before answering
-            num_ctx=4096,         # small ctx: saves ~1.2 GB VRAM vs 32768
+            two_phase=False,      # Qwen is single-phase; VibeThinker callers set two_phase=True
+            num_ctx=4096,         # small ctx: fast + low VRAM
         )
         self._client = OllamaClient(advisor_cfg)
         self._interval = config.advisor_interval
-        print(f"[advisor] VibeThinkerAdvisor active — model={config.advisor_model} "
+        mode = "self-advising" if self._self_advising else f"model={resolved_model}"
+        print(f"[advisor] active — {mode} "
               f"temp={config.advisor_temperature} every={config.advisor_interval} turns "
               f"ctx=4096",
               flush=True)
@@ -127,13 +143,17 @@ class VibeThinkerAdvisor:
         history = format_turns_for_advisor(turns, self._interval)
         system = _SYSTEM
         user = _build_user(task, history)
-        print("\n[advisor] calling VibeThinker for advice...", flush=True)
-        # Two-phase: phase 1 = free <think> reasoning (discarded), phase 2 = advice text.
-        reasoning = self._client._reason(system, user, on_token=None)
-        advice = self._client._act(system, user, reasoning,
-                                   DecodeConstraint(json_schema=None), on_token=None)
-        # Strip any leaked <think> tags from phase-2 text (defensive).
+        label = "self" if self._self_advising else "advisor"
+        print(f"\n[advisor] calling {label} model for advice...", flush=True)
+        # Single-phase: one /api/chat call, free-text output (no JSON schema constraint).
+        # The advisor is Qwen (or another single-phase model), not VibeThinker, so we use
+        # _reason() with a no-stop constraint — it generates the advice text directly.
+        advice = self._client._reason(system, user, on_token=None)
+        # Strip any Hermes tool-call blocks or <think> tags that may appear.
         advice = _THINK_RE.sub("", advice).strip()
+        advice = _TOOL_CALL_RE.sub("", advice).strip()
+        if not advice:
+            advice = "(no advice generated)"
         print(f"[advisor] hint: {advice[:120]}{'...' if len(advice) > 120 else ''}",
               flush=True)
         return advice

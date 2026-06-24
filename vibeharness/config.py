@@ -177,10 +177,12 @@ class Config:
     web_browser: str = "chrome"
 
     # VibeThinker advisor — periodic free-text hint injector (beta_qwen3coder only).
-    # When advisor_enabled=True, every advisor_interval Qwen turns VibeThinker is called
+    # When advisor_enabled=True, every advisor_interval Qwen turns an advisor model is called
     # (free-text, no schema) and its advice is injected into Qwen's next turn user message
-    # as <user_advice>...</user_advice>. Requires OLLAMA_MAX_LOADED_MODELS=2.
-    advisor_model: str = "vibethinker:latest"
+    # as <user_advice>...</user_advice>.
+    # Empty string means "same model as the base agent" (Qwen self-advises, one model in VRAM).
+    # Set to "vibethinker:latest" to use VibeThinker as the advisor (requires model-swap mode).
+    advisor_model: str = ""
     advisor_temperature: float = 1.0   # high diversity for advice
     advisor_interval: int = 5          # call advisor every N Qwen turns
     advisor_enabled: bool = False      # opt-in; set True via CLI or settings
