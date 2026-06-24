@@ -43,3 +43,37 @@ class ToolRegistry:
 
     def docs(self) -> str:
         return "\n\n".join(t.doc() for t in self._tools.values())
+
+    def tools_block(self, style: str = "hermes") -> str:
+        """A tool-definition block in an ALTERNATIVE wire style (issue #105).
+
+        The default Markdown rendering lives in :meth:`docs`; this is the seam a
+        codec uses when the model was fine-tuned to read tool definitions in a
+        non-Markdown shape. ``style="hermes"`` emits the Qwen2.5 / Hermes
+        ``<tools>...</tools>`` block: one OpenAI-nested function schema per line —
+        ``{"type":"function","function":{"name",description","parameters":<args schema>}}``
+        — built from each tool's ``_args_schema()`` (the SAME parameter source the
+        JSON-schema constraint uses, so the two can never drift). This is the exact
+        tool-definition format mythos_fast's embedded template renders, and the card
+        states tool-use performance "depends heavily" on it.
+
+        Open/closed: adding a style adds a branch here; the existing ``docs()``
+        Markdown path and the other codecs are untouched.
+        """
+        if style == "hermes":
+            import json
+
+            lines = ["<tools>"]
+            for t in self._tools.values():
+                fn = {
+                    "type": "function",
+                    "function": {
+                        "name": t.name,
+                        "description": t.description,
+                        "parameters": t._args_schema(),
+                    },
+                }
+                lines.append(json.dumps(fn, ensure_ascii=False))
+            lines.append("</tools>")
+            return "\n".join(lines)
+        raise ValueError(f"unknown tools_block style: {style!r}")

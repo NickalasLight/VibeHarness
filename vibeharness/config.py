@@ -6,7 +6,11 @@ from dataclasses import dataclass
 @dataclass(frozen=True)
 class Config:
     # model / sampling
-    model: str = "vibethinker"
+    # ISSUE #105 / branch beta_mythos_fast (ISOLATED): the default model on this line is
+    # the mythos_fast fine-tune, paired with the `hermes` codec below so the harness
+    # speaks the model's native trained dialect. (On `beta` the default is "vibethinker"
+    # + "json"; this branch never merges back, so these defaults stay local to it.)
+    model: str = "hf.co/Shadow0482/mythos_fast:Q6_K"
     temperature: float = 0.3          # phase-1 reasoning temperature (some diversity helps)
     action_temperature: float = 0.0   # phase-2 action: greedy, for verbatim string fidelity
     top_p: float = 0.95
@@ -30,7 +34,11 @@ class Config:
 
     # tool-call wire format (see vibeharness.codec.get_codec). "json" is the
     # decode-constrained baseline; other codecs add alternative formats.
-    codec: str = "json"
+    # ISSUE #105 (beta_mythos_fast): default to "hermes" — the native Qwen2.5/Hermes
+    # <tool_call>{"name","arguments"} format + <tools> function-schema definitions that
+    # mythos_fast was fine-tuned on, so the harness aligns to (and benefits from) the
+    # fine-tune. On `beta` this default is "json".
+    codec: str = "hermes"
 
     # context + per-turn token budgets.
     # num_ctx is the whole window (system prompt + history + generation share it).

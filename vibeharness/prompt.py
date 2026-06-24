@@ -106,8 +106,16 @@ class SystemPromptBuilder:
             tool_guidance = ""
             if self._guidance.strip():
                 tool_guidance = f"# Working with your tools\n{self._guidance.strip()}\n\n"
+            # The active codec may supply its own tool-definition rendering (issue
+            # #105): a Hermes/Qwen fine-tune reads tools as a <tools> function-schema
+            # block, not Markdown. Fall back to the registry's Markdown docs when the
+            # codec has no opinion (every codec but `hermes` returns None), so the other
+            # formats render exactly as before.
+            docs = self._codec.tool_definitions(self._registry)
+            if docs is None:
+                docs = self._registry.docs()
             body = _SYSTEM_TEMPLATE.format(
-                docs=self._registry.docs(),
+                docs=docs,
                 tool_guidance=tool_guidance,
                 format_instructions=self._codec.format_instructions(self._max_actions))
         header = ""
