@@ -1,0 +1,159 @@
+{
+  "_meta": {
+    "synthetic": true,
+    "description": "SYNTHETIC test fixture. Jason Statham is a fictional job applicant used to exercise the agent's job-application flow. Tailored to the FlashTec 'Senior .NET Engineer' posting (Dallas, TX). Do NOT use as real personal data.",
+    "tailoredToPosting": {
+      "jobId": "FT-2024-8842",
+      "title": "Senior .NET Engineer",
+      "company": "FlashTec",
+      "location": "Dallas, TX (Hybrid)",
+      "sourceUrl": "http://localhost:3000/careers/senior-net-engineer-dallas-tx-FT-2024-8842",
+      "applyPath": "/careers/senior-net-engineer-dallas-tx-FT-2024-8842/apply"
+    }
+  },
+
+  "firstName": "Jason",
+  "lastName": "Statham",
+  "fullName": "Jason Statham",
+  "email": "jason.statham.dev@example.com",
+  "phone": "+1 (214) 555-0199",
+
+  "addressLine1": "1820 McKinney Avenue, Apt 14C",
+  "addressLine2": "",
+  "city": "Dallas",
+  "state": "TX",
+  "postalCode": "75201",
+  "country": "United States",
+  "location": "Dallas, TX",
+
+  "linkedinUrl": "https://www.linkedin.com/in/jason-statham-dotnet",
+  "githubUrl": "https://github.com/jstatham-dev",
+  "portfolioUrl": "https://jstatham.dev",
+
+  "workAuthorization": "U.S. Citizen",
+  "requireSponsorship": "No",
+  "willingToRelocate": "No",
+  "workPreference": "Hybrid",
+  "availableStartDate": "2026-07-21",
+
+  "currentTitle": "Senior Software Engineer",
+  "currentCompany": "Lone Star Payments Inc.",
+  "totalExperienceYears": 9,
+  "dotnetExperienceYears": 9,
+  "salaryExpectation": "$165,000",
+
+  "highestDegree": "Bachelor of Science",
+  "school": "The University of Texas at Dallas",
+  "fieldOfStudy": "Computer Science",
+  "graduationDate": "2016-05",
+
+  "summary": "Senior .NET engineer with 9 years building high-throughput, low-latency payment and ledger systems in C# / .NET. Deep experience designing production ASP.NET Core Web APIs, modeling complex financial domains with Domain-Driven Design, and operating event-driven services on Azure. Comfortable owning features end-to-end from architecture through on-call, and mentoring mid-level engineers.",
+
+  "skills": [
+    "C#",
+    ".NET 8 / .NET Core",
+    "ASP.NET Core Web API",
+    "Domain-Driven Design (DDD)",
+    "Clean Architecture",
+    "SOLID principles",
+    "Microsoft SQL Server (schema design, query tuning, transactions)",
+    "Entity Framework Core",
+    "Dapper",
+    "Azure (App Services, Functions, AKS)",
+    "Docker / containerization",
+    "Kubernetes",
+    "Azure Service Bus",
+    "Apache Kafka",
+    "RabbitMQ",
+    "gRPC",
+    "xUnit / automated testing (unit, integration)",
+    "CI/CD (Azure DevOps, GitHub Actions)",
+    "Infrastructure-as-Code (Terraform, Bicep)",
+    "Observability (OpenTelemetry, Application Insights)"
+  ],
+
+  "certifications": [
+    "Microsoft Certified: Azure Developer Associate (AZ-204)",
+    "Microsoft Certified: Azure Solutions Architect Expert (AZ-305)"
+  ],
+
+  "workHistory": [
+    {
+      "title": "Senior Software Engineer",
+      "company": "Lone Star Payments Inc.",
+      "location": "Dallas, TX",
+      "startDate": "2021-03",
+      "endDate": "Present",
+      "current": true,
+      "highlights": [
+        "Designed and operate a fleet of C# / .NET 8 microservices processing 3M+ card and ACH transactions per day at sub-100ms p99 latency.",
+        "Re-architected the core ledger service using Domain-Driven Design, cutting reconciliation defects by 70% and enabling daily settlement at scale.",
+        "Built event-driven pipelines on Azure Service Bus and Kafka for real-time fraud scoring and double-entry posting.",
+        "Tuned SQL Server schemas and queries, reducing settlement batch time from 45 minutes to under 6.",
+        "Mentor four mid-level engineers; introduced clean-architecture and automated-testing standards adopted team-wide.",
+        "Share the on-call rotation for a five-nines payments platform."
+      ]
+    },
+    {
+      "title": "Software Engineer II",
+      "company": "Brazos Software Group",
+      "location": "Austin, TX",
+      "startDate": "2018-06",
+      "endDate": "2021-02",
+      "current": false,
+      "highlights": [
+        "Built and scaled ASP.NET Core Web APIs powering a B2B invoicing platform serving 12,000 merchants.",
+        "Migrated a legacy .NET Framework monolith to containerized .NET Core services deployed on Azure AKS.",
+        "Implemented gRPC inter-service contracts and high-performance serialization, halving internal call latency.",
+        "Established CI/CD pipelines in Azure DevOps with automated integration testing gates."
+      ]
+    },
+    {
+      "title": "Software Engineer",
+      "company": "Trinity Web Solutions",
+      "location": "Dallas, TX",
+      "startDate": "2016-07",
+      "endDate": "2018-05",
+      "current": false,
+      "highlights": [
+        "Developed C# / ASP.NET MVC features for client-facing logistics applications.",
+        "Designed normalized SQL Server schemas and authored tuned stored procedures.",
+        "Wrote xUnit test suites and helped raise team code-review standards."
+      ]
+    }
+  ],
+
+  "education": [
+    {
+      "degree": "Bachelor of Science in Computer Science",
+      "school": "The University of Texas at Dallas",
+      "location": "Richardson, TX",
+      "graduationDate": "2016-05",
+      "details": "GPA 3.7/4.0. Coursework in distributed systems, databases, and software engineering."
+    }
+  ],
+
+  "whyInterested": "FlashTec's bet on .NET, Azure, and event-driven architecture to move real money at five-nines reliability is exactly the problem space I have spent my career in. I want to bring my payments and ledger experience to a Dallas-based platform team where I can own high-throughput services end-to-end and mentor the next generation of engineers.",
+  "heardAboutUs": "Company careers page",
+  "referralName": "",
+
+  "voluntaryDisclosures": {
+    "note": "Synthetic placeholders only; left blank/decline as a real applicant might.",
+    "gender": "Decline to self-identify",
+    "ethnicity": "Decline to self-identify",
+    "veteranStatus": "I am not a protected veteran",
+    "disabilityStatus": "Decline to answer"
+  },
+
+  "certification": {
+    "certifyTrue": true,
+    "consentDataProcessing": true,
+    "signatureName": "Jason Statham",
+    "signed": true
+  },
+
+  "attachments": {
+    "resume": "jason_statham_resume.docx",
+    "coverLetter": "jason_statham_cover_letter.docx"
+  }
+}
