@@ -85,7 +85,7 @@ class RunLogger:
             # Diagnostics are a best-effort aid; never let a dump failure break the run.
             pass
 
-    def log_validator(self, *, task: str, history: str, claim: str,
+    def log_validator(self, *, context: str, history: str,
                       reasoning: str, passed: bool, reason: str,
                       model: str | None = None, config: Config | None = None) -> None:
         """Persist ONE validator invocation to its own file in this run's ``.vibe/``.
@@ -95,6 +95,11 @@ class RunLogger:
         verdict are lost from the on-disk record (issue #47). Each call writes its own
         ``validator_<guid>.json`` (``validator_`` marks the producer; the uuid4 hex
         guid guarantees no clobber when ``validate`` is called multiple times).
+
+        Issue #57: the validator no longer gets a self-claim. ``context`` is the
+        tool-less main system prompt (task + workspace + page snapshot) that the
+        validator actually judged from, recorded here so the on-disk record reflects
+        the richer evidence.
 
         Best-effort and exception-safe — exactly the contract of the #37 diagnostics
         dump: a logging failure must NEVER throw into the run, so every step is guarded
@@ -117,9 +122,8 @@ class RunLogger:
                     "top_k": config.top_k,
                 } if config is not None else None,
                 "inputs": {
-                    "task": task,
+                    "context": context,
                     "history": history,
-                    "claim": claim,
                 },
                 "reasoning": reasoning,
                 "verdict": {
