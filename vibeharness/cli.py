@@ -319,14 +319,20 @@ def _run_locked(args, task, config, registry, codec, names, workdir, logger,
     _safe_log(logger, task, config, RunResult(task=task))
     print(f" log: {logger.json_path}")
 
-    for ts in toolsets:
-        ts.setup(config)
+    # Setup is INSIDE the try so its teardown ALWAYS runs in the finally — even if a
+    # later toolset's setup raises after the web browser is already open, or the run
+    # body dies with an uncaught exception or Ctrl-C. Otherwise a crash between an
+    # opened browser and the agent run would leak the whole chrome/node tree (#15).
     try:
+        for ts in toolsets:
+            ts.setup(config)
         result = agent.run(task, on_turn=checkpoint)
     except OllamaUnavailable as e:
         print(f"\nerror: {e}", file=sys.stderr)
         return 1   # the start/streamed log on disk already holds the last known state
     finally:
+        # Reap every toolset, swallowing per-toolset errors, so one failing teardown
+        # never prevents the others (e.g. the web browser) from being torn down.
         for ts in reversed(toolsets):
             try:
                 ts.teardown(config)
