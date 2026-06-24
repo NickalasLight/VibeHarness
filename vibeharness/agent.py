@@ -36,6 +36,7 @@ from .memory import NarrativeMemory
 from .prompt import build_turn_prompt
 from .registry import ToolRegistry
 from .reporting import NullReporter, Reporter
+from .snapshot_budget import estimate_tokens, input_budget_tokens
 from .validation import Validator
 
 
@@ -142,10 +143,32 @@ class RalphAgent:
         # The tool-call codec owns the action wire format: the decode constraint
         # and how the raw payload is parsed back into (tool, args) pairs.
         self._codec = codec or get_codec("json")
+        # NATIVE stateful tool calling (issue #129/#130/#131). Active only when (a) the
+        # run opts in (config.native_tools), (b) the model is single-phase (the native
+        # path is for the non-thinking base agent, not VibeThinker's two-phase <think>
+        # flow), and (c) the codec actually speaks native tools (codec.tools() non-None —
+        # only ``hermes`` today). Otherwise we use the legacy single-message decide(),
+        # so json/xml/etc codecs and VibeThinker are completely unaffected.
+        self._native = bool(
+            getattr(config, "native_tools", False)
+            and not config.two_phase
+            and self._codec.tools(registry) is not None
+        )
+        # The native enveloped tool schemas, computed once (stateless). Sent in every
+        # native /api/chat request's ``tools:`` field so Ollama applies the model's own
+        # trained tool template. None when the native path is inactive.
+        self._tools = self._codec.tools(registry) if self._native else None
 
     def run(self, task: str, on_turn: Callable[["RunResult"], None] | None = None,
             advice_provider: Callable[[int], "str | None"] | None = None) -> RunResult:
         memory = NarrativeMemory()
+        # Stateful multi-turn message history (issue #129/#130/#131): the REAL
+        # user/assistant/tool messages exchanged this run, WITHOUT the system message
+        # (which is regenerated fresh each turn — it carries the live page snapshot — and
+        # prepended at request time). Empty and unused on the legacy single-message path.
+        # NarrativeMemory is kept in parallel: the advisor and the human-readable
+        # transcript read its prose; this list is the model's transport-level memory.
+        chat_history: list[dict] = []
         result = RunResult(task=task)
         limit = self._cfg.max_actions_per_turn
         constraint = self._codec.constraint(self._registry, limit)
@@ -186,7 +209,15 @@ class RalphAgent:
                 # context window with (issue #43 dynamic snapshot budget). Providers may
                 # be zero-arg (legacy: workspace-only refresh) or accept the user message;
                 # _build_system bridges both so older wirings keep working unchanged.
-                user = build_turn_prompt(task, memory.render(), self._codec.turn_action_hint())
+                # In NATIVE mode the real chat_history carries past turns, so the user
+                # message omits the prose narrative (which would duplicate the history and
+                # waste the window); it keeps the task reminder + action hint. In legacy
+                # mode the narrative is embedded as before.
+                if self._native:
+                    user = build_turn_prompt(task, "", self._codec.turn_action_hint())
+                else:
+                    user = build_turn_prompt(task, memory.render(),
+                                             self._codec.turn_action_hint())
                 # Inject advisor hint when available (injected by caller via advice_provider).
                 if advice_provider is not None:
                     hint = advice_provider(i)
@@ -194,7 +225,10 @@ class RalphAgent:
                         user += (f"\n\n<user_advice>The human user gives you the following "
                                  f"hint: '{hint}'</user_advice>")
                 system = self._build_system(user)
-                decision = self._decide(system, user, constraint)
+                if self._native:
+                    decision = self._decide_chat(system, chat_history, user, constraint)
+                else:
+                    decision = self._decide(system, user, constraint)
                 if decision is None:
                     # The turn exceeded its wall-clock generation budget. Record a
                     # failed turn so the abort is observable, then end gracefully.
@@ -223,7 +257,17 @@ class RalphAgent:
                     if preamble:
                         memory.record(f"you reasoned: {preamble[:400]}")
 
-                actions, error = self._codec.parse(decision.action_json)
+                # Prefer STRUCTURED tool_calls when Ollama parsed them (native path); the
+                # 3B model usually returns none and the call arrives as text, so fall back
+                # to the codec's tolerant parse() of the content. Either way we get
+                # (name, args) pairs and a possible error string.
+                if decision.tool_calls:
+                    actions = self._codec.parse_tool_calls(list(decision.tool_calls))
+                    error = None if actions else "structured tool_calls were empty/invalid"
+                    if error:  # fall back to parsing the text content
+                        actions, error = self._codec.parse(decision.action_json)
+                else:
+                    actions, error = self._codec.parse(decision.action_json)
                 if error is not None:
                     self._record(turn, Action(None, {}, f"your last response was invalid and "
                                               f"could not be run: {error}.", ok=False), memory)
@@ -308,6 +352,18 @@ class RalphAgent:
                             attempted[sig] = action.ok
                         if action.ok and isinstance(args.get("target"), str):
                             handled_refs.add(args["target"])
+
+                # NATIVE stateful history (issue #129/#130/#131): commit THIS turn to the
+                # real message history so the next turn's request replays it verbatim.
+                # We append the user turn, the assistant response, and one role:"tool"
+                # message per executed action (its observation) — exactly the shape
+                # Ollama's chat template feeds back via <tool_response>. Done here, after
+                # the action loop, so every observation recorded on the turn is captured.
+                # Then FIFO-evict the oldest non-system messages to stay within the token
+                # budget. Skipped on the legacy path (chat_history stays empty/unused).
+                if self._native:
+                    self._commit_turn_to_history(chat_history, user, decision, turn)
+                    self._evict_history(chat_history, system, user)
             except BaseException as exc:
                 # Failsafe: any unexpected mid-turn error (an uncaught tool/validator/
                 # decode exception, a KeyboardInterrupt, …) must NOT discard the work
@@ -406,6 +462,127 @@ class RalphAgent:
         if "error" in box:
             raise box["error"]
         return box["decision"]
+
+    def _decide_chat(self, system: str, chat_history: list[dict], user: str,
+                     constraint) -> Decision | None:
+        """Run one turn's NATIVE stateful decide_chat() call (issue #129/#130/#131).
+
+        Assembles the request messages as ``[system] + chat_history + [current user]``
+        and calls the client's native ``decide_chat`` with the enveloped tool schemas.
+        Mirrors :meth:`_decide` exactly for the wall-clock budget: inline when
+        ``turn_timeout_seconds <= 0``, else a joined daemon worker that returns ``None``
+        on overrun. The system message is rebuilt EACH turn (it carries the live page
+        snapshot), so it is sent fresh and is never stored in ``chat_history``."""
+        messages = [{"role": "system", "content": system}] + list(chat_history) + [
+            {"role": "user", "content": user}]
+
+        def call() -> Decision:
+            return self._client.decide_chat(
+                messages, self._tools, constraint,
+                on_reason=self._reporter.reasoning_token,
+                on_action=self._reporter.action_token,
+            )
+
+        budget = self._cfg.turn_timeout_seconds
+        if budget <= 0:
+            return call()
+        box: dict = {}
+
+        def work() -> None:
+            try:
+                box["decision"] = call()
+            except BaseException as exc:
+                box["error"] = exc
+
+        worker = threading.Thread(target=work, name="vibe-turn-decide", daemon=True)
+        worker.start()
+        worker.join(budget)
+        if worker.is_alive():
+            return None
+        if "error" in box:
+            raise box["error"]
+        return box["decision"]
+
+    # ---- native stateful chat history (issue #129/#130/#131) ----
+    def _commit_turn_to_history(self, chat_history: list[dict], user: str,
+                                decision: "Decision", turn: "Turn") -> None:
+        """Append this completed turn to the stateful message history.
+
+        Records, in order:
+          * the current ``user`` turn message,
+          * the assistant message — carrying the STRUCTURED ``tool_calls`` when Ollama
+            returned them, else the raw response content (the common case for this 3B
+            model, where the call came back as text),
+          * one ``role: "tool"`` message per executed action, holding that action's
+            observation. This is exactly the shape the model's chat template feeds back
+            (the ``<tool_response>`` path), so the next turn replays a faithful history.
+
+        Tool messages are emitted even for error/blocked actions (their observation is
+        the steer/error text) so the model SEES the consequence of its last move in the
+        history, not just in a one-off injection.
+
+        ROLE "tool" (reconciling CORRECTIONS.md / PR #135): that audit warns the raw
+        Qwen2.5 HF ChatML has no standalone ``tool`` role and results must be a
+        ``user`` message wrapping ``<tool_response>...</tool_response>``. That is true of
+        the RAW template — but we talk to OLLAMA, whose modelfile template (ground truth,
+        captured from ``ollama show --modelfile``) explicitly handles ``role: "tool"`` and
+        DOES the ``<|im_start|>user / <tool_response>`` wrapping itself. Sending
+        ``role: "tool"`` is therefore correct here and verified end-to-end live (the model
+        read a tool result back and answered from it). Do NOT pre-wrap into a user message
+        — that would double-wrap under Ollama's template."""
+        chat_history.append({"role": "user", "content": user})
+        assistant: dict = {"role": "assistant"}
+        if decision.tool_calls:
+            assistant["content"] = ""
+            assistant["tool_calls"] = [
+                tc for tc in decision.tool_calls if isinstance(tc, dict)]
+        else:
+            assistant["content"] = decision.action_json or ""
+        chat_history.append(assistant)
+        for action in turn.actions:
+            name = action.tool or "unknown"
+            chat_history.append({
+                "role": "tool",
+                "tool_name": name,
+                "content": action.observation or "",
+            })
+
+    def _evict_history(self, chat_history: list[dict], system: str, user: str) -> None:
+        """FIFO-evict the OLDEST non-system messages until the history fits the budget.
+
+        Two bounds, both applied (whichever is tighter wins):
+          * a TOKEN budget — the input window (``num_ctx`` minus the output reservation
+            and safety margin, via :func:`input_budget_tokens`) minus what the freshly
+            rebuilt system + the next user message will cost; the remainder is what the
+            history may occupy. Tokens are estimated with the same conservative
+            chars-per-token heuristic the snapshot budget uses (#43), so the two agree.
+          * an optional fixed message cap (``chat_history_max_turns``, 0 = off).
+
+        The system message is regenerated each turn and is NEVER evicted (it is not in
+        ``chat_history``). We always keep at least the most recent message so a single
+        oversized turn cannot empty the history entirely."""
+        cfg = self._cfg
+        cpt = cfg.snapshot_chars_per_token
+        in_budget = input_budget_tokens(cfg)
+        # Reserve room for the system + the user message that will accompany the history
+        # on the NEXT request (the current user turn is already in chat_history).
+        fixed = estimate_tokens(system, cpt) + estimate_tokens(user, cpt)
+        history_budget = max(0, in_budget - fixed)
+
+        def msg_tokens(m: dict) -> int:
+            text = m.get("content") or ""
+            for tc in m.get("tool_calls", []) or []:
+                text += json.dumps(tc, ensure_ascii=False)
+            return estimate_tokens(text, cpt)
+
+        # Optional fixed cap first (coarse), then the token budget.
+        cap = cfg.chat_history_max_turns
+        if cap and cap > 0:
+            while len(chat_history) > cap:
+                chat_history.pop(0)
+        total = sum(msg_tokens(m) for m in chat_history)
+        while total > history_budget and len(chat_history) > 1:
+            total -= msg_tokens(chat_history.pop(0))
 
     # ---- validation ----
     def _validate(self, args: dict, turn: Turn, memory: NarrativeMemory,

@@ -19,7 +19,6 @@ from __future__ import annotations
 import re
 from dataclasses import replace
 
-from .codec import DecodeConstraint
 from .config import Config
 from .llm import OllamaClient
 
@@ -80,6 +79,51 @@ def _extract_preamble(raw_action: str) -> str:
     else:
         preamble = raw_action.strip()
     return preamble[:300] if preamble else ""
+
+
+def build_advisor_messages(task: str, turns: list, n: int) -> list[dict]:
+    """Build a PROPER multi-turn ``messages`` list for the advisor (issue #129/#130/#131).
+
+    Instead of collapsing the agent's recent history into one prose blob, replay the last
+    ``n`` turns as real role-tagged messages — the same shape the base agent's stateful
+    history uses:
+
+      * ``system`` — the advisor's instruction prompt.
+      * a leading ``user`` message stating the TASK.
+      * for each recent turn: an ``assistant`` message (the agent's response text / its
+        chosen action) and a ``tool`` message per action holding the observation.
+      * a trailing ``user`` message asking for the advice.
+
+    This gives VibeThinker a faithful, role-structured view of what the base agent did —
+    NOT a flattened summary. NOTE: the advisor is deliberately NOT given the native
+    ``tools:`` field: VibeThinker (a reasoning fine-tune) gets confused by enveloped tool
+    schemas (ground-truthed live — it reads the schema dump as data), and its job is
+    free-text advice, not tool calls."""
+    import json
+    recent = turns[-n:] if len(turns) >= n else turns
+    messages: list[dict] = [
+        {"role": "system", "content": _SYSTEM},
+        {"role": "user", "content": f"TASK:\n{task}"},
+    ]
+    for turn in recent:
+        preamble = _extract_preamble(getattr(turn, "raw_action", "") or "")
+        assistant = preamble or (getattr(turn, "raw_action", "") or "").strip()[:400]
+        messages.append({"role": "assistant",
+                         "content": assistant or f"(turn {turn.index})"})
+        for a in turn.actions:
+            status = "OK" if a.ok else "FAIL"
+            tool = a.tool or "(none)"
+            args_s = json.dumps(a.args, ensure_ascii=False)[:120] if a.args else ""
+            obs = (a.observation or "")[:300]
+            messages.append({
+                "role": "tool",
+                "tool_name": tool,
+                "content": f"[{status}] {tool} {args_s} -> {obs}",
+            })
+    messages.append({"role": "user",
+                     "content": "What is going wrong (if anything) and what should the "
+                                "agent do next?"})
+    return messages
 
 
 def format_turns_for_advisor(turns: list, n: int) -> str:
@@ -157,9 +201,11 @@ class VibeThinkerAdvisor:
 
         When ``reporter`` is supplied the generation renders live; otherwise silent.
         """
-        history = format_turns_for_advisor(turns, self._interval)
-        system = _SYSTEM
-        user = _build_user(task, history)
+        # PROPER multi-turn history (issue #129/#130/#131): replay the recent turns as
+        # real role-tagged messages (system + task + per-turn assistant/tool + the ask)
+        # instead of a flattened prose summary. NO tools: field is sent (the advisor gives
+        # free-text advice; VibeThinker is confused by enveloped tool schemas).
+        messages = build_advisor_messages(task, turns, self._interval)
         label = "self" if self._self_advising else "vibethinker"
         print(f"\n[advisor] {label} generating advice...", flush=True)
 
@@ -167,21 +213,17 @@ class VibeThinkerAdvisor:
             reporter.advisor_start()
 
         if self._two_phase:
-            # VibeThinker two-phase: think then advise.
+            # VibeThinker two-phase over the message history: think then advise.
             on_think = reporter.advisor_thinking_token if reporter else None
             on_advise = reporter.advisor_token if reporter else None
-            reasoning = self._client._reason(system, user, on_token=on_think)
+            reasoning = self._client._reason_chat(messages, on_token=on_think)
             # Continue past </think> as free text (no JSON schema constraint).
-            advice = self._client._act(
-                system, user, reasoning,
-                DecodeConstraint(json_schema=None, stop=frozenset()),
-                on_token=on_advise,
-            )
+            advice = self._client._act_chat(messages, reasoning, on_token=on_advise)
         else:
-            # Qwen self-advising: single-phase free text via _reason() (stops at </think>
-            # which Qwen never emits, so we get the full output).
+            # Qwen self-advising: single-phase free text via _reason_chat() (stops at
+            # </think> which Qwen never emits, so we get the full output).
             on_advise = reporter.advisor_token if reporter else None
-            advice = self._client._reason(system, user, on_token=on_advise)
+            advice = self._client._reason_chat(messages, on_token=on_advise)
 
         if reporter is not None:
             reporter.advisor_end()

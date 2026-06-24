@@ -331,9 +331,14 @@ def run_agent(args: argparse.Namespace) -> int:
     # Vary the system prompt by the SELECTED toolset(s): each advertises its own short
     # guidance, assembled into one "# Working with your tools" section.
     guidance = SystemPromptBuilder.assemble_guidance(toolsets)
+    _native = bool(
+        getattr(config, "native_tools", False)
+        and not config.two_phase
+        and codec.tools(registry) is not None
+    )
     system_prompt = SystemPromptBuilder(
         registry, config.max_actions_per_turn, codec,
-        guidance=guidance).build(task)   # task anchored at the front
+        guidance=guidance).build(task, native_tools=_native)   # task anchored at the front
 
     if args.workdir:
         workdir = Path(args.workdir).resolve()
@@ -394,7 +399,7 @@ def make_render_workspace(fs, names):
 
 def make_system_prompt_provider(builder, config, task, render_workspace,
                                 raw_snapshot_provider, logger=None,
-                                include_tool_guidance=True):
+                                include_tool_guidance=True, native_tools=False):
     """Build the per-turn system-prompt provider with the DYNAMIC snapshot budget (#43).
 
     Returns a callable taking the per-turn ``user`` message (RalphAgent passes it so
@@ -440,13 +445,15 @@ def make_system_prompt_provider(builder, config, task, render_workspace,
         if not raw:
             # No live page this turn: render no page section (issue #24 behaviour).
             prompt = builder.build(task, workspace=workspace, page="",
-                                   include_tool_guidance=include_tool_guidance)
+                                   include_tool_guidance=include_tool_guidance,
+                                   native_tools=native_tools)
             _dump(prompt, raw or None)
             return prompt
         # The "rest" of the message: system prompt with NO page section + the user
         # turn message. We measure this to learn how much room the snapshot has.
         rest_system = builder.build(task, workspace=workspace, page="",
-                                    include_tool_guidance=include_tool_guidance)
+                                    include_tool_guidance=include_tool_guidance,
+                                    native_tools=native_tools)
         rest_text = rest_system + user
         budget = compute_snapshot_budget(config, rest_text)
         if budget.overflow:
@@ -460,12 +467,14 @@ def make_system_prompt_provider(builder, config, task, render_workspace,
                 file=sys.stderr,
             )
             prompt = builder.build(task, workspace=workspace, page="",
-                                   include_tool_guidance=include_tool_guidance)
+                                   include_tool_guidance=include_tool_guidance,
+                                   native_tools=native_tools)
             _dump(prompt, raw)
             return prompt
         page = render_budgeted_snapshot(raw, budget.budget_chars)
         prompt = builder.build(task, workspace=workspace, page=page,
-                               include_tool_guidance=include_tool_guidance)
+                               include_tool_guidance=include_tool_guidance,
+                               native_tools=native_tools)
         _dump(prompt, raw)
         return prompt
     return provider
@@ -537,10 +546,21 @@ def _run_locked(args, task, config, registry, codec, names, workdir, logger,
         raw_snapshot_provider = lambda: annotate_filled_snapshot(
             _inner_for_fill(), filled_controls)
 
+    # NATIVE tool calling active? (issue #129/#130/#131) — same predicate the agent uses:
+    # opted in, single-phase, and the codec speaks native tools. When active, the live
+    # system prompt must OMIT the `# Tools` block + format instructions (Ollama injects
+    # them from the model's template via the tools: field).
+    native_tools = bool(
+        getattr(config, "native_tools", False)
+        and not config.two_phase
+        and codec.tools(registry) is not None
+    )
+
     # The per-turn provider applies #43's dynamic snapshot budget AND, given the
     # logger, performs #37's per-turn diagnostic dump (raw snapshot + injected prompt).
     system_prompt_provider = make_system_prompt_provider(
-        builder, config, task, render_workspace, raw_snapshot_provider, logger)
+        builder, config, task, render_workspace, raw_snapshot_provider, logger,
+        native_tools=native_tools)
     # Issue #57: a TOOL-LESS twin of the same per-turn prompt to feed the validator —
     # task + workspace + the same #43-budgeted page snapshot, but with the tool
     # descriptions / format-instruction block stripped, so the validator sees the real
@@ -686,10 +706,19 @@ def main(argv: list[str] | None = None) -> int:
         except UnknownCodec as e:
             print(f"error: {e}")
             return 2
+        # Show the prompt the model ACTUALLY receives: when native tools are active
+        # (issue #129/#130/#131) Ollama injects the # Tools block + format instructions
+        # from the model's template, so the harness prompt omits them — render that.
+        _registry = catalog.build_registry(toolsets, cfg)
+        _native = bool(
+            getattr(cfg, "native_tools", False)
+            and not cfg.two_phase
+            and codec.tools(_registry) is not None
+        )
         print(SystemPromptBuilder(
-            catalog.build_registry(toolsets, cfg),
-            cfg.max_actions_per_turn, codec,
-            guidance=SystemPromptBuilder.assemble_guidance(toolsets)).build())
+            _registry, cfg.max_actions_per_turn, codec,
+            guidance=SystemPromptBuilder.assemble_guidance(toolsets)).build(
+                native_tools=_native))
         return 0
     if not args.task and not args.task_file:
         print("error: no task given.\n")

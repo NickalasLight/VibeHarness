@@ -126,6 +126,48 @@ class RequestShapeTest(unittest.TestCase):
         self.assertEqual(fake.bodies[0]["keep_alive"], "30m")
         self.assertEqual(fake.bodies[0]["options"]["num_ctx"], 32768)
 
+    def test_decide_chat_sends_messages_and_tools(self):
+        # NATIVE path (#129/#130/#131): decide_chat issues ONE /api/chat request carrying
+        # the FULL messages history and the enveloped tools: field, still stamped with the
+        # runner-shape options.
+        cfg = Config(ollama_url="http://test:11434")
+        chat = _FakeResponse([_line({"message": {"content": '{"name":"x","arguments":{}}'}}),
+                              _line({"done": True})])
+        fake = self._install([chat])
+        msgs = [{"role": "system", "content": "S"},
+                {"role": "user", "content": "U1"},
+                {"role": "assistant", "content": "A1"},
+                {"role": "tool", "tool_name": "t", "content": "O1"},
+                {"role": "user", "content": "U2"}]
+        tools = [{"type": "function", "function": {"name": "x", "parameters": {}}}]
+        d = OllamaClient(cfg).decide_chat(msgs, tools, DecodeConstraint())
+        self.assertEqual(len(fake.bodies), 1)
+        body = fake.bodies[0]
+        self.assertEqual(body["messages"], msgs)       # full history sent verbatim
+        self.assertEqual(body["tools"], tools)         # enveloped tools in tools: field
+        self.assertEqual(body["keep_alive"], "30m")
+        self.assertEqual(body["options"]["num_ctx"], 32768)
+        self.assertEqual(d.action_json, '{"name":"x","arguments":{}}')
+
+    def test_decide_chat_captures_structured_tool_calls(self):
+        cfg = Config(ollama_url="http://test:11434")
+        calls = [{"function": {"name": "fill", "arguments": {"target": "e1"}}}]
+        chat = _FakeResponse([
+            _line({"message": {"content": "", "tool_calls": calls}}),
+            _line({"done": True})])
+        self._install([chat])
+        d = OllamaClient(cfg).decide_chat([{"role": "user", "content": "go"}], None,
+                                          DecodeConstraint())
+        self.assertEqual(list(d.tool_calls), calls)
+
+    def test_decide_chat_omits_tools_when_none(self):
+        cfg = Config(ollama_url="http://test:11434")
+        chat = _FakeResponse([_line({"message": {"content": "hi"}}), _line({"done": True})])
+        fake = self._install([chat])
+        OllamaClient(cfg).decide_chat([{"role": "user", "content": "go"}], None,
+                                      DecodeConstraint())
+        self.assertNotIn("tools", fake.bodies[0])
+
     def test_generate_sends_num_ctx_and_keep_alive(self):
         resp = _FakeResponse([_line({"response": "hi"}), _line({"done": True})])
         fake = self._install([resp])

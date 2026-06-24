@@ -1,19 +1,32 @@
 """LLM client.
 
 The agent depends on the `LLMClient` abstraction (DIP); `OllamaClient` is one
-implementation. It performs a two-phase generation:
-  phase 1 - free reasoning, stopped at </think>  (discarded by the caller)
-  phase 2 - raw continuation prefilled past </think>, parsed by the active codec.
+implementation. There are THREE generation paths:
 
-Whether phase 2 is CONSTRAINED depends entirely on the active codec's
-``DecodeConstraint``: only when ``constraint.json_schema is not None`` is Ollama's
-`format` field set (see ``_act``). The default `json` codec supplies a JSON-schema and
-is constrained; the `hermes` codec (the Qwen2.5/Qwen2.5-Coder native tool-call dialect,
-the default on `beta_qwen3coder` — issue #123) supplies ``json_schema=None`` and is
-therefore UNCONSTRAINED end to end — parsing of its ``<tool_call>`` blocks is done by
-the codec, not a decode constraint.
+  * :meth:`OllamaClient.decide_chat` — the NATIVE stateful path (issue #129/#130/#131,
+    the base-agent default on ``beta_qwen3coder``). ONE /api/chat call sends the FULL
+    multi-turn ``messages`` history PLUS the enveloped ``tools:`` schema, so Ollama
+    applies the MODEL'S OWN trained tool template — the ``{"type":"function",...}``
+    envelope and the anti-fence wording — instead of the harness hand-injecting a tool
+    block. Ground truth (live runs, Ollama 0.30.8): the qwen2.5-coder 3B model still
+    streams its call as TEXT in ``message.content`` and Ollama leaves ``tool_calls``
+    null, so the codec's tolerant ``parse()`` of the content stays load-bearing; when
+    structured ``tool_calls`` ARE returned they are captured and preferred.
 
-Both phases stream token-by-token so callers can render generation live.
+  * :meth:`decide` single-phase (``two_phase=False``) — legacy system+user /api/chat,
+    kept for the validator and as the ``decide`` fallback the test fakes implement.
+
+  * :meth:`decide` two-phase (``two_phase=True``, VibeThinker) — phase 1 free reasoning
+    stopped at ``</think>`` (discarded), phase 2 raw continuation prefilled past
+    ``</think>``. Used by the advisor/validator; VibeThinker is NOT sent native tools
+    (it gets confused by enveloped schemas — verified live).
+
+Whether a path is CONSTRAINED depends on the active codec's ``DecodeConstraint``: only
+when ``constraint.json_schema is not None`` is Ollama's ``format`` field set. The
+``hermes`` codec supplies ``json_schema=None`` (unconstrained); its ``<tool_call>`` /
+fenced / bare JSON output is parsed by the codec, not a decode constraint.
+
+All paths stream token-by-token so callers can render generation live.
 """
 from __future__ import annotations
 
@@ -41,6 +54,12 @@ class Decision:
     reasoning: str        # phase-1 text (discarded by the agent, kept for logs)
     action_json: str      # phase-2 action payload (parsed by the codec; constrained
                           # only if the codec supplies a json_schema — see module docs)
+    # Structured tool calls Ollama parsed from the response, when the native tools:
+    # path is used (issue #129/#130/#131). Empty for the legacy text path AND for the
+    # qwen 3B model itself, which Ollama 0.30.8 leaves as text in ``action_json`` (the
+    # codec's parse() recovers it). When NON-empty the agent prefers these over parsing
+    # ``action_json`` — see RalphAgent.
+    tool_calls: tuple = ()
 
 
 class LLMClient(ABC):
@@ -49,6 +68,31 @@ class LLMClient(ABC):
                on_reason: TokenSink | None = None,
                on_action: TokenSink | None = None) -> Decision:
         ...
+
+    def decide_chat(self, messages: list[dict], tools: list[dict] | None,
+                    constraint: DecodeConstraint,
+                    on_reason: TokenSink | None = None,
+                    on_action: TokenSink | None = None) -> Decision:
+        """Native stateful multi-turn decide (issue #129/#130/#131).
+
+        Takes the FULL chat ``messages`` history (system / user / assistant / tool, the
+        last typically the current user turn) and the enveloped ``tools`` schema list,
+        and returns a :class:`Decision` whose ``action_json`` holds the model's response
+        text and whose ``tool_calls`` holds any STRUCTURED calls Ollama parsed.
+
+        The default implementation here adapts to the legacy :meth:`decide` so test
+        doubles (and any client that only implements ``decide``) work unchanged: it
+        flattens the messages into a system string + a single user string and delegates.
+        :class:`OllamaClient` overrides this with the real native ``/api/chat`` + ``tools:``
+        transport. This keeps the agent on ONE code path while preserving every existing
+        ``decide``-only implementation (the fakes in the test suite)."""
+        system = "\n\n".join(m["content"] for m in messages
+                             if m.get("role") == "system" and m.get("content"))
+        # The newest non-system message is the live turn; everything earlier is history.
+        non_system = [m for m in messages if m.get("role") != "system"]
+        user = non_system[-1]["content"] if non_system else ""
+        return self.decide(system, user, constraint,
+                           on_reason=on_reason, on_action=on_action)
 
 
 def ensure_single_runner_env() -> None:
@@ -83,6 +127,40 @@ class OllamaClient(LLMClient):
         reasoning = self._reason(system, user, on_reason)
         action = self._act(system, user, reasoning, constraint, on_action)
         return Decision(reasoning=reasoning, action_json=action)
+
+    def decide_chat(self, messages: list[dict], tools: list[dict] | None,
+                    constraint: DecodeConstraint,
+                    on_reason: TokenSink | None = None,
+                    on_action: TokenSink | None = None) -> Decision:
+        """Native stateful /api/chat generation over the FULL message history.
+
+        ONE /api/chat call sends the whole ``messages`` history plus the enveloped
+        ``tools`` (so Ollama applies the model's own trained tool template — the
+        envelope + anti-fence wording — instead of a hand-injected block). Streams the
+        response token-by-token under ``message.content`` (ground-truth: this 3B model
+        streams the call as content, NOT as structured chunks), feeding ``on_action`` so
+        live rendering is unchanged. If Ollama DID return structured ``tool_calls`` they
+        are captured too; the agent prefers them and otherwise parses the content.
+
+        ``two_phase`` (VibeThinker) is intentionally NOT handled here: VibeThinker is the
+        advisor/validator, not the native-tools base agent, and gets confused by enveloped
+        tool schemas (verified live). Its two-phase <think> flow keeps the legacy
+        :meth:`decide` path. This method is for the single-phase native-tools base agent."""
+        payload: dict = {
+            "model": self._cfg.model,
+            "messages": messages,
+            "options": {**self._options(),
+                        "temperature": self._cfg.action_temperature,
+                        "num_predict": self._cfg.reason_tokens + self._cfg.action_tokens,
+                        "stop": list(constraint.stop)},
+        }
+        if tools:
+            payload["tools"] = tools
+        if constraint.json_schema is not None:
+            payload["format"] = constraint.json_schema
+        content, tool_calls = self._stream_chat(payload, on_action)
+        return Decision(reasoning="", action_json=content.strip(),
+                        tool_calls=tuple(tool_calls))
 
     def generate(self, prompt: str, max_chars: int | None = None,
                  on_token: TokenSink | None = None) -> str:
@@ -155,6 +233,77 @@ class OllamaClient(LLMClient):
             payload["format"] = constraint.json_schema
         text = self._stream("/api/generate", payload, on_token)
         return text.strip()
+
+    # ---- two-phase over a FULL message history (advisor, issue #129/#130/#131) ----
+    def _reason_chat(self, messages: list[dict], on_token: TokenSink | None) -> str:
+        """Phase 1 over a multi-turn ``messages`` history: free reasoning, stop at
+        ``</think>``. Used by the VibeThinker advisor so it sees the recent turns as
+        real role-tagged messages instead of a flattened prose blob. NO ``tools:`` field
+        is sent — VibeThinker is a reasoning model that gets confused by enveloped tool
+        schemas, and its job here is free-text advice."""
+        return self._stream("/api/chat", {
+            "model": self._cfg.model,
+            "messages": messages,
+            "options": {**self._options(), "num_predict": self._cfg.reason_tokens,
+                        "stop": ["</think>"]},
+        }, on_token)
+
+    def _act_chat(self, messages: list[dict], reasoning: str,
+                  on_token: TokenSink | None) -> str:
+        """Phase 2 over a multi-turn ``messages`` history: continue past ``</think>`` as
+        free text (the advice). Appends the phase-1 reasoning (closing an open
+        ``<think>``) as a prefilled assistant turn so generation resumes after it."""
+        prefill = self._continue_after_reasoning(reasoning)
+        convo = list(messages) + [{"role": "assistant", "content": prefill}]
+        return self._stream("/api/chat", {
+            "model": self._cfg.model,
+            "messages": convo,
+            "options": {**self._options(), "temperature": self._cfg.action_temperature,
+                        "num_predict": self._cfg.action_tokens},
+        }, on_token).strip()
+
+    # ---- native /api/chat streaming that ALSO captures structured tool_calls ----
+    def _stream_chat(self, payload: dict,
+                     on_token: TokenSink | None) -> "tuple[str, list[dict]]":
+        """Stream an /api/chat generation, returning ``(content, tool_calls)``.
+
+        Like :meth:`_stream` but additionally accumulates any ``message.tool_calls``
+        Ollama emits (most small models emit none — the call comes through as content,
+        which the codec then parses). The runner-shape ``keep_alive``/``num_ctx``
+        invariant (#77) is preserved exactly: this stamps the same constant keep_alive
+        and the payload already carries the pinned options."""
+        body = {"keep_alive": self._cfg.ollama_keep_alive, **payload, "stream": True}
+        req = urllib.request.Request(
+            self._cfg.ollama_url + "/api/chat",
+            data=json.dumps(body).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        parts: list[str] = []
+        tool_calls: list[dict] = []
+        try:
+            with urllib.request.urlopen(req, timeout=self._cfg.request_timeout) as resp:
+                for raw in resp:
+                    line = raw.decode("utf-8").strip()
+                    if not line:
+                        continue
+                    obj = json.loads(line)
+                    msg = obj.get("message", {}) or {}
+                    chunk = msg.get("content") or ""
+                    if chunk:
+                        parts.append(chunk)
+                        if on_token:
+                            on_token(chunk)
+                    calls = msg.get("tool_calls")
+                    if calls:
+                        tool_calls.extend(calls)
+                    if obj.get("done"):
+                        break
+        except urllib.error.URLError as e:
+            raise OllamaUnavailable(
+                f"Could not reach Ollama at {self._cfg.ollama_url}. "
+                f"Is it running? Start it with `ollama serve`. ({e.reason})"
+            ) from e
+        return "".join(parts), tool_calls
 
     # ---- streaming transport ----
     def _stream(self, path: str, payload: dict, on_token: TokenSink | None) -> str:
