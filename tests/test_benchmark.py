@@ -136,6 +136,7 @@ class RunnerTest(unittest.TestCase):
         self.assertEqual(len(d["results"]), 1)
 
     def test_transcript_dir_captures_run_artifacts(self):
+        import json
         import tempfile
         from pathlib import Path
         task = get_tasks([1])[0]
