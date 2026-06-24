@@ -57,6 +57,14 @@ class Config:
     # Cap on the auto-injected live page snapshot rendered into the per-turn system
     # prompt (issue #24). ARIA snapshots can be 800+ lines; truncate so the current
     # page state is shown without crowding the task out of context.
-    web_snapshot_char_limit: int = 6000
+    # Raised 6000 -> 40000 (~10k tokens) per the issue #28 snapshot-size analysis
+    # (SNAPSHOT_SIZE_ANALYSIS.md): 8/9 real pages exceed 6000 chars, and a 6k cap
+    # truncates BEFORE the consent/Accept buttons the agent is told to click (those
+    # late-DOM overlays land at the END of the ARIA tree, e.g. YouTube ~45k). 40000
+    # is the knee of the coverage/budget curve. NOTE: even 40k can still clip the
+    # very largest pages (e.g. w3schools ~63k) because overlay controls are emitted
+    # last; the longer-term fix is to PRIORITIZE interactive/overlay controls in the
+    # injected snapshot rather than rely on cap size (future enhancement, see #28).
+    web_snapshot_char_limit: int = 40000
     web_headless: bool = False        # headed by default so a human can watch
     web_browser: str = "chrome"
