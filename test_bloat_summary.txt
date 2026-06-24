@@ -1,0 +1,536 @@
+================================================================================
+VIBEHARNESS TEST-SUITE + COVERAGE ANALYSIS
+Consolidate the tests; shift weight to real-local-environment integration tests
+Branch: chore/test-bloat-analysis   |   Analysis only (no test/source files changed)
+================================================================================
+
+Philosophy being advanced
+--------------------------
+The local machine IS the test environment and it is free: a real filesystem, a
+real Ollama at http://127.0.0.1:11434 with the `vibethinker` model (confirmed
+live during this analysis: Ollama 0.30.8, model `vibethinker:latest` present),
+and a real subprocess/Playwright path. Mocks (FakeLLMClient, FakeValidator,
+FakeCli, ScriptedClient, monkeypatched urllib) should be the EXCEPTION reserved
+for unreachable/error paths and determinism-critical pure units -- NOT the
+default. Today the suite inverts that: the things that can actually break in
+production (real generation, the two-phase decode, the `format` constraint
+really constraining, end-to-end file ops under a codec, the web path) are the
+LEAST exercised, because almost everything is asserted against a fake.
+
+================================================================================
+1. INVENTORY
+================================================================================
+
+Test count is per `def test_`/`async def test_`. Classification:
+  U-mock = unit test whose core dependency (LLM / validator / CLI / transport)
+           is replaced by a fake or scripted stub
+  U-pure = unit test with no external dependency, exercises real code directly
+           (filesystem, parsing, schema, string rendering) -- these are healthy
+  INT    = integration test that touches a real external resource
+           (real Ollama, real playwright-cli + demo server)
+
+UNIT SUITE (tests/)
+-------------------------------------------------------------------------------
+File                       Tests  Class    Covers
+-------------------------------------------------------------------------------
+test_agent.py               13    U-mock   RalphAgent loop: turn sequencing,
+                                           per-turn action cap, batch turns,
+                                           post-validate ignore, validate
+                                           pass/fail loop control, invalid JSON,
+                                           unknown tool, step budget, on_turn
+                                           checkpoint, validator-stream ->
+                                           reporter, static vs provider system
+                                           prompt, transcript/to_dict.
+                                           Uses FakeLLMClient + FakeValidator.
+                                           (FS + ToolRegistry are REAL here.)
+test_codec.py               12    U-pure   get_codec resolve/unknown; JSON codec
+                                           format_instructions, turn hint,
+                                           constraint shape (maxItems), parse
+                                           single/array/invalid/missing-tool/
+                                           bad-args. No model; pure string+dict.
+test_filesystem.py          29    U-pure   FileSystem: write/read roundtrip,
+                                           parent-dir create, modes, paging,
+                                           copy (file/dir/over-cap), list,
+                                           search (content/filename), make/
+                                           delete/move, tree (sizes/depth/cap).
+                                           REAL temp dirs. Strongest file here.
+test_llm_helpers.py          4    U-pure   OllamaClient static helpers only:
+                                           _render_chatml, _continue_after_
+                                           reasoning (3 branches). No network.
+test_memory_prompt.py       12    U-pure   NarrativeMemory render; SystemPrompt
+                                           Builder tool listing/ordering/task/
+                                           workspace/cap; build_turn_prompt
+                                           recency ordering.
+test_registry_schema.py      9    U-pure   ToolRegistry dup/empty reject, get/
+                                           names, action_schema oneOf+maxItems,
+                                           branch required fields, docs; Param
+                                           doc/schema/enum.
+test_reporting.py            6    U-pure   ConsoleReporter real stdout render
+                                           (color off): validator block,
+                                           stream, truncation, ok/fail marks,
+                                           run_end finished/unfinished.
+test_runlog.py               3    U-pure   RunLogger writes json+md into .vibe,
+                                           content, overwrite same file. REAL fs.
+test_settings.py             9    U-pure   Settings load/set/apply/reset, key
+                                           aliases, bad value, unknown key,
+                                           cli override layering, ignore bogus.
+                                           REAL fs via VIBEHARNESS_HOME temp.
+test_streaming_log.py        2    U-mock   Agent+RunLogger stream-to-disk per
+                                           turn; partial-run/KeyboardInterrupt.
+                                           Scripted client+validator; fs REAL.
+test_tools.py               23    U-pure   fs_tools wrappers: write/read obs,
+                                           append/prepend verbs, missing errors,
+                                           list, search, manage make/move/copy/
+                                           delete + guards, paging, create-vs-
+                                           write guard, read-before-overwrite
+                                           guard, ReadTracker, default toolset
+                                           names, shared tracker. REAL fs.
+test_toolset.py              5    U-pure   ToolsetCatalog: default has fs+web,
+                                           fs creates tools, unknown select,
+                                           dup reject, build_registry merge +
+                                           merged action schema.
+test_validation.py           7    U-mock   LLMValidator pass/fail/unparseable,
+                                           prompt content, missing claim,
+                                           streaming callback forwarding;
+                                           ValidateTool schema. ScriptedClient.
+test_web.py                  9    U-mock   BrowseTool over FakeCli: goto/snap/
+                                           fill-guard/click/eval/unknown/failure/
+                                           truncate/schema. CLI is faked.
+-------------------------------------------------------------------------------
+UNIT TOTAL                 143
+-------------------------------------------------------------------------------
+
+INTEGRATION SUITE (tests/integration/)
+-------------------------------------------------------------------------------
+File                       Tests  Class    Covers
+-------------------------------------------------------------------------------
+test_model_live.py           3    INT(2)   Real Ollama generate text; early-stop
+                             +U-mock(1)     at ~100 chars w/ streaming; +1 dead-
+                                           port OllamaUnavailable (no server).
+                                           skipUnless(_ollama_up).
+test_web_live.py            10    INT(8)    Real playwright-cli + demo app at
+                             +U-pure(2)     :3000: snapshot non-empty/unicode/
+                                           refs, goto title, click->form, fill,
+                                           unknown action, missing param; +2
+                                           WebToolset prereq/create (no server).
+                                           skipUnless(cli + server up).
+-------------------------------------------------------------------------------
+INTEGRATION TOTAL           13
+-------------------------------------------------------------------------------
+GRAND TOTAL                156   tests across 16 test files (+2 __init__.py)
+
+MOCK-DRIVEN QUANTIFICATION
+-------------------------------------------------------------------------------
+  U-mock tests (fake LLM/validator/CLI/transport): 13+2+7+9 +1(model_live)= 32
+  Tests that NEVER touch the real model:                       143 + 2 = 145
+  Tests that exercise REAL local generation (Ollama):                     2
+  Tests that exercise the REAL constrained-decode `format` path:          0
+  Tests that exercise an end-to-end agent run against a real model:       0
+
+  Of 156 tests, ~32 (21%) are explicitly fake-backed. But the headline number
+  is sharper: of everything that *depends on an LLM*, only 2 of ~34 (about 6%)
+  use the real model -- 94% of the LLM-facing surface is mock-only. The single
+  most important production behavior (a real model emitting a constrained,
+  parseable tool call and the agent executing it on a real filesystem) has
+  ZERO coverage. The web path is the one bright spot: 8 genuine integration
+  tests already treat the local env as real.
+
+================================================================================
+2. REDUNDANCY / BLAST RADIUS OF DUPLICATION (cite file::test)
+================================================================================
+
+(A) FOUR private copies of "a fake/scripted LLM client" -- the single biggest
+    boilerplate duplication in the suite:
+      - test_agent.py::FakeLLMClient (+ RecordingLLMClient subclass)
+      - test_streaming_log.py::_ScriptedClient
+      - test_validation.py::ScriptedClient
+      - (and FakeValidator appears in test_agent.py while a second pass-only
+        validator _PassValidator is re-declared in test_streaming_log.py)
+    Same idea four times: "return scripted action JSON, optionally record the
+    prompt, optionally drive on_reason/on_action." -> Collapse to ONE shared
+    fixture module (tests/_fakes.py) with a single ScriptedClient and a single
+    StubValidator. Removes ~60 lines of duplicated stub code and 3 redundant
+    class definitions. (No test count change, but kills the boilerplate the
+    task calls out.)
+
+(B) FakeCli in test_web.py duplicates the *shape* of the real PlaywrightCli that
+    test_web_live.py already drives for real. Every test_web.py assertion
+    ("calls == [['goto', url]]") merely restates BrowseTool's arg-mapping
+    implementation against a recorder. The same mappings are proven end-to-end
+    in test_web_live.py::test_goto_reports_title / test_click_apply_reaches_the_
+    form. -> Most of test_web.py is implementation-restatement (see cluster C).
+
+(C) Codec/registry schema overlap -- the SAME JSON-schema facts asserted in
+    three files:
+      - test_codec.py::test_constraint_is_a_json_schema_with_maxitems
+      - test_codec.py::test_constraint_unbounded_has_no_maxitems
+      - test_registry_schema.py::test_action_schema_is_array_of_tool_calls
+      - test_registry_schema.py::test_action_schema_max_items_caps_the_array
+      - test_registry_schema.py::test_each_branch_requires_tool_and_args
+      - test_toolset.py::test_build_registry_merges...  (re-asserts oneOf consts)
+      - test_memory_prompt.py / test_registry_schema.py both assert "docs mention
+        every tool": test_docs_mention_every_tool vs
+        test_system_prompt_renders_every_tool_name_and_description
+    "maxItems caps the array" is asserted in BOTH the codec test and the
+    registry test against the same registry.action_schema(). -> One
+    parameterized "schema shape" test owns this; codec test only asserts the
+    codec *delegates* to it.
+
+(D) Tool-result observation verbs are individually enumerated:
+      - test_tools.py::test_write_append_observation_verb
+      - test_tools.py::test_write_prepend_observation_verb
+      - test_tools.py::test_write_then_read_observations ("you wrote the file")
+    Three near-identical tests differing only in mode string and expected verb.
+    -> One table-driven test: [(overwrite,"wrote"),(append,"appended"),
+    (prepend,"prepended")].
+
+(E) Write-guard pair is split where one parameterization would do:
+      - test_tools.py::test_append_without_read_ok
+      - test_tools.py::test_prepend_without_read_ok
+    Same behavior ("non-destructive modes bypass the read-before-overwrite
+    guard") asserted twice. -> One parameterized test over mode in {append,
+    prepend}.
+
+(F) FileSystem vs fs_tools double-coverage. test_filesystem.py exhaustively
+    tests FileSystem.copy/move/delete/search, and test_tools.py re-tests the
+    SAME operations one thin wrapper up (ManagePathTool copy/move/delete,
+    SearchTool, ListDirectoryTool). The wrapper layer only adds observation
+    strings + ok flags. Examples of the same behavior asserted twice:
+      - test_filesystem.py::test_copy_dest_exists_raises
+        ~ test_tools.py::test_manage_copy_existing_destination_errors
+      - test_filesystem.py::test_search_content
+        ~ test_tools.py::test_search_tool
+      - test_filesystem.py::test_list_dir_marks_directories
+        ~ test_tools.py::test_list_directory
+    -> Keep the deep FileSystem tests (they are the real spec). Thin the tool
+    tests down to ONLY what the wrapper adds (observation text + ok/err flag +
+    the guards that have no FileSystem equivalent). The "does copy actually
+    copy bytes" question belongs to ONE layer, not both.
+
+(G) Trivial / low-value tests that restate the implementation:
+      - test_validation.py::test_streaming_callbacks_are_forwarded_to_client
+        asserts `client.last_on_reason IS on_reason` -- a pure pass-through
+        identity check; restates one line of LLMValidator. Low value once a
+        real-model validator test exists.
+      - test_agent.py::test_static_system_used_without_provider asserts the
+        system string is repeated 3x -- restates a `for` loop.
+      - test_codec.py::test_turn_action_hint_mentions_json and
+        test_format_instructions_* assert substring presence in prose the codec
+        emits -- brittle, restate the literal string.
+
+(H) Reporter stream is verified twice from two angles:
+      - test_reporting.py::test_validator_reasoning_and_verdict_are_streamed
+        (ConsoleReporter renders it)
+      - test_agent.py::test_validator_stream_reaches_reporter
+        (agent forwards it)
+    Acceptable as a seam test, but note the overlap; the agent-side one can
+    use the RecordingReporter only (it already does) and need not re-assert
+    rendering.
+
+================================================================================
+3. COVERAGE GAPS -- where mocks hide real behavior
+================================================================================
+
+These are the things that would still be GREEN if the real integration broke,
+because no test ever runs them for real:
+
+  G1. THE TWO-PHASE DECODE (llm.py _reason -> _act). Only the static string
+      helpers (_render_chatml, _continue_after_reasoning) are unit-tested.
+      The actual phase-1 stop-at-</think>, the raw-continuation prefill, and
+      phase-2 generation are NEVER executed against Ollama. If the ChatML
+      template, the </think> stop, or the prefill drifted, every unit test
+      still passes.
+
+  G2. CONSTRAINED DECODING ACTUALLY CONSTRAINING. test_codec.py only checks
+      that constraint() RETURNS a dict with maxItems. Nothing verifies that
+      passing that schema to Ollama's `format` actually forces the model to
+      emit a parseable action of the right shape, or that maxItems actually
+      bounds the array. This is the highest-value untested claim in the repo
+      -- the entire design rests on "format constrains output," and it is
+      asserted nowhere against a real model.
+
+  G3. END-TO-END AGENT RUN ON A REAL MODEL + REAL FILESYSTEM. RalphAgent is
+      tested only with FakeLLMClient. There is no test where the real model
+      reads a task, emits real tool calls, and a file actually appears on disk
+      and validation passes. The agent<->codec<->client<->fs contract is
+      entirely mock-verified.
+
+  G4. THE CODEC SEAM AGAINST A REAL MODEL, PER CODEC. codec.get_codec is built
+      for swappable formats (json today; tagged/xml/gbnf planned). There is no
+      "every registered codec round-trips a real model's output" test, so a new
+      codec could ship with instructions the model can't follow and the suite
+      would not notice.
+
+  G5. OllamaClient.generate early-stop is tested (good) but decide() -- the
+      method the agent actually calls -- has NO live test at all.
+
+  G6. THE `gbnf` / stop-string branch of DecodeConstraint is dead in tests:
+      llm._act only applies json_schema; nothing exercises constraint.stop or
+      documents that gbnf is intentionally ignored on the Ollama backend.
+
+  G7. tests/integration/ IS THIN on the model side: 2 real-generation tests,
+      both liveness smoke tests ("it produced text", "it stopped at ~100
+      chars"). Neither touches the agent, the codec, the constraint, or tool
+      execution. The web side is comparatively rich (8 real tests) -- the model
+      side should reach parity.
+
+  G8. NO MARKER / SKIP INFRASTRUCTURE. Integration files hand-roll _ollama_up()
+      / _server_up() / _cli_available() and skipUnless at class scope. There is
+      no pytest marker (e.g. `needs_ollama`, `needs_web`), no conftest, no
+      `-m "not slow"` fast path. Adding more integration tests today means
+      copy-pasting the probe boilerplate a 3rd, 4th, 5th time (see redundancy A
+      for the client-stub equivalent).
+
+================================================================================
+4. CONSOLIDATION + INTEGRATION PLAN  (the core deliverable)
+================================================================================
+
+GOAL: fewer raw tests, equal-or-better behavioral coverage, and the LLM-facing
+surface moved from ~6% real to majority-real -- using the local box as the test
+environment.
+
+--------------------------------------------------------------------------------
+4a. MERGE / DELETE  (before -> after, by file)
+--------------------------------------------------------------------------------
+Legend: -> target consolidated test.
+
+File                Before  After  Action
+--------------------------------------------------------------------------------
+test_agent.py         13     10    MERGE invalid-JSON + unknown-tool +
+                                   over-limit-note into one table-driven
+                                   "malformed/over-budget turn is reported and
+                                   loop continues" (params: bad-json, unknown-
+                                   tool, over-cap). DELETE
+                                   test_static_system_used_without_provider
+                                   (restates loop; provider test covers the
+                                   interesting case). Keep the rest.
+test_tools.py         23     14    Table-drive the 3 observation-verb tests ->1
+                                   (D). Merge append/prepend-without-read ->1
+                                   (E). Drop the 6 manage/search/list tests that
+                                   only re-prove FileSystem behavior (F); keep
+                                   only wrapper-specific assertions (observation
+                                   text, ok flag, create-vs-write guard, read-
+                                   before-overwrite guard, ReadTracker, default
+                                   toolset names, shared tracker).
+test_filesystem.py    29     22    Table-drive paging (small/multi/out-of-range/
+                                   empty ->1 parametrized), tree (sizes/depth/
+                                   cap/empty/missing -> keep 2: a rich content
+                                   test + a param'd limits test). Net -7; these
+                                   are good U-pure tests, trim only the
+                                   mechanical near-dupes.
+test_codec.py         12      8    DELETE the 2 constraint-shape tests (moved to
+                                   the schema-owner test, C) and replace with a
+                                   single "codec.constraint delegates to
+                                   registry.action_schema(max_items)" test.
+                                   Merge the 3 format_instructions/turn_hint
+                                   prose tests ->1 "instructions render cap +
+                                   format name". Keep all 5 parse tests
+                                   (table-drive the 3 error cases ->1).
+test_registry_schema   9      7    Keep as the SINGLE OWNER of action_schema
+                                   shape (oneOf, maxItems, required). Merge the
+                                   two "docs/prompt mention every tool" cousins
+                                   with test_memory_prompt via a shared helper;
+                                   net -2.
+test_web.py            9      4    This is the biggest cut. Most of it restates
+                                   BrowseTool arg-mapping against FakeCli and is
+                                   now proven for real in test_web_live.py.
+                                   KEEP ONLY the pure-unit error paths that the
+                                   live test can't cheaply force: fill-missing-
+                                   text guard, unknown-action, output-truncation,
+                                   schema-branch. DELETE goto/snapshot/click/eval
+                                   mapping tests (covered live). -5.
+test_validation.py     7      5    DELETE test_streaming_callbacks_are_forwarded
+                                   (identity restatement, G). Merge pass/fail
+                                   into a param'd verdict test. Keep unparseable,
+                                   prompt-content, missing-claim, ValidateTool
+                                   schema.
+test_toolset.py        5      4    Merge the merged-schema assertion into the
+                                   registry-schema owner; keep catalog
+                                   has-fs+web, fs-creates-tools, unknown-select,
+                                   dup-reject.
+test_memory_prompt.py 12     10    Table-drive the workspace permutations
+                                   (with/without task, default-absent ->1
+                                   param'd). Keep ordering + cap + render tests.
+test_reporting.py      6      6    Keep (real-stdout U-pure, already lean).
+test_runlog.py         3      3    Keep.
+test_settings.py       9      8    Merge the two max-actions alias asserts ->1.
+test_llm_helpers.py    4      4    Keep (pure string helpers, cheap, correct).
+test_streaming_log.py  2      2    Keep, but switch to the SHARED ScriptedClient
+                                   fixture (A) instead of its private _Scripted-
+                                   Client/_PassValidator.
+--------------------------------------------------------------------------------
+UNIT  before -> after        143    101     (-42, ~29% fewer unit tests)
+--------------------------------------------------------------------------------
+PLUS: extract tests/_fakes.py (one ScriptedClient + one StubValidator + one
+FakeCli) consumed by test_agent, test_validation, test_streaming_log, test_web.
+Removes 4 duplicated stub class definitions (~60 lines) for 0 test-count cost.
+
+--------------------------------------------------------------------------------
+4b. ADD / CONVERT TOWARD REAL-ENVIRONMENT INTEGRATION TESTS
+--------------------------------------------------------------------------------
+Proposed integration count: 13 -> 24  (+11 high-value real tests).
+
+NET SUITE COUNT:   156 (143U + 13I)  ->  125 (101U + 24I)
+                   ~20% fewer tests overall, with the *real-model* surface
+                   going from 2 tests to ~13.
+
+INFRASTRUCTURE (do this first -- it unblocks everything and kills probe dup G8):
+
+  tests/conftest.py
+    - pytest markers registered: `needs_ollama`, `needs_web`, `slow`.
+    - session fixtures:
+        ollama_up()   -> probes /api/version once, caches; tests marked
+                         needs_ollama auto-skip when down.
+        web_up()      -> probes playwright-cli + :3000 once.
+        live_client   -> OllamaClient(Config()) bound to 127.0.0.1:11434.
+        live_registry -> default_catalog fs registry.
+        tmp_workspace -> real TemporaryDirectory Path (replaces the per-file
+                         setUp/tearDown temp-dir boilerplate repeated in 6 files).
+    - a deterministic Config for tests: Config(temperature=0.0,
+      action_temperature=0.0, reason_tokens=256, action_tokens=512) so live
+      runs are greedy, fast, and repeatable. Seed via OLLAMA options where the
+      backend honors it; otherwise lean on temperature=0 + small token budgets.
+
+  pyproject.toml [tool.pytest.ini_options]
+    markers = needs_ollama / needs_web / slow
+    addopts = -m "not slow"   (default run is the fast, hermetic unit suite;
+              `pytest -m slow` or `-m needs_ollama` opts into the real model.)
+
+  Layout:
+    tests/                      fast, hermetic unit tests (no network), default.
+    tests/integration/model/    real-Ollama tests (needs_ollama, mostly slow).
+    tests/integration/web/      real-playwright tests (needs_web).
+    tests/integration/agent/    real end-to-end agent runs (needs_ollama, slow).
+
+TOP-PRIORITY NEW INTEGRATION TESTS (names + what they assert against real env):
+
+  [P0] tests/integration/agent/test_real_file_task.py
+       ::test_real_model_creates_a_file_under_each_codec   (PARAMETRIZED over
+       every name in a codec registry -- json today, future codecs free)
+         GIVEN a real OllamaClient(vibethinker), a real FileSystem rooted in a
+               real tmp_workspace, the default fs registry, and an LLMValidator
+               backed by the same real model,
+         WHEN  RalphAgent.run("Create a file named hello.txt containing the
+               text ocean") executes for real,
+         THEN  os.path.exists(workspace/'hello.txt') is True AND its contents
+               contain 'ocean' AND result.finished is True.
+       This is THE missing test (G2,G3,G4): real generation -> real two-phase
+       decode -> real constraint -> real parse -> real tool exec -> real file ->
+       real validation, end to end, once per codec. Marked needs_ollama+slow.
+
+  [P0] tests/integration/model/test_constraint_really_constrains.py
+       ::test_format_schema_forces_a_parseable_action
+         GIVEN live_client and the json codec's constraint(registry, max=1),
+         WHEN  decide(system, "list the current directory", constraint) runs for
+               real,
+         THEN  codec.parse(decision.action_json) returns (actions, None) with
+               exactly 1 action whose tool is in registry.names() -- i.e. the
+               `format` grammar actually produced schema-valid, parseable JSON.
+       ::test_max_items_actually_bounds_the_array
+         WHEN  the same call uses max_actions=2 and a prompt that tempts many
+               actions, THEN parsed actions <= 2.
+       ::test_unconstrained_control_can_drift  (xfail/observational, optional)
+         Demonstrates that WITHOUT the format the same prompt is not guaranteed
+         parseable -- documents why the constraint matters. Marked needs_ollama.
+
+  [P1] tests/integration/model/test_two_phase_decode.py
+       ::test_reasoning_phase_stops_at_think_close
+         decide() yields a Decision whose reasoning is non-empty and whose
+         action_json starts a valid action -- proving phase-1 stop + phase-2
+         prefill wiring (G1). Assert via the on_reason/on_action streams firing.
+       ::test_streaming_callbacks_fire_with_real_tokens
+         on_reason and on_action each receive >=1 real chunk (replaces the
+         deleted identity-only unit test G with a real-behavior version).
+
+  [P1] tests/integration/agent/test_real_multistep_task.py
+       ::test_read_modify_write_roundtrip
+         Task: "Read seed.txt, then append the word DONE to it." Pre-seed the
+         file in tmp_workspace. Assert the file ends with DONE and the read-
+         before-overwrite guard did not block the legitimate append -- exercises
+         the guard logic that unit tests fake, against a real model's tool
+         sequence. needs_ollama+slow.
+
+  [P2] tests/integration/model/test_validator_live.py
+       ::test_validator_passes_a_truly_complete_task /
+       ::test_validator_fails_an_incomplete_claim
+         Run LLMValidator(live_client) over a real history; assert pass on a
+         genuinely-complete transcript and fail on an obviously-incomplete one.
+         Replaces 2 scripted-verdict unit tests with real judgment behavior.
+         (Keep ONE unit test for the unparseable->fail safety path, which must
+         stay deterministic.)
+
+  [P2] Convert tests/integration/test_web_live.py fill/click flow to also run a
+       short REAL agent turn that drives `browse` via the model (1 added test:
+       ::test_model_drives_one_browse_action), proving the web codec path works
+       with real generation, not just hand-fed actions.
+
+WHAT STAYS A UNIT TEST (and why) -- the legitimate mock minority:
+  - OllamaUnavailable on a dead port (test_model_live) -- error path, must be
+    deterministic and serverless. KEEP as unit.
+  - Codec/registry SCHEMA SHAPE, prompt rendering, NarrativeMemory, Settings,
+    RunLogger, ConsoleReporter, FileSystem primitives -- pure, fast, real code
+    already; no model needed. These are the suite's healthy core.
+  - Parser ERROR cases (invalid JSON, missing tool, bad args, unknown tool,
+    over-cap, fill-missing-text) -- you cannot reliably make a real model emit
+    malformed output on demand; mocking the bad input is correct here.
+  - The streaming-to-disk-per-turn test -- the *value* is the fs+logger wiring,
+    which is already real; the scripted client is the right tool because we need
+    an exact, fast turn count.
+
+BEST PRACTICES TO ENFORCE:
+  - Hermetic-but-real: every integration test uses a fresh real TemporaryDirectory
+    and asserts cleanup (test_streaming_log already models this well -- copy it).
+  - Determinism on a real model: temperature=0 / action_temperature=0, tiny
+    token budgets, assert on ROBUST properties (file exists, contents contain a
+    keyword, parse succeeds, action count bounded) NOT on exact model phrasing.
+  - Fast vs slow split: default `pytest` runs only hermetic units (`-m "not
+    slow"`); `pytest -m needs_ollama` runs the real-model suite locally. CI stays
+    green without the model; the dev box gets full real coverage for free.
+  - Skip-gracefully: a single conftest probe per resource (ollama_up/web_up),
+    NOT per-file copy-paste. Down dependency -> skip with a clear reason, never
+    fail.
+  - One shared fakes module so the 4 duplicated client stubs become 1, and the
+    line between "legitimately faked" and "should be real" is visible in one
+    place.
+  - Each codec added to the registry is automatically covered by the
+    parametrized P0 end-to-end test -- new format, zero new test wiring.
+
+================================================================================
+EXECUTIVE SUMMARY
+================================================================================
+  Current suite:    156 tests (143 unit + 13 integration), 16 files.
+  Mock-driven now:  ~21% of all tests are fake-backed; but of the LLM-facing
+                    surface only 2 of ~34 (~6%) use the REAL model -- the
+                    constrained-decode, two-phase, and end-to-end agent paths
+                    have effectively ZERO real coverage.
+  Proposed suite:   ~125 tests (101 unit + 24 integration) -- ~20% fewer overall,
+                    ~29% fewer unit tests, while real-model tests go 2 -> ~13 and
+                    one shared _fakes.py removes 4 duplicated client stubs.
+
+  Top redundancies to collapse:
+    1. 4 private fake-LLM-client classes -> 1 shared fixture (tests/_fakes.py).
+    2. test_web.py FakeCli arg-mapping tests (9->4) -- restate impl, now proven
+       live in test_web_live.py.
+    3. action_schema shape asserted in 3 files (codec/registry/toolset) -> one
+       owner (test_registry_schema).
+    4. FileSystem vs fs_tools double-coverage of copy/move/search/list -> deep
+       tests in test_filesystem, wrapper-only assertions in test_tools.
+    5. Observation-verb and write-guard near-dupes -> table-driven (4->2).
+
+  Top 5 highest-value integration tests to ADD:
+    1. Real model creates a file end-to-end, PARAMETRIZED per codec (the single
+       missing test that exercises generation->decode->constraint->parse->tool->
+       fs->validation in one shot).
+    2. "Constrained decoding really constrains": real `format` schema forces a
+       parseable action; maxItems really bounds the array.
+    3. Two-phase decode live: phase-1 stops at </think>, phase-2 prefill yields a
+       valid action; streaming callbacks fire with real tokens.
+    4. Real multistep read-modify-write task (proves the read-before-overwrite
+       guard against a real model's tool sequence).
+    5. Live validator pass/fail on genuinely complete vs incomplete transcripts.
+
+  Plus infrastructure: conftest.py with needs_ollama/needs_web/slow markers,
+  one-time resource probes, deterministic greedy Config, real tmp_workspace
+  fixture, and a default `-m "not slow"` fast lane so CI stays green while the
+  local box is treated as the free, real test environment it is.
+================================================================================
