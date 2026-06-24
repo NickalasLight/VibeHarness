@@ -54,5 +54,9 @@ class Config:
     web_session: str = "vibe"
     web_cli_timeout: int = 90
     web_observation_char_limit: int = 14000
+    # Cap on the auto-injected live page snapshot rendered into the per-turn system
+    # prompt (issue #24). ARIA snapshots can be 800+ lines; truncate so the current
+    # page state is shown without crowding the task out of context.
+    web_snapshot_char_limit: int = 6000
     web_headless: bool = False        # headed by default so a human can watch
     web_browser: str = "chrome"

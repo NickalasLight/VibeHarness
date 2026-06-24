@@ -27,6 +27,7 @@ from .runlog import RunLogger
 from .settings import Settings, settable_keys
 from .toolset import ToolsetCatalog, default_catalog
 from .validation import LLMValidator
+from .web import make_snapshot_provider
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -248,7 +249,18 @@ def _run_locked(args, task, config, registry, codec, names, workdir, logger,
             tree = f"(could not list: {e})"
         return f"Working directory: {cwd}\n{tree}"
 
-    system_prompt_provider = lambda: builder.build(task, workspace=render_workspace())
+    # When the web toolset is active, auto-inject a FRESH page snapshot into the
+    # per-turn system prompt (issue #24). The provider captures from the run's
+    # existing Playwright session each turn; because the whole prompt is rebuilt per
+    # turn, only the latest snapshot is ever present (stale-dropping by regeneration —
+    # never written to narrative memory). When web is not active, no page section.
+    snapshot_provider = (make_snapshot_provider(config) if "web" in names else None)
+
+    def render_page() -> str:
+        return snapshot_provider() if snapshot_provider else ""
+
+    system_prompt_provider = lambda: builder.build(
+        task, workspace=render_workspace(), page=render_page())
     agent = RalphAgent(client, registry, system_prompt, config, validator,
                        reporter=reporter, system_prompt_provider=system_prompt_provider,
                        codec=codec)
