@@ -581,5 +581,216 @@ class CliFinallyTeardownContractTest(unittest.TestCase):
         self.assertTrue(fs.torn_down)             # reached despite web's teardown raising
 
 
+class _ReopenableCli:
+    """A PlaywrightCli stand-in modelling a session whose persistent daemon has
+    DIED: until ``open`` is called, every command (snapshot included) fails with the
+    real "browser is not open" text; after ``open`` it answers normally. Records all
+    calls so a test can prove the reopen + retry sequence (issues #101, #75)."""
+
+    NOT_OPEN = "The browser 'vibe' is not open, please run open first playwright-cli -s=vibe open"
+
+    def __init__(self, snapshot_after_open="Page: \"X\"\n[e1] textbox\n",
+                 result_after_open="### Page\nok", *, open_succeeds=True):
+        self._open = False
+        self._open_succeeds = open_succeeds
+        self._snapshot = snapshot_after_open
+        self._result = result_after_open
+        self.calls = []
+
+    # mirror PlaywrightCli's surface the tools use
+    @property
+    def open_flags(self):
+        return ["--headed"]
+
+    def open(self, *flags):
+        self.calls.append(["open", *flags])
+        if not self._open_succeeds:
+            return (False, "open failed: could not launch browser")
+        self._open = True
+        return (True, "### Browser `vibe` opened with pid 1234.")
+
+    def run(self, *args):
+        self.calls.append(list(args))
+        if not self._open:
+            return (False, self.NOT_OPEN)
+        if args and args[0] == "snapshot":
+            return (True, self._snapshot)
+        return (True, self._result)
+
+
+class SessionClosedDetectionTest(unittest.TestCase):
+    """The session-death signal (#101) is distinct from a per-element no-match (#73)."""
+
+    def test_output_signals_session_closed(self):
+        from vibeharness.web import output_signals_session_closed
+        self.assertTrue(output_signals_session_closed(
+            "The browser 'vibe' is not open, please run open first playwright-cli -s=vibe open"))
+        self.assertTrue(output_signals_session_closed("Error: session closed"))
+        self.assertFalse(output_signals_session_closed("### Page\n- Page Title: YouTube"))
+        self.assertFalse(output_signals_session_closed(""))
+
+    def test_no_match_is_not_a_session_close(self):
+        # A per-element miss (#73) must NOT be mistaken for the daemon dying, or we
+        # would needlessly reopen on every bad ref.
+        from vibeharness.web import output_signals_session_closed
+        self.assertFalse(output_signals_session_closed(
+            '### Error\nError: ".x" does not match any elements.'))
+
+
+class RootCauseDaemonSurvivesTimeoutTest(unittest.TestCase):
+    """Issue #101 root cause: a SINGLE per-command timeout/kill must NOT tear down
+    the shared persistent daemon. The harness's per-command kill path
+    (``_kill_tree``) acts only on that command's own spawned process; it must never
+    issue a session `close`/`stop`, which is what actually kills the daemon."""
+
+    def test_timed_out_command_does_not_close_the_session(self):
+        # Drive the REAL bounded-execution path with a child that outlives the
+        # timeout, then assert the wrapper never asked playwright to `close`/`stop`
+        # the session — i.e. one slow command cannot take down the daemon.
+        closed = {"count": 0}
+
+        class _SleepCliNoClose(_SleepCli):
+            def close(self):
+                closed["count"] += 1
+                super().close()
+
+        cli = _SleepCliNoClose(timeout=1, sleep_seconds=30)
+        ok, out = cli.run("snapshot")
+        self.assertFalse(ok)
+        self.assertIn("timed out", out)
+        # The timeout path tree-kills only THIS command's own child; it must not have
+        # invoked the session-closing close() at all.
+        self.assertEqual(closed["count"], 0,
+                         "a per-command timeout must not close/stop the shared daemon (#101)")
+
+    def test_kill_tree_targets_only_the_commands_own_proc(self):
+        # The kill on timeout is scoped to the timed-out command's Popen handle, NOT
+        # a broadcast daemon kill: assert _kill_tree is handed exactly that proc.
+        import vibeharness.web as web_mod
+        killed = []
+
+        class FakeProc:
+            pid = 555
+            returncode = None
+            def communicate(self, timeout=None):
+                raise subprocess.TimeoutExpired(cmd="x", timeout=timeout or 1)
+            def kill(self):
+                pass
+
+        the_proc = FakeProc()
+        cli = PlaywrightCli(session="vibe", timeout=1)
+        cli._binary = "fake"
+        orig_popen = web_mod.subprocess.Popen
+        # Restore the staticmethod via the class __dict__ so we don't accidentally
+        # rebind it as an instance method (which would feed `self` and break later
+        # tests that exercise the real kill path).
+        orig_kill = PlaywrightCli.__dict__["_kill_tree"]
+        web_mod.subprocess.Popen = lambda *a, **k: the_proc
+        cli._kill_tree = lambda p: killed.append(p)   # per-instance override only
+        try:
+            cli.run("snapshot")
+        finally:
+            web_mod.subprocess.Popen = orig_popen
+        # Exactly the command's own proc was killed — nothing broader.
+        self.assertEqual(killed, [the_proc])
+        self.assertIs(PlaywrightCli.__dict__["_kill_tree"], orig_kill)  # class untouched
+
+
+class OpenBrowserToolTest(unittest.TestCase):
+    """Issue #75: an agent-callable open_browser tool that (re)opens the session."""
+
+    def test_open_browser_is_registered(self):
+        from vibeharness.web import OpenBrowserTool
+        names = [c.name for c in _WEB_TOOL_CLASSES]
+        self.assertIn("open_browser", names)
+        # And it is the FIRST tool, so it's prominent / always available.
+        self.assertIs(_WEB_TOOL_CLASSES[0], OpenBrowserTool)
+
+    def test_open_browser_opens_the_session(self):
+        from vibeharness.web import OpenBrowserTool
+        cli = _ReopenableCli()
+        tool = OpenBrowserTool(cli, observation_limit=1000)
+        res = tool.run({})
+        self.assertTrue(res.ok)
+        self.assertIn("open", res.observation.lower())
+        # It used cli.open() (carrying the run's flags), not a bare run("open").
+        self.assertEqual(cli.calls[0][0], "open")
+
+    def test_open_browser_surfaces_failure_clearly(self):
+        from vibeharness.web import OpenBrowserTool
+        cli = _ReopenableCli(open_succeeds=False)
+        tool = OpenBrowserTool(cli, observation_limit=1000)
+        res = tool.run({})
+        self.assertFalse(res.ok)
+        self.assertIn("failed", res.observation.lower())
+
+    def test_open_uses_captured_flags_on_real_cli(self):
+        # PlaywrightCli.open() defaults to the session's captured open flags so a
+        # reopen restores the same headed/channel browser (#101/#75).
+        recorded = []
+        cli = PlaywrightCli(session="vibe", timeout=5, open_flags=["--headed", "--browser", "chrome"])
+        cli.run = lambda *a: (recorded.append(list(a)) or (True, "ok"))
+        cli.open()
+        self.assertEqual(recorded, [["open", "--headed", "--browser", "chrome"]])
+
+
+class AutoRecoveryTest(unittest.TestCase):
+    """Issue #101/#75: a web action against a CLOSED session transparently reopens
+    the session and retries once — the agent sees success, not a dead-end error."""
+
+    def test_fill_reopens_and_retries_on_dead_session(self):
+        cli = _ReopenableCli(snapshot_after_open="Page: \"X\"\n[e1] textbox\n",
+                             result_after_open="### Page\nfilled")
+        tool = FillTool(cli, observation_limit=1000)
+        res = tool.run({"target": "e1", "text": "hi"})
+        self.assertTrue(res.ok, "auto-recovery should make the retried action succeed")
+        # Proof of the sequence: a failed action surfaced "not open", then open() ran,
+        # then the action was replayed and succeeded.
+        verbs = [c[0] for c in cli.calls]
+        self.assertIn("open", verbs)
+        self.assertEqual(verbs[-1], "fill")        # last call is the successful replay
+
+    def test_goto_reopens_and_retries_on_dead_session(self):
+        # goto has no target guard, so it's the cleanest proof of the action-level path.
+        cli = _ReopenableCli(result_after_open="### Page\nnavigated")
+        tool = GotoTool(cli, observation_limit=1000)
+        res = tool.run({"url": "https://example.com"})
+        self.assertTrue(res.ok)
+        self.assertEqual([c for c in cli.calls if c[0] == "open"], [["open"]])  # opened once
+        self.assertEqual(cli.calls[-1], ["goto", "https://example.com"])
+
+    def test_reopen_failure_returns_clear_recovery_path_not_bare_error(self):
+        # If the session is dead AND reopening fails, the agent must get an
+        # actionable "call open_browser" message, never a silent dead-end.
+        cli = _ReopenableCli(open_succeeds=False)
+        tool = GotoTool(cli, observation_limit=1000)
+        res = tool.run({"url": "https://example.com"})
+        self.assertFalse(res.ok)
+        self.assertIn("open_browser", res.observation)
+
+    def test_recovery_only_triggers_on_session_close_not_no_match(self):
+        # A per-element no-match (#73) must NOT trigger a reopen — only a genuine
+        # session death does. Use a live (open) session whose action no-matches.
+        cli = _SnapshotThenResultCli(
+            snapshot="Page: \"X\"\n[e1] button\n",
+            result_ok=True,
+            result_output='### Error\nError: "e1" does not match any elements.')
+        tool = ClickTool(cli, observation_limit=1000)
+        res = tool.run({"target": "e1"})
+        self.assertFalse(res.ok)
+        self.assertNotIn(["open"], cli.calls)      # never tried to reopen
+        self.assertIn("does not match", res.observation)
+
+
+class WebToolsetGuidanceRecoveryTest(unittest.TestCase):
+    """Issue #75: system guidance must tell the agent to open the browser when there
+    is no current page / the session was closed."""
+
+    def test_guidance_mentions_open_browser_when_no_page(self):
+        guidance = WebToolset().system_guidance().lower()
+        self.assertIn("open_browser", guidance)
+        self.assertIn("not open", guidance)
+
+
 if __name__ == "__main__":
     unittest.main()
