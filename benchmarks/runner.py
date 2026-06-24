@@ -36,11 +36,11 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from pkgutil import iter_modules
 from typing import Callable, Iterator, Optional
 
 from vibeharness.agent import RalphAgent
 from vibeharness.codec import UnknownCodec, get_codec
+from vibeharness.codec import available_codecs as _discover_codecs
 from vibeharness.config import Config
 from vibeharness.filesystem import FileSystem, FileSystemError
 from vibeharness.llm import LLMClient, OllamaClient
@@ -68,16 +68,13 @@ def _default_validator_factory(client: LLMClient) -> Validator:
 # Codec discovery.
 # --------------------------------------------------------------------------- #
 def available_codecs() -> list[str]:
-    """Names of every codec the harness exposes, discovered by scanning the
-    ``vibeharness.codecs`` package for ``<name>_codec`` modules. Sorted, with the
-    baseline ``json`` first when present."""
-    import vibeharness.codecs as pkg
+    """Names of every codec the harness exposes, with the baseline ``json`` first
+    when present.
 
-    names: list[str] = []
-    for mod in iter_modules(pkg.__path__):
-        if mod.name.endswith("_codec"):
-            names.append(mod.name[: -len("_codec")])
-    names = sorted(set(names))
+    Discovery is delegated to :func:`vibeharness.codec.available_codecs` (the single,
+    frozen-safe canonical implementation); this wrapper only applies the benchmark's
+    "surface json first" ordering on top of that sorted result."""
+    names = _discover_codecs()
     if "json" in names:  # surface the baseline first
         names = ["json"] + [n for n in names if n != "json"]
     return names

@@ -14,9 +14,9 @@ file with one another and merge without conflict.
 from __future__ import annotations
 
 import importlib
+import pkgutil
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -78,17 +78,24 @@ class UnknownCodec(KeyError):
 def available_codecs() -> list[str]:
     """List installed codec names, discovered from the ``vibeharness.codecs`` package.
 
-    Scans the package directory for ``*_codec.py`` files and strips the ``_codec``
-    suffix, so each codec module contributes its name with no central registry to
-    edit. Dunder files (e.g. ``__init__.py``) are excluded; the result is sorted.
+    Enumerates the package's submodules with :func:`pkgutil.iter_modules`, keeping the
+    ``<name>_codec`` modules and stripping the ``_codec`` suffix, so each codec module
+    contributes its name with no central registry to edit. The result is sorted.
+
+    This uses the import system's module enumeration rather than a filesystem glob so
+    discovery survives a PyInstaller ``--onefile`` freeze, where the package lives in
+    the bundled archive and has no on-disk ``codecs/`` directory to scan. The build
+    must still bundle the codec submodules (``--collect-submodules vibeharness.codecs``)
+    so they appear here and can be imported by :func:`get_codec`.
     """
-    codecs_dir = Path(__file__).parent / "codecs"
+    import vibeharness.codecs as pkg
+
     names = [
-        path.stem[: -len("_codec")]
-        for path in codecs_dir.glob("*_codec.py")
-        if not path.stem.startswith("__")
+        mod.name[: -len("_codec")]
+        for mod in pkgutil.iter_modules(pkg.__path__)
+        if mod.name.endswith("_codec")
     ]
-    return sorted(names)
+    return sorted(set(names))
 
 
 def get_codec(name: str) -> ToolCallCodec:
