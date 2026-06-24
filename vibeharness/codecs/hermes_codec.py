@@ -117,20 +117,30 @@ class HermesCodec(ToolCallCodec):
             "provided with function signatures within <tools></tools> XML tags (see the "
             "# Tools section below).\n"
             "For each function call, return a json object with function name and arguments "
-            "within <tool_call></tool_call> XML tags:\n"
+            "within <tool_call></tool_call> XML tags with NO other text. "
+            "Do not include any backticks or ```json:\n"
             "<tool_call>\n"
             '{"name": <function-name>, "arguments": <args-json-object>}\n'
             "</tool_call>\n"
             "- Emit consecutive <tool_call> blocks to make several calls; they run in "
             "order. Use only the functions listed in the <tools> block below.\n"
-            "- Batch independent or predictable calls in one turn (e.g. write a file then "
-            "read it back); emit a single call when you must see its result before deciding."
+            "- Batch independent or predictable calls in one turn (e.g. fill several "
+            "fields, then click Next); emit a single call when you must see its result "
+            "before deciding."
             + cap
         )
 
     def turn_action_hint(self) -> str:
-        return ('Respond with one or more <tool_call>{"name": ..., "arguments": {...}}'
-                "</tool_call> blocks.")
+        # Concrete multi-call example in the recency zone so the 3B model learns the
+        # pattern from an in-context demonstration, not just an abstract instruction.
+        return (
+            "Respond with one or more CONSECUTIVE <tool_call> blocks — one block per action.\n"
+            "Example (two actions in one turn):\n"
+            '<tool_call>\n{"name": "fill", "arguments": {"target": "e12", "text": "Alice"}}\n</tool_call>\n'
+            '<tool_call>\n{"name": "fill", "arguments": {"target": "e14", "text": "alice@example.com"}}\n</tool_call>\n'
+            "ALWAYS batch independent form-field fills, clicks, and selections together. "
+            "Use a single <tool_call> ONLY when you must see a result before deciding the next step."
+        )
 
     def tool_definitions(self, registry: ToolRegistry) -> str | None:
         """Render tools as the Hermes ``<tools>`` block (BARE per-line function schemas)

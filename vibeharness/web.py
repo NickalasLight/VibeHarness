@@ -7,8 +7,8 @@ clicks, and content extraction all share state.
 Each basic browser operation the CLI supports is its own ``Tool`` subclass
 (``goto``, ``click``, ``fill``, ``type``, ``press_key``, ``select_option``,
 ``hover``, ``navigate_back``, …) — see :class:`WebToolset`. There is
-deliberately NO ``evaluate``/JS tool: the limited agent accomplishes web tasks
-using only these discrete subtools, never by executing arbitrary JavaScript. This
+An ``evaluate`` tool allows the agent to run read-only JS to inspect an element
+(e.g. its tagName, type, or option list) before choosing how to interact. This
 replaces the old monolithic ``browse(action=...)`` dispatcher: every operation is
 now its own named tool with its own typed parameters and description, so the model
 chooses a tool the same way it chooses ``read_file`` vs ``write_file``.
@@ -69,6 +69,56 @@ def resolve_web_session(config: Config) -> str:
 _REF_RE = re.compile(r"\be(\d+)\b")
 _REF_TOKEN_RE = re.compile(r"\[?\be(\d+)\b\]?")
 
+# Roles/patterns that make a snapshot line interactable for text or selection.
+_INTERACTABLE_ROLES = frozenset({
+    "textbox", "combobox", "listbox", "checkbox", "radio", "spinbutton",
+    "searchbox", "button", "link", "menuitem", "option", "switch",
+})
+
+# Playwright error substring that signals a non-interactable element was targeted.
+_NOT_INTERACTABLE_PHRASES = (
+    "element is not an <input>",
+    "element is not a <textarea>",
+    "does not have a role allowing",
+    "element is not an <input>, <textarea>",
+)
+
+# Pattern to extract the HTML snippet from Playwright's "locator resolved to <...>" error.
+_RESOLVED_TO_RE = re.compile(
+    r"locator resolved to (<[^>]+>[^<]{0,120}(?:</[^>]+>)?|<[^>]+/>|<[^>]+>)",
+    re.DOTALL,
+)
+
+
+def _nearby_interactable_refs(failed_ref: str, snapshot: str, window: int = 12) -> str:
+    """Return a short description of interactable refs near ``failed_ref`` in the snapshot.
+
+    Searches ±``window`` ref-numbers from the failed ref and returns the first 5
+    interactable lines found, formatted as "eN (description)".
+    """
+    if not failed_ref or not snapshot:
+        return "(could not determine nearby refs)"
+    m = re.match(r"e(\d+)$", failed_ref)
+    if not m:
+        return "(could not determine nearby refs)"
+    center = int(m.group(1))
+    candidates = []
+    for line in snapshot.splitlines():
+        rm = _REF_RE.search(line)
+        if not rm:
+            continue
+        ref_num = int(rm.group(1))
+        if abs(ref_num - center) > window:
+            continue
+        ref = f"e{ref_num}"
+        if ref == failed_ref:
+            continue
+        line_lower = line.lower()
+        if any(role in line_lower for role in _INTERACTABLE_ROLES):
+            candidates.append(f"{ref} ({line.strip()[:80]})")
+    candidates.sort(key=lambda s: abs(int(s[1:s.index(" ")]) - center))
+    return ", ".join(candidates[:5]) or "(none found nearby)"
+
 # Substrings playwright-cli emits in its (exit-0) output when a target/ref did NOT
 # resolve to a real element. The CLI exits 0 and embeds the failure as text, so the
 # only way to detect a no-match is to scan the output (issue #73). Matched
@@ -83,6 +133,25 @@ _NO_MATCH_MARKERS: tuple[str, ...] = (
     "waiting for locator",  # playwright timeout phrasing when a locator never appears
     "timeout",
 )
+
+
+def annotate_filled_snapshot(snapshot: str, filled: dict[str, str]) -> str:
+    """Append filled-value markers to snapshot lines whose ref is in ``filled``.
+
+    Each matching line gets:  ``  [ALREADY FILLED WITH 'value' — DO NOT FILL AGAIN]``
+    appended, so the model knows which elements are already handled.
+    """
+    if not snapshot or not filled:
+        return snapshot
+    lines = []
+    for line in snapshot.splitlines():
+        m = _REF_RE.search(line)
+        if m:
+            ref = f"e{m.group(1)}"
+            if ref in filled:
+                line = f"{line}  [ALREADY FILLED WITH '{filled[ref]}' — DO NOT FILL AGAIN]"
+        lines.append(line)
+    return "\n".join(lines)
 
 
 def parse_snapshot_refs(snapshot: str) -> set[str]:
@@ -164,6 +233,67 @@ def output_signals_no_match(output: str) -> bool:
         if any(marker in low for marker in _NO_MATCH_MARKERS):
             return True
     return False
+
+
+# ---------------------------------------------------------------------------
+# DOM-change detection helpers — appended to interaction tool observations.
+# After any successful interactive action (click, fill, type, press_key,
+# select_option, check, uncheck) the snapshot is diffed against a pre-action
+# baseline and newly-appeared elements are reported inline so the model can
+# immediately use their refs without needing an explicit snapshot call.
+# ---------------------------------------------------------------------------
+
+def _diff_snapshot_refs(before: str, after: str) -> list[str]:
+    """Return refs in ``after`` that were not in ``before`` (new elements).
+
+    Extracts all ``[ref=eN]`` patterns from both snapshots and returns the
+    sorted list of refs that are new in ``after``. Returns an empty list when
+    nothing changed or snapshots are empty.
+    """
+    _REF_ATTR_RE = re.compile(r"\[ref=(e\d+)\]")
+    before_refs = set(_REF_ATTR_RE.findall(before or ""))
+    after_refs = set(_REF_ATTR_RE.findall(after or ""))
+    new_refs = after_refs - before_refs
+    return sorted(new_refs, key=lambda r: int(r[1:]))
+
+
+def _extract_ref_lines(refs: list[str], snapshot: str) -> list[str]:
+    """Return the snapshot lines that contain each ref in ``refs``.
+
+    Returns up to 20 lines (stripped) to keep the delta message concise.
+    """
+    results: list[str] = []
+    for ref in refs:
+        for line in (snapshot or "").splitlines():
+            if f"[ref={ref}]" in line:
+                results.append(line.strip())
+                break
+    return results[:20]
+
+
+def _check_dom_delta(cli: "PlaywrightCli", before_snapshot: str,
+                     result: "ToolResult") -> "ToolResult":
+    """Append a DOM-change summary to ``result`` when new elements appeared.
+
+    Captures a fresh snapshot, computes the ref diff against
+    ``before_snapshot``, and — if any new refs exist — appends a
+    ``DOM CHANGE DETECTED`` paragraph to the observation so the model sees
+    the new elements' refs immediately without needing to call ``snapshot``.
+    Returns the original ``result`` unchanged when the action failed or no
+    new elements appeared.
+    """
+    if not result.ok:
+        return result
+    after = capture_page_snapshot_raw(cli) or ""
+    new_refs = _diff_snapshot_refs(before_snapshot, after)
+    if not new_refs:
+        return result
+    new_lines = _extract_ref_lines(new_refs, after)
+    delta_msg = (
+        f"\n\nDOM CHANGE DETECTED: {len(new_refs)} new element(s) appeared:\n"
+        + "\n".join(f"  {line}" for line in new_lines[:20])
+    )
+    return ToolResult(result.ok, (result.observation or "") + delta_msg)
 
 
 # Substrings playwright-cli emits (in its error text) when the named session has no
@@ -525,6 +655,12 @@ class _WebTool(Tool):
     # ever calling playwright (issue #73). Tools without a targeted element
     # (goto/type/press_key/screenshot-whole-page/navigate_*/reload) leave this off.
     _validate_target: bool = False
+    # When True, ``run()`` captures a DOM snapshot before the action and appends a
+    # DOM CHANGE DETECTED summary to the observation when new refs appear. Set on
+    # interactive tools (click, type, press_key, check, uncheck) via the class body.
+    # FillTool and SelectOptionTool manage the delta themselves because they override
+    # run() with additional logic that must run first.
+    _detect_dom_change: bool = False
 
     def __init__(self, cli: PlaywrightCli, observation_limit: int):
         self._cli = cli
@@ -539,7 +675,15 @@ class _WebTool(Tool):
         """The thing acted on, for the narrative observation. Override as needed."""
         return args.get("url") or args.get("target") or "the page"
 
-    def run(self, args: dict) -> ToolResult:
+    def _run_impl(self, args: dict) -> ToolResult:
+        """Core run logic: validate params, guard target ref, invoke CLI, phrase result.
+
+        Extracted from the original ``run()`` so that the public ``run()`` entry point
+        can wrap it with optional DOM-change detection without subclass complications.
+        Subclasses that override ``run()`` call ``super().run()`` which now goes through
+        this wrapper; they should call ``super()._run_impl()`` if they need the raw
+        result before the DOM delta is appended (see FillTool, SelectOptionTool).
+        """
         missing = [p for p in self._required if not args.get(p)]
         if missing:
             return ToolResult(False, f"you called `{self.name}` but did not provide: "
@@ -575,6 +719,21 @@ class _WebTool(Tool):
             return ToolResult(False, f"you tried to {self._verb} {subject} but it failed: "
                               f"{self._trim(output)}")
         return ToolResult(True, f"you {self._verb} {subject}. Result:\n{self._trim(output)}")
+
+    def run(self, args: dict) -> ToolResult:
+        """Public entry point. Wraps ``_run_impl`` with optional DOM-change detection.
+
+        When ``_detect_dom_change`` is True, captures a before-snapshot, runs the
+        action, then appends a DOM CHANGE DETECTED message listing any new element
+        refs that appeared. Subclasses that override ``run()`` call
+        ``super()._run_impl()`` directly so they retain control of when (and if) the
+        delta is appended.
+        """
+        if not self._detect_dom_change:
+            return self._run_impl(args)
+        before = capture_page_snapshot_raw(self._cli) or ""
+        result = self._run_impl(args)
+        return _check_dom_delta(self._cli, before, result)
 
     def _guard_target(self, args: dict) -> ToolResult | None:
         """Reject a ``target`` that is not a ref present in the current snapshot.
@@ -619,7 +778,11 @@ class _WebTool(Tool):
 
 class GotoTool(_WebTool):
     name = "goto"
-    description = "Navigate the browser to a URL. The page, cookies and history persist."
+    description = (
+        "Navigate the browser to a URL. The page, cookies and history persist. "
+        "If no browser session is open yet, this will open one automatically — "
+        "use goto as your FIRST action to open the target page."
+    )
     _verb = "navigated to"
     _required = ("url",)
 
@@ -637,6 +800,7 @@ class ClickTool(_WebTool):
     _verb = "clicked"
     _required = ("target",)
     _validate_target = True
+    _detect_dom_change = True
 
     @property
     def parameters(self):
@@ -665,6 +829,34 @@ class FillTool(_WebTool):
     def _build(self, args):
         return ["fill", args["target"], args["text"]]
 
+    def run(self, args: dict) -> ToolResult:
+        # Capture the DOM before calling the action so we can detect new elements.
+        before = capture_page_snapshot_raw(self._cli) or ""
+        result = self._run_impl(args)
+        if not result.ok:
+            obs_lower = (result.observation or "").lower()
+            if any(p in obs_lower for p in _NOT_INTERACTABLE_PHRASES):
+                target = args.get("target", "")
+                # Extract the HTML snippet Playwright gives us.
+                m = _RESOLVED_TO_RE.search(result.observation or "")
+                html_snippet = m.group(1).strip() if m else "(unknown element type)"
+                # Find nearby interactable refs from a fresh snapshot.
+                snapshot = capture_page_snapshot_raw(self._cli) or ""
+                nearby = _nearby_interactable_refs(target, snapshot)
+                obs = (
+                    f"ERROR: '{target}' is NOT interactable for text input. "
+                    f"Playwright resolved it to: {html_snippet}  "
+                    f"This element cannot accept fill/type — it is a label, div, span, "
+                    f"or other non-input element. "
+                    f"Nearby interactable elements: {nearby}. "
+                    f"Pick one of those refs instead, or use select_option/click if "
+                    f"it is a dropdown or combobox."
+                )
+                return ToolResult(False, obs)
+            return result
+        # Action succeeded — append DOM change delta if any new elements appeared.
+        return _check_dom_delta(self._cli, before, result)
+
 
 class TypeTool(_WebTool):
     name = "type"
@@ -672,6 +864,7 @@ class TypeTool(_WebTool):
                   "(use `fill` to set a field's value directly).")
     _verb = "typed into"
     _required = ("text",)
+    _detect_dom_change = True
 
     def _subject(self, args):
         return "the focused element"
@@ -689,6 +882,7 @@ class PressKeyTool(_WebTool):
     description = "Press a single keyboard key, e.g. 'Enter', 'Tab', 'ArrowLeft', 'Escape'."
     _verb = "pressed a key on"
     _required = ("key",)
+    _detect_dom_change = True
 
     @property
     def parameters(self):
@@ -718,10 +912,12 @@ class SelectOptionTool(_WebTool):
         return ["select", args["target"], args["value"]]
 
     def run(self, args: dict) -> ToolResult:
+        # Capture DOM before the action so we can detect new elements afterward.
+        before = capture_page_snapshot_raw(self._cli) or ""
         # Try the native <select> path first (the base behaviour).
-        result = super().run(args)
+        result = self._run_impl(args)
         if result.ok:
-            return result
+            return _check_dom_delta(self._cli, before, result)
         # FALLBACK (#125): a CUSTOM combobox (<div role="listbox">) is not a native
         # <select>, so Playwright's `select` fails ("Element is not a <select> element")
         # and the discrete subtools alone never reach the (closed) options. Detect that
@@ -733,7 +929,7 @@ class SelectOptionTool(_WebTool):
         if "not a <select>" in obs or "is not a select" in obs or "<select> element" in obs:
             combo = self._select_via_combobox(args["target"], args["value"])
             if combo is not None:
-                return combo
+                return _check_dom_delta(self._cli, before, combo)
         return result
 
     def _select_via_combobox(self, target: str, value: str) -> ToolResult | None:
@@ -770,6 +966,7 @@ class CheckTool(_WebTool):
     _verb = "checked"
     _required = ("target",)
     _validate_target = True
+    _detect_dom_change = True
 
     @property
     def parameters(self):
@@ -786,6 +983,7 @@ class UncheckTool(_WebTool):
     _verb = "unchecked"
     _required = ("target",)
     _validate_target = True
+    _detect_dom_change = True
 
     @property
     def parameters(self):
@@ -922,6 +1120,64 @@ class ReloadTool(_WebTool):
         return ["reload"]
 
 
+class EvaluateTool(_WebTool):
+    """Run JavaScript on the page (or on one element) to inspect its state.
+
+    Use this when you need to understand what kind of element a ref points to before
+    deciding which interaction tool to use — e.g. inspect whether a combobox is a
+    native <select> or a custom widget, read its current value, list its <option>
+    children, or check a data attribute. Returns the JavaScript return value as text.
+    Does NOT modify the page. Never use it to set values — use fill/select_option/click.
+    """
+
+    name = "evaluate"
+    description = (
+        "Run a JavaScript snippet on the page (or on a specific element) to inspect "
+        "its state. Use to identify element types, list dropdown options, read current "
+        "values, or check attributes before choosing the right interaction tool. "
+        "Example: expression='el => el.tagName + \" \" + el.type' with target='e6' "
+        "inspects element e6. Without a target, the expression runs on the whole page "
+        "(use 'document.title' or 'document.readyState' etc.). "
+        "Does NOT modify the page."
+    )
+    _verb = "evaluated JS on"
+
+    @property
+    def parameters(self):
+        return [
+            Param("expression", "string",
+                  "JavaScript expression or arrow function to evaluate. "
+                  "If target is given, the function receives the DOM element as its first "
+                  "argument: 'el => el.tagName'. Without a target, it runs on the page "
+                  "as a plain expression: 'document.title'."),
+            Param("target", "string",
+                  "Optional element ref (e.g. 'e6') from the current snapshot to pass "
+                  "to the expression as the first argument. Omit to run on the whole page.",
+                  required=False),
+        ]
+
+    def _subject(self, args):
+        return args.get("target") or "the page"
+
+    def _build(self, args):
+        parts = ["eval", args["expression"]]
+        if args.get("target"):
+            parts.append(args["target"])
+        return parts
+
+    def run(self, args: dict) -> ToolResult:
+        if "expression" not in args:
+            return ToolResult(False, "evaluate requires an 'expression' argument.")
+        ok, output = self._cli.run(*self._build(args))
+        subject = self._subject(args)
+        if not ok:
+            return ToolResult(False,
+                              f"you tried to evaluate JS on {subject} but it failed: "
+                              f"{self._trim(output)}")
+        return ToolResult(True,
+                          f"you evaluated JS on {subject}. Result:\n{self._trim(output)}")
+
+
 class OpenBrowserTool(_WebTool):
     """(Re)open the persistent browser session (issues #101, #75).
 
@@ -959,15 +1215,61 @@ class OpenBrowserTool(_WebTool):
         return ["open"]
 
 
-# The full, ordered set of discrete web tools the toolset exposes. One per basic
-# playwright-cli operation; NO snapshot (page is auto-injected every turn).
-# ``open_browser`` (issues #101/#75) lets the agent restore a dead persistent
-# session — it is the one tool that works when no page is currently open.
+class SnapshotTool(_WebTool):
+    """Explicitly request a fresh page snapshot.
+
+    The page snapshot is auto-injected into the system prompt every turn, but when
+    you interact with a dynamic element (e.g. click opens a dropdown, a page section
+    expands, a field validates), calling snapshot lets you see the CURRENT DOM in the
+    tool result sequence — useful when you need to find the refs of newly appeared
+    options or changed elements mid-turn BEFORE deciding the next action.
+
+    When you call snapshot this turn, the auto-injected snapshot is SUPPRESSED from
+    the next turn's system prompt (since your explicit snapshot IS the fresh state).
+    Use it after clicking a combobox/dropdown to find the option refs you need to click.
+    """
+
+    name = "snapshot"
+    description = (
+        "Capture a fresh page snapshot now and return it as a tool result. "
+        "Use this after clicking a dropdown, combobox, or dynamic element to see the "
+        "updated DOM (including new option refs) before deciding your next action. "
+        "The auto-injected page snapshot in the system prompt is suppressed on the "
+        "following turn since your explicit snapshot is the fresh state. "
+        "Do NOT call this every turn — it is only needed when the page changed mid-turn "
+        "and you need to find newly appeared refs."
+    )
+    _verb = "took a snapshot of"
+
+    # Set to True when run() is called this turn; read by cli.py's snapshot provider
+    # to suppress the auto-injected snapshot on the NEXT turn (no duplication).
+    _called: bool = False
+
+    @property
+    def parameters(self):
+        return []
+
+    def _build(self, args):  # pragma: no cover
+        return ["snapshot"]
+
+    def run(self, args: dict) -> ToolResult:
+        SnapshotTool._called = True
+        ok, output = self._cli.run("snapshot")
+        if not ok:
+            return ToolResult(False, f"snapshot failed: {self._trim(output)}")
+        return ToolResult(True, f"Current page snapshot:\n{self._trim(output)}")
+
+
+# The full, ordered set of discrete web tools the toolset exposes.
+# ``open_browser`` lets the agent restore a dead persistent session.
+# ``snapshot`` lets the agent explicitly request a fresh page view mid-turn.
 _WEB_TOOL_CLASSES: tuple[type[_WebTool], ...] = (
-    OpenBrowserTool,
     GotoTool, ClickTool, FillTool, TypeTool, PressKeyTool, SelectOptionTool,
     CheckTool, UncheckTool, HoverTool, DragTool, UploadTool,
-    ScreenshotTool, NavigateBackTool, NavigateForwardTool, ReloadTool,
+    ReloadTool,
+    # Excluded: OpenBrowserTool (goto opens browser automatically),
+    # EvaluateTool (not needed), SnapshotTool (auto-injected into system prompt),
+    # NavigateBackTool, NavigateForwardTool (not needed), ScreenshotTool (model is not visual).
 )
 
 

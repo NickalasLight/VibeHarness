@@ -28,6 +28,12 @@ class Reporter(ABC):
     @abstractmethod
     def action_result(self, action: "Action") -> None: ...
     @abstractmethod
+    def advisor_start(self) -> None: ...
+    @abstractmethod
+    def advisor_token(self, text: str) -> None: ...
+    @abstractmethod
+    def advisor_end(self) -> None: ...
+    @abstractmethod
     def note(self, text: str) -> None: ...
     @abstractmethod
     def run_end(self, result: "RunResult") -> None: ...
@@ -55,12 +61,16 @@ class NullReporter(Reporter):
     def validator_start(self): pass
     def validator_reasoning_token(self, text): pass
     def validator_verdict_token(self, text): pass
+    def advisor_start(self): pass
+    def advisor_thinking_token(self, text): pass
+    def advisor_token(self, text): pass
+    def advisor_end(self): pass
 
 
 # ANSI styling (enabled on Windows 10+ consoles).
 _C = {"reset": "\033[0m", "dim": "\033[2m", "bold": "\033[1m",
       "green": "\033[32m", "red": "\033[31m", "cyan": "\033[36m", "yellow": "\033[33m",
-      "magenta": "\033[35m"}
+      "magenta": "\033[35m", "blue": "\033[34m"}
 
 
 def _enable_ansi() -> None:
@@ -71,7 +81,7 @@ def _enable_ansi() -> None:
 class ConsoleReporter(Reporter):
     """Streams a live, color-coded view of each turn to the terminal."""
 
-    def __init__(self, color: bool = True, result_limit: int = 240):
+    def __init__(self, color: bool = True, result_limit: int = 2000):
         self._color = color
         self._result_limit = result_limit   # console-only preview cap; agent gets the full result
         if color:
@@ -138,6 +148,27 @@ class ConsoleReporter(Reporter):
         if len(preview) > self._result_limit:
             preview = preview[:self._result_limit] + f" …(+{len(preview) - self._result_limit} more chars)"
         self._w("\n" + self._c(color, f"└ {mark} {preview}") + "\n")
+
+    # ---- advisor stream (rendered in blue, clearly labeled) ----
+    def advisor_start(self) -> None:
+        self._adv_think_open = False
+        self._adv_advice_open = False
+        self._w(self._c("blue", "\n│ ╭─ advisor ──────────────────\n"))
+
+    def advisor_thinking_token(self, text: str) -> None:
+        if not self._adv_think_open:
+            self._w(self._c("blue", "│ ╎ thinking: "))
+            self._adv_think_open = True
+        self._w(self._c("dim", text))
+
+    def advisor_token(self, text: str) -> None:
+        if not self._adv_advice_open:
+            self._w(self._c("blue", "\n│ ╎ advice: "))
+            self._adv_advice_open = True
+        self._w(self._c("blue", text))
+
+    def advisor_end(self) -> None:
+        self._w(self._c("blue", "\n│ ╰────────────────────────────\n"))
 
     def run_end(self, result) -> None:
         n = len(result.turns)

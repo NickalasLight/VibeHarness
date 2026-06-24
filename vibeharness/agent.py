@@ -16,10 +16,18 @@ from __future__ import annotations
 import inspect
 import itertools
 import json
+import re
 import threading
 from dataclasses import asdict, dataclass, field
 
 from typing import Callable
+
+# Matches the first JSON/Hermes tool-call block in a model response so we can
+# extract the free-text preamble the model emitted before it.
+_TOOL_BLOCK_RE = re.compile(
+    r"<tool_call>|```(?:json)?",
+    re.DOTALL,
+)
 
 from .codec import ToolCallCodec, get_codec
 from .config import Config
@@ -135,7 +143,8 @@ class RalphAgent:
         # and how the raw payload is parsed back into (tool, args) pairs.
         self._codec = codec or get_codec("json")
 
-    def run(self, task: str, on_turn: Callable[["RunResult"], None] | None = None) -> RunResult:
+    def run(self, task: str, on_turn: Callable[["RunResult"], None] | None = None,
+            advice_provider: Callable[[int], "str | None"] | None = None) -> RunResult:
         memory = NarrativeMemory()
         result = RunResult(task=task)
         limit = self._cfg.max_actions_per_turn
@@ -155,6 +164,11 @@ class RalphAgent:
         # and to pick an UNHANDLED ref from the snapshot, instead of cycling among the same
         # few. Targets the "can't find the next field" failure mode.
         handled_refs: set[str] = set()
+        # Escalating block pressure: count how many times any blocked action on the same
+        # TARGET has fired. When this reaches 3, we emit a HARD STOP that names the exact
+        # alternative call (select_option / click / evaluate) so a low-capability model
+        # that ignores soft warnings is forced to see the concrete fix every turn.
+        target_block_counts: dict[str, int] = {}
 
         # max_steps <= 0 means run until validation passes.
         turns = (itertools.count(1) if self._cfg.max_steps <= 0
@@ -173,6 +187,12 @@ class RalphAgent:
                 # be zero-arg (legacy: workspace-only refresh) or accept the user message;
                 # _build_system bridges both so older wirings keep working unchanged.
                 user = build_turn_prompt(task, memory.render(), self._codec.turn_action_hint())
+                # Inject advisor hint when available (injected by caller via advice_provider).
+                if advice_provider is not None:
+                    hint = advice_provider(i)
+                    if hint:
+                        user += (f"\n\n<user_advice>The human user gives you the following "
+                                 f"hint: '{hint}'</user_advice>")
                 system = self._build_system(user)
                 decision = self._decide(system, user, constraint)
                 if decision is None:
@@ -191,20 +211,41 @@ class RalphAgent:
                 turn = Turn(index=i, reasoning=decision.reasoning, raw_action=decision.action_json)
                 result.turns.append(turn)
 
+                # For single-phase models (two_phase=False, e.g. Qwen) the reasoning
+                # field is always "". The model's preamble — whatever it wrote before
+                # the <tool_call> block — lives in raw_action instead. Record it into
+                # the narrative so the model can reference its own prior thinking on
+                # the next turn (helps catch "I already did X" confusions).
+                if not decision.reasoning:
+                    m = _TOOL_BLOCK_RE.search(decision.action_json or "")
+                    preamble = (decision.action_json[:m.start()].strip() if m
+                                else "").strip()
+                    if preamble:
+                        memory.record(f"you reasoned: {preamble[:400]}")
+
                 actions, error = self._codec.parse(decision.action_json)
                 if error is not None:
                     self._record(turn, Action(None, {}, f"your last response was invalid and "
                                               f"could not be run: {error}.", ok=False), memory)
                 else:
                     # Defensive guard: even if a batch slips past the schema cap, only the
-                    # first `limit` actions run. Record a brief note so the model knows.
+                    # first `limit` actions run. Explicitly list the dropped calls so the
+                    # model can re-issue them with the SAME tools on the next turn — silent
+                    # dropping caused the Country combobox to be re-attempted with fill
+                    # instead of select_option in iter3 (13 wasted turns).
                     if limit > 0 and len(actions) > limit:
-                        dropped = len(actions) - limit
+                        dropped_calls = actions[limit:]
                         actions = actions[:limit]
-                        self._record(turn, Action(None, {}, f"you emitted more than the "
-                                                  f"per-turn limit of {limit} actions; only the "
-                                                  f"first {limit} were run ({dropped} ignored).",
-                                                  ok=False), memory)
+                        dropped_desc = "; ".join(
+                            f"{t}({', '.join(f'{k}={repr(v)[:40]}' for k, v in (a or {}).items())})"
+                            for t, a in dropped_calls
+                        )
+                        self._record(turn, Action(None, {}, (
+                            f"ERROR: you emitted {limit + len(dropped_calls)} actions but the "
+                            f"per-turn limit is {limit}. The following {len(dropped_calls)} "
+                            f"action(s) were NOT executed — re-issue them on your NEXT turn "
+                            f"with the SAME tools and exact values: {dropped_desc}"
+                        ), ok=False), memory)
                     for tool_name, args in actions:
                         if tool_name == "validate":
                             self._validate(args, turn, memory, result, user)
@@ -213,20 +254,48 @@ class RalphAgent:
                             continue
                         sig = self._action_signature(tool_name, args)
                         if sig is not None and sig in attempted:
-                            payload = json.dumps(args, ensure_ascii=False)
+                            target = args.get("target", "")
+                            value = args.get("text") or args.get("value") or ""
                             if attempted[sig]:
-                                obs = (f"you ALREADY did this exact action successfully earlier "
-                                       f"this run ({tool_name} {payload}); repeating it makes no "
-                                       f"progress. Do something DIFFERENT now — act on the NEXT "
-                                       f"field or element you have not handled yet, or advance the "
-                                       f"form (e.g. click a Next/Continue/Submit control).")
+                                obs = (f"WARNING: '{target}' was already successfully set to "
+                                       f"'{value}' earlier this run. You are now trying to set "
+                                       f"it to '{value}' again — the same value. This is a "
+                                       f"no-op: the field already holds that value. If you "
+                                       f"intended a different value, call {tool_name} with the "
+                                       f"corrected value instead. Otherwise move to the NEXT "
+                                       f"unfilled field or click Next/Continue/Submit.")
                             else:
-                                obs = (f"this exact action already FAILED earlier this run "
-                                       f"({tool_name} {payload}) and will fail the same way again. "
-                                       f"Do NOT repeat it — pick a DIFFERENT ref that actually "
-                                       f"appears in the current page snapshot, use a different tool, "
-                                       f"or advance the form. Never reuse a ref that is not in the "
-                                       f"snapshot.")
+                                # Escalating pressure for failure loops on the same target.
+                                count = target_block_counts.get(target, 0) + 1
+                                target_block_counts[target] = count
+                                if count >= 3:
+                                    obs = (
+                                        f"HARD STOP: {tool_name}('{target}') has been blocked "
+                                        f"{count} times. Text-input tools (fill/type/press_key) "
+                                        f"will NEVER work on this element. You are REQUIRED to "
+                                        f"use one of these RIGHT NOW:\n"
+                                        f"  • select_option(target='{target}', value='{value}') "
+                                        f"— if it is a native <select> or custom dropdown\n"
+                                        f"  • click(target='{target}') — to open a custom "
+                                        f"combobox, then click the matching option from the "
+                                        f"updated snapshot\n"
+                                        f"  • evaluate(expression='el => el.tagName + \" \" + "
+                                        f"(el.getAttribute(\"role\")||el.type)', target='{target}') "
+                                        f"— to inspect the element type before choosing\n"
+                                        f"Do NOT call {tool_name} on '{target}' again. "
+                                        f"Pick one of the three options above NOW."
+                                    )
+                                else:
+                                    obs = (f"WARNING: you already attempted {tool_name} on "
+                                           f"'{target}' (value: '{value}') and it FAILED. "
+                                           f"That element may be a dropdown, combobox, date "
+                                           f"picker, file upload, or other non-text component "
+                                           f"that does not accept a direct fill. Try a different "
+                                           f"approach: use select_option to choose from a list, "
+                                           f"click '{target}' to open it first, use evaluate to "
+                                           f"inspect what kind of element it is, or use "
+                                           f"press_key after clicking it. "
+                                           f"Do NOT call {tool_name} on '{target}' again.")
                             if handled_refs:
                                 obs += (" You have already successfully handled these refs: "
                                         f"{', '.join(sorted(handled_refs))} — pick a fillable/"

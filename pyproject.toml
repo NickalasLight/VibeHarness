@@ -20,7 +20,7 @@ classifiers = [
 dependencies = []  # standard library only
 
 [project.optional-dependencies]
-dev = ["pytest>=7"]
+dev = ["pytest>=7", "jinja2>=3"]
 
 [project.urls]
 Homepage = "https://github.com/NickalasLight/VibeHarness"
@@ -41,4 +41,5 @@ markers = [
     "needs_ollama: requires a live Ollama server",
     "needs_web: requires playwright-cli + the demo web app at localhost:3000",
     "slow: slow / real-model test (not part of the fast unit lane)",
+    "integration: network/HuggingFace-dependent test (skipped when offline or HF_TOKEN absent)",
 ]
