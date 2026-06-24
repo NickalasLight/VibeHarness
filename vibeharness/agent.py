@@ -13,6 +13,7 @@ NarrativeMemory and a Reporter.
 """
 from __future__ import annotations
 
+import inspect
 import itertools
 import json
 import threading
@@ -85,6 +86,27 @@ class RunResult:
         return "\n".join(out)
 
 
+def _accepts_one_positional(fn: Callable) -> bool:
+    """True if ``fn`` can be called with exactly one positional argument.
+
+    Used to distinguish a snapshot-budgeting system-prompt provider (takes the
+    per-turn user message) from a legacy zero-arg provider, without ever swallowing
+    a TypeError that the provider itself might raise.
+    """
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return False
+    positional = 0
+    for p in sig.parameters.values():
+        if p.kind in (inspect.Parameter.POSITIONAL_ONLY,
+                      inspect.Parameter.POSITIONAL_OR_KEYWORD):
+            positional += 1
+        elif p.kind == inspect.Parameter.VAR_POSITIONAL:
+            return True  # *args accepts one positional
+    return positional >= 1
+
+
 class RalphAgent:
     def __init__(self, client: LLMClient, registry: ToolRegistry, system_prompt: str,
                  config: Config, validator: Validator, reporter: Reporter | None = None,
@@ -100,6 +122,9 @@ class RalphAgent:
         # each turn to regenerate the system prompt (e.g. with a fresh workspace
         # tree); when None, the static system_prompt above is reused every turn.
         self._system_provider = system_prompt_provider
+        # Cached arity of the provider (does it accept the per-turn user message?).
+        # Resolved lazily on first use so the inspection happens once per run.
+        self._provider_wants_user: bool | None = None
         # The tool-call codec owns the action wire format: the decode constraint
         # and how the raw payload is parsed back into (tool, args) pairs.
         self._codec = codec or get_codec("json")
@@ -121,8 +146,13 @@ class RalphAgent:
             # turn and never lose the actions that already completed this turn.
             turn: Turn | None = None
             try:
-                system = self._system_provider() if self._system_provider else self._system
+                # Build the per-turn user message FIRST so a system-prompt provider can
+                # size the live page snapshot against the FULL message it will share the
+                # context window with (issue #43 dynamic snapshot budget). Providers may
+                # be zero-arg (legacy: workspace-only refresh) or accept the user message;
+                # _build_system bridges both so older wirings keep working unchanged.
                 user = build_turn_prompt(task, memory.render(), self._codec.turn_action_hint())
+                system = self._build_system(user)
                 decision = self._decide(system, user, constraint)
                 if decision is None:
                     # The turn exceeded its wall-clock generation budget. Record a
@@ -186,6 +216,24 @@ class RalphAgent:
                 break
 
         return result
+
+    def _build_system(self, user: str) -> str:
+        """Produce this turn's system prompt.
+
+        With no provider, the static system prompt is reused. With a provider, call
+        it to regenerate the prompt fresh (workspace tree, live page snapshot, …).
+        The provider may optionally accept the per-turn ``user`` message so it can
+        budget the page snapshot against the full message (issue #43); zero-arg
+        providers (the legacy workspace-refresh seam) are still supported.
+        """
+        provider = self._system_provider
+        if provider is None:
+            return self._system
+        # Inspect the provider's arity ONCE so we never confuse a legacy zero-arg
+        # provider with one that raised TypeError internally (a bare try/except would).
+        if self._provider_wants_user is None:
+            self._provider_wants_user = _accepts_one_positional(provider)
+        return provider(user) if self._provider_wants_user else provider()
 
     # ---- per-turn generation, bounded by a wall-clock budget ----
     def _decide(self, system: str, user: str, constraint) -> Decision | None:

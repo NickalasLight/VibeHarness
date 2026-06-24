@@ -25,9 +25,10 @@ from .prompt import SystemPromptBuilder
 from .reporting import ConsoleReporter
 from .runlog import RunLogger
 from .settings import Settings, settable_keys
+from .snapshot_budget import compute_snapshot_budget, render_budgeted_snapshot
 from .toolset import ToolsetCatalog, agent_default_toolsets, default_catalog
 from .validation import LLMValidator
-from .web import make_snapshot_provider
+from .web import make_raw_snapshot_provider, make_snapshot_provider
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -270,6 +271,52 @@ def run_agent(args: argparse.Namespace) -> int:
         lock.release()
 
 
+def make_system_prompt_provider(builder, config, task, render_workspace,
+                                raw_snapshot_provider):
+    """Build the per-turn system-prompt provider with the DYNAMIC snapshot budget (#43).
+
+    Returns a callable taking the per-turn ``user`` message (RalphAgent passes it so
+    the snapshot can be sized against the FULL model message). Each turn:
+
+      1. Render the workspace and capture the UNTRUNCATED live page snapshot.
+      2. Build ``rest`` = the system prompt WITHOUT the page section + the user
+         message. This is everything that will share the context window besides the
+         snapshot.
+      3. Size the snapshot to the remaining token budget and truncate it to fit.
+      4. Rebuild the system prompt with the budgeted snapshot injected.
+
+    When no snapshot provider is wired (web inactive), this degrades to the original
+    workspace-only refresh — no page section, no budgeting work.
+    """
+    def provider(user: str = "") -> str:
+        workspace = render_workspace()
+        if raw_snapshot_provider is None:
+            return builder.build(task, workspace=workspace, page="")
+        raw = raw_snapshot_provider()
+        if not raw:
+            # No live page this turn: render no page section (issue #24 behaviour).
+            return builder.build(task, workspace=workspace, page="")
+        # The "rest" of the message: system prompt with NO page section + the user
+        # turn message. We measure this to learn how much room the snapshot has.
+        rest_system = builder.build(task, workspace=workspace, page="")
+        rest_text = rest_system + user
+        budget = compute_snapshot_budget(config, rest_text)
+        if budget.overflow:
+            # The rest of the message already fills the window: inject NO snapshot and
+            # warn, so we never overflow num_ctx (issue #43).
+            print(
+                f"\nwarning: the message without the page snapshot "
+                f"(~{budget.rest_tokens} tokens) already meets the input budget of "
+                f"~{budget.input_budget_tokens} tokens; injecting no page snapshot this "
+                f"turn to stay within num_ctx ({config.num_ctx}).",
+                file=sys.stderr,
+            )
+            return builder.build(task, workspace=workspace, page="")
+        page = render_budgeted_snapshot(raw, budget.budget_chars)
+        return builder.build(task, workspace=workspace, page=page)
+    return provider
+
+
 def _run_locked(args, task, config, registry, codec, names, workdir, logger,
                 system_prompt, toolsets) -> int:
     reporter = ConsoleReporter(color=not args.no_color)
@@ -300,13 +347,15 @@ def _run_locked(args, task, config, registry, codec, names, workdir, logger,
     # existing Playwright session each turn; because the whole prompt is rebuilt per
     # turn, only the latest snapshot is ever present (stale-dropping by regeneration —
     # never written to narrative memory). When web is not active, no page section.
-    snapshot_provider = (make_snapshot_provider(config) if "web" in names else None)
+    #
+    # Issue #43: the snapshot is sized DYNAMICALLY. We capture it UNTRUNCATED, then
+    # truncate it only as much as the context window requires once the rest of the
+    # message (system prompt minus the page section + the per-turn user message) is
+    # known. So the provider takes the per-turn ``user`` message (see RalphAgent).
+    raw_snapshot_provider = (make_raw_snapshot_provider(config) if "web" in names else None)
 
-    def render_page() -> str:
-        return snapshot_provider() if snapshot_provider else ""
-
-    system_prompt_provider = lambda: builder.build(
-        task, workspace=render_workspace(), page=render_page())
+    system_prompt_provider = make_system_prompt_provider(
+        builder, config, task, render_workspace, raw_snapshot_provider)
     agent = RalphAgent(client, registry, system_prompt, config, validator,
                        reporter=reporter, system_prompt_provider=system_prompt_provider,
                        codec=codec)

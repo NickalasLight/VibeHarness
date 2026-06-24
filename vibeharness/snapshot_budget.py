@@ -131,3 +131,15 @@ def truncate_snapshot(raw: str, budget_chars: int) -> tuple[str, int]:
     if len(raw) <= budget_chars:
         return raw, 0
     return raw[:budget_chars], len(raw) - budget_chars
+
+
+def render_budgeted_snapshot(raw: str, budget_chars: int) -> str:
+    """Truncate ``raw`` to ``budget_chars`` and append the truncation marker iff
+    truncation occurred. The marker matches web.py's existing rendering so logs read
+    consistently. Returns "" when nothing fits (``budget_chars <= 0``)."""
+    body, dropped = truncate_snapshot(raw, budget_chars)
+    if dropped <= 0:
+        return body
+    if not body:
+        return ""  # zero budget -> inject nothing (caller warns separately)
+    return body + f"\n…[+{dropped} chars truncated]"

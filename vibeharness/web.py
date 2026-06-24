@@ -263,6 +263,23 @@ def capture_page_snapshot(cli: PlaywrightCli, char_limit: int) -> str:
     return text[:char_limit] + f"\n…[+{len(text) - char_limit} chars truncated]"
 
 
+def capture_page_snapshot_raw(cli: PlaywrightCli) -> str:
+    """Capture a fresh `snapshot` of the live page WITHOUT truncation (issue #43).
+
+    Same session-sharing and never-raises contract as :func:`capture_page_snapshot`,
+    but returns the full snapshot text so the caller can apply the DYNAMIC budget
+    (truncate only as much as the context window requires). Returns "" on any
+    failure (no session, CLI error, timeout).
+    """
+    try:
+        ok, output = cli.run("snapshot")
+    except Exception:
+        return ""
+    if not ok:
+        return ""
+    return (output or "").strip()
+
+
 def make_snapshot_provider(config: Config) -> Callable[[], str]:
     """Build a per-turn page-snapshot provider bound to the run's web session.
 
@@ -271,9 +288,25 @@ def make_snapshot_provider(config: Config) -> Callable[[], str]:
     snapshot from the run's existing Playwright session and returns it truncated to
     ``config.web_snapshot_char_limit``. The session name and timeout come from
     ``config`` so the snapshot CLI shares the exact session the `browse` tool uses.
+
+    NOTE (#43): this fixed-cap provider is retained for backward compatibility and
+    tests; the live run now uses :func:`make_raw_snapshot_provider` plus the dynamic
+    budget so the snapshot is sized against the full message each turn.
     """
     cli = PlaywrightCli(config.web_session, config.web_cli_timeout)
     return lambda: capture_page_snapshot(cli, config.web_snapshot_char_limit)
+
+
+def make_raw_snapshot_provider(config: Config) -> Callable[[], str]:
+    """Build a per-turn provider that returns the UNTRUNCATED live snapshot (#43).
+
+    The dynamic snapshot budget (see :mod:`vibeharness.snapshot_budget`) needs the
+    raw snapshot so it can decide, against the full message, how much of it fits. As
+    with :func:`make_snapshot_provider` it binds the run's session/timeout from
+    ``config`` and never raises (returns "" when no page is available).
+    """
+    cli = PlaywrightCli(config.web_session, config.web_cli_timeout)
+    return lambda: capture_page_snapshot_raw(cli)
 
 
 class WebToolset(Toolset):
