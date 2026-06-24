@@ -85,6 +85,25 @@ _NO_MATCH_MARKERS: tuple[str, ...] = (
 )
 
 
+def annotate_filled_snapshot(snapshot: str, filled: dict[str, str]) -> str:
+    """Append filled-value markers to snapshot lines whose ref is in ``filled``.
+
+    Each matching line gets:  ``  [ALREADY FILLED WITH 'value' — DO NOT FILL AGAIN]``
+    appended, so the model knows which elements are already handled.
+    """
+    if not snapshot or not filled:
+        return snapshot
+    lines = []
+    for line in snapshot.splitlines():
+        m = _REF_RE.search(line)
+        if m:
+            ref = f"e{m.group(1)}"
+            if ref in filled:
+                line = f"{line}  [ALREADY FILLED WITH '{filled[ref]}' — DO NOT FILL AGAIN]"
+        lines.append(line)
+    return "\n".join(lines)
+
+
 def parse_snapshot_refs(snapshot: str) -> set[str]:
     """Extract the set of element refs (``e163`` …) present in a live page snapshot.
 

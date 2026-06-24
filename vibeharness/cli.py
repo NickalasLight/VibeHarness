@@ -34,8 +34,9 @@ from .toolset import (
     default_catalog,
 )
 from .validation import LLMValidator
-from .web import make_raw_snapshot_provider, resolve_web_session
+from .web import annotate_filled_snapshot, make_raw_snapshot_provider, resolve_web_session
 from .snapshot_prose import aria_yaml_to_prose
+from .advisor import VibeThinkerAdvisor
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -86,6 +87,9 @@ current default temperature: {saved_temp}
                         "--agent's default. (default: fs). e.g. --toolset web,fs")
     p.add_argument("--headless", action="store_true",
                    help="run the web browser headless (default: headed so you can watch)")
+    p.add_argument("--advisor", action="store_true",
+                   help="enable VibeThinker advisor: every 5 Qwen turns inject a free-text "
+                        "hint from VibeThinker into the agent's user message (beta_qwen3coder)")
     p.add_argument("--web-snapshot-prose", action="store_true",
                    help="render the live page snapshot as WebArena-style prose (pruned, "
                         "ref-keyed) instead of raw ARIA-YAML (issue #64; A/B seam)")
@@ -227,6 +231,8 @@ def resolve_config(args: argparse.Namespace) -> Config:
         overrides["web_headless"] = True
     if getattr(args, "web_snapshot_prose", False):
         overrides["web_snapshot_prose"] = True
+    if getattr(args, "advisor", False):
+        overrides["advisor_enabled"] = True
     cfg = replace(cfg, **overrides) if overrides else cfg
     # Mint a UNIQUE per-run Playwright session name (issues #111/#112) so concurrent
     # runs never share — and tear down — one another's browser daemon. An explicitly
@@ -470,6 +476,14 @@ def _run_locked(args, task, config, registry, codec, names, workdir, logger,
     reporter.run_start(task, str(workdir), config)
     print(f" toolsets: {', '.join(names)} (+ validate)")
 
+    # Advisor: allow two models in VRAM simultaneously BEFORE constructing OllamaClient
+    # (ensure_single_runner_env uses setdefault so this must come first).
+    if config.advisor_enabled:
+        os.environ["OLLAMA_MAX_LOADED_MODELS"] = "2"
+        advisor = VibeThinkerAdvisor(config)
+    else:
+        advisor = None
+
     client = OllamaClient(config)
     validator = LLMValidator(client, logger=logger, config=config)
 
@@ -507,6 +521,16 @@ def _run_locked(args, task, config, registry, codec, names, workdir, logger,
         _inner_snapshot_provider = raw_snapshot_provider
         raw_snapshot_provider = lambda: aria_yaml_to_prose(_inner_snapshot_provider())
 
+    # Filled-control annotation: track which refs the agent has successfully filled this
+    # run and annotate those lines in the snapshot with "ALREADY FILLED WITH '...'".
+    # Updated by the checkpoint after each turn; read by the snapshot provider each turn.
+    filled_controls: dict[str, str] = {}
+    if raw_snapshot_provider is not None:
+        import json as _json
+        _inner_for_fill = raw_snapshot_provider
+        raw_snapshot_provider = lambda: annotate_filled_snapshot(
+            _inner_for_fill(), filled_controls)
+
     # The per-turn provider applies #43's dynamic snapshot budget AND, given the
     # logger, performs #37's per-turn diagnostic dump (raw snapshot + injected prompt).
     system_prompt_provider = make_system_prompt_provider(
@@ -523,7 +547,34 @@ def _run_locked(args, task, config, registry, codec, names, workdir, logger,
                        reporter=reporter, system_prompt_provider=system_prompt_provider,
                        codec=codec, validator_context_provider=validator_context_provider)
 
-    checkpoint = lambda res: _safe_log(logger, task, config, res)   # stream log each turn
+    # Advisor advice buffer: the checkpoint populates it every N turns; advice_provider
+    # drains it once at the start of the next turn and injects it into the user message.
+    _advice_buffer: list[str] = []
+
+    def checkpoint(res: RunResult) -> None:
+        # Update filled_controls from the latest turn's successful fill/select actions.
+        if res.turns:
+            latest = res.turns[-1]
+            for a in latest.actions:
+                if not a.ok or not a.args:
+                    continue
+                tgt = a.args.get("target")
+                if a.tool in ("fill", "type") and tgt and isinstance(a.args.get("text"), str):
+                    filled_controls[tgt] = a.args["text"]
+                elif a.tool == "select_option" and tgt and isinstance(a.args.get("value"), str):
+                    filled_controls[tgt] = a.args["value"]
+                elif a.tool == "check" and tgt:
+                    filled_controls[tgt] = "(checked)"
+        _safe_log(logger, task, config, res)
+        # Trigger advisor every N turns when enabled.
+        if advisor is not None and res.turns and len(res.turns) % config.advisor_interval == 0:
+            advice = advisor.advise(task, res.turns)
+            _advice_buffer.clear()
+            _advice_buffer.append(advice)
+
+    def advice_provider(turn_idx: int) -> str | None:
+        return _advice_buffer.pop() if _advice_buffer else None
+
     # Write an initial log at run START (before turn 1). on_turn fires only AFTER a
     # turn completes, so without this a turn that hangs or raises mid-way would leave
     # NO log at all. Creating the .vibe/ folder + a seed log up front guarantees a
@@ -538,7 +589,8 @@ def _run_locked(args, task, config, registry, codec, names, workdir, logger,
     try:
         for ts in toolsets:
             ts.setup(config)
-        result = agent.run(task, on_turn=checkpoint)
+        result = agent.run(task, on_turn=checkpoint,
+                           advice_provider=advice_provider if advisor else None)
     except OllamaUnavailable as e:
         print(f"\nerror: {e}", file=sys.stderr)
         return 1   # the start/streamed log on disk already holds the last known state

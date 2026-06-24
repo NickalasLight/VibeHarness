@@ -176,6 +176,15 @@ class Config:
     web_headless: bool = False        # headed by default so a human can watch
     web_browser: str = "chrome"
 
+    # VibeThinker advisor — periodic free-text hint injector (beta_qwen3coder only).
+    # When advisor_enabled=True, every advisor_interval Qwen turns VibeThinker is called
+    # (free-text, no schema) and its advice is injected into Qwen's next turn user message
+    # as <user_advice>...</user_advice>. Requires OLLAMA_MAX_LOADED_MODELS=2.
+    advisor_model: str = "vibethinker:latest"
+    advisor_temperature: float = 1.0   # high diversity for advice
+    advisor_interval: int = 5          # call advisor every N Qwen turns
+    advisor_enabled: bool = False      # opt-in; set True via CLI or settings
+
     # --- snapshot prose rendering (issue #64) ---
     # When True, the auto-injected live page snapshot is run through the deterministic
     # WebArena-style ARIA->prose transform (vibeharness.snapshot_prose) before injection,

@@ -135,7 +135,8 @@ class RalphAgent:
         # and how the raw payload is parsed back into (tool, args) pairs.
         self._codec = codec or get_codec("json")
 
-    def run(self, task: str, on_turn: Callable[["RunResult"], None] | None = None) -> RunResult:
+    def run(self, task: str, on_turn: Callable[["RunResult"], None] | None = None,
+            advice_provider: Callable[[int], "str | None"] | None = None) -> RunResult:
         memory = NarrativeMemory()
         result = RunResult(task=task)
         limit = self._cfg.max_actions_per_turn
@@ -173,6 +174,12 @@ class RalphAgent:
                 # be zero-arg (legacy: workspace-only refresh) or accept the user message;
                 # _build_system bridges both so older wirings keep working unchanged.
                 user = build_turn_prompt(task, memory.render(), self._codec.turn_action_hint())
+                # Inject advisor hint when available (injected by caller via advice_provider).
+                if advice_provider is not None:
+                    hint = advice_provider(i)
+                    if hint:
+                        user += (f"\n\n<user_advice>The human user gives you the following "
+                                 f"hint: '{hint}'</user_advice>")
                 system = self._build_system(user)
                 decision = self._decide(system, user, constraint)
                 if decision is None:
