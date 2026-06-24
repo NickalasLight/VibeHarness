@@ -251,9 +251,9 @@ class WebToolset(Toolset):
 
     def system_guidance(self) -> str | None:
         return (
-            "A snapshot is your only view of the page, so take a fresh one after every "
-            "navigation or click and read it before deciding what to do next. "
-            "Act only on elements present in the current snapshot, referencing them by their "
+            "The current page is shown to you each turn under '# Current page (live snapshot)' — "
+            "read it before deciding what to do next. "
+            "Act only on elements present in that snapshot, referencing them by their "
             "ref — never guess a selector or element id. "
             "If a cookie/consent banner or modal dialog blocks what you need, clear it first: "
             "locate its Accept / Agree / Reject / Dismiss / Continue control in the snapshot and "
