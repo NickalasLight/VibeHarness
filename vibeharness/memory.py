@@ -14,9 +14,6 @@ class NarrativeMemory:
     def record(self, observation: str) -> None:
         self._steps.append(observation)
 
-    def is_empty(self) -> bool:
-        return not self._steps
-
     def render(self) -> str:
         if not self._steps:
             return "You have not taken any actions yet."

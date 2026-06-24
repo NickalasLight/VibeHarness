@@ -66,29 +66,8 @@ class OllamaClient(LLMClient):
                              "stream": True, "options": self._options()}).encode(),
             headers={"Content-Type": "application/json"},
         )
-        parts: list[str] = []
-        produced = 0
-        try:
-            with urllib.request.urlopen(req, timeout=self._cfg.request_timeout) as resp:
-                for raw in resp:
-                    line = raw.decode("utf-8").strip()
-                    if not line:
-                        continue
-                    obj = json.loads(line)
-                    chunk = obj.get("response", "")
-                    if chunk:
-                        parts.append(chunk)
-                        produced += len(chunk)
-                        if on_token:
-                            on_token(chunk)
-                    if (max_chars is not None and produced >= max_chars) or obj.get("done"):
-                        break
-        except urllib.error.URLError as e:
-            raise OllamaUnavailable(
-                f"Could not reach Ollama at {self._cfg.ollama_url}. "
-                f"Is it running? Start it with `ollama serve`. ({e.reason})"
-            ) from e
-        return "".join(parts)
+        return self._read_stream(req, lambda obj: obj.get("response", ""),
+                                 on_token, max_chars=max_chars)
 
     # ---- phase 1: free reasoning, stop at </think> ----
     def _reason(self, system: str, user: str, on_token: TokenSink | None) -> str:
@@ -128,7 +107,24 @@ class OllamaClient(LLMClient):
             data=json.dumps({**payload, "stream": True}).encode(),
             headers={"Content-Type": "application/json"},
         )
+        return self._read_stream(req, self._chat_or_response, on_token)
+
+    @staticmethod
+    def _chat_or_response(obj: dict) -> str:
+        # /api/chat streams text under message.content; /api/generate under response.
+        return (obj.get("message", {}).get("content")
+                if "message" in obj else obj.get("response", ""))
+
+    def _read_stream(self, req: urllib.request.Request,
+                     extract: Callable[[dict], str],
+                     on_token: TokenSink | None,
+                     max_chars: int | None = None) -> str:
+        """Shared streamed-read loop: open ``req``, decode each NDJSON line, pull
+        the text chunk via ``extract``, feed ``on_token``, and stop on ``done`` (or
+        early once ``max_chars`` characters have been produced, closing the
+        connection). Raises :class:`OllamaUnavailable` if the server is down."""
         parts: list[str] = []
+        produced = 0
         try:
             with urllib.request.urlopen(req, timeout=self._cfg.request_timeout) as resp:
                 for raw in resp:
@@ -136,13 +132,13 @@ class OllamaClient(LLMClient):
                     if not line:
                         continue
                     obj = json.loads(line)
-                    chunk = (obj.get("message", {}).get("content")
-                             if "message" in obj else obj.get("response", ""))
+                    chunk = extract(obj)
                     if chunk:
                         parts.append(chunk)
+                        produced += len(chunk)
                         if on_token:
                             on_token(chunk)
-                    if obj.get("done"):
+                    if (max_chars is not None and produced >= max_chars) or obj.get("done"):
                         break
         except urllib.error.URLError as e:
             raise OllamaUnavailable(
