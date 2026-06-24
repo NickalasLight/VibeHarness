@@ -26,7 +26,7 @@ class Config:
     action_tokens: int = 16384        # phase 2 (constrained JSON action) — can be large
 
     # observation rendering
-    observation_char_limit: int = 1500  # truncate big tool outputs in the narrative
+    observation_char_limit: int = 12000  # truncate big tool outputs in the narrative
 
     # backend
     ollama_url: str = "http://127.0.0.1:11434"
@@ -35,6 +35,6 @@ class Config:
     # web toolset (Playwright Agent CLI)
     web_session: str = "vibe"
     web_cli_timeout: int = 90
-    web_observation_char_limit: int = 4000
+    web_observation_char_limit: int = 14000
     web_headless: bool = False        # headed by default so a human can watch
     web_browser: str = "chrome"
