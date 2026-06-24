@@ -1,13 +1,13 @@
 {
   "phase": "optimizing",
-  "iteration": 2,
-  "last_score": 48,
+  "iteration": 3,
+  "last_score": 22,
   "best_score": 48,
   "vibethinker_enabled": false,
   "rewrite_pr_merged": true,
   "hf_test_pr_merged": true,
   "finished": false,
-  "notes": "Iter 2 RUNNING (PID=14720). Turn 7 at Jan 2022 calendar nav — agent manually clicking Next Year. Root causes identified and FIXED for iter-3: (1) _select_via_combobox now presses Escape before clicking trigger to close any open overlay; (2) task_iter4.txt: work arrangement value fixed to 'Hybrid' (agent passed hint text); (3) ONE-DROPDOWN-AT-A-TIME warning added. These changes are committed to branch (not yet PR). Agent passed 'I already live in the Dallas, TX area' correctly. Spinbutton guard active. Calendar nav expected to complete ~40 more min; then work arrangement, then page 3+. Iter-2 expected score 50-80 depending on page advance. Side task: job_app_benchmark identifier randomization complete (data-field/data-name suffixed with per-visit hex token, commit 4ac627d on main). See issue #142.",
+  "notes": "Iter 2 COMPLETE: score=22 (12/26 fields + 1 page advance + 0 submit) — REGRESSION from iter-1=48. Run died on Step 2 (Work Eligibility) after burning 18 of 20 turns: (1) agent called select_option on the date combobox while the work-arrangement listbox overlay was still OPEN -> 'not a <select>' error -> calendar handler never ran -> 10 turns of MANUAL year/month nav (turns 4-12); (2) work arrangement 'Hybrid' never set (agent passed the hint text, not the option text); (3) turns 14-19: Continue clicked WITHOUT work arrangement -> validation rejected -> 4 BLIND Continue re-clicks, never read the validation alerts, never recovered. Fixes committed: Escape-before-trigger in _select_via_combobox (commit 12c9cf8); task_iter4.txt 'Hybrid' exact value + ONE-DROPDOWN-AT-A-TIME rule (12c9cf8). NEW iter-2-analysis fix: _check_dom_delta now detects validation `alert` nodes after a rejected Continue click and surfaces them explicitly ('FORM NOT ADVANCED — fix these errors before clicking Continue again') so the model stops the blind Continue loop. See issue #142.",
   "ground_truth": {
     "tool_schema_format": "bare {name,description,parameters} for hand-crafted <tools>; ENVELOPED {type:function,function:{...}} for Ollama native tools: API field",
     "tool_result_role": "role:tool works via Ollama native API (Ollama handles it internally)",
@@ -18,9 +18,9 @@
     "context_window": "num_ctx=32768 required (OLLAMA_FLASH_ATTENTION=1 makes it safe at ~4500 MiB). 16384 gives only 7168 token input budget — too small for 8-page form. Restore to 32768.",
     "scoring_system": "GET http://localhost:3000/api/score/session-end at end of each run. Writes .vibe/last_benchmark_score.json with commitMessageStart.",
     "loop_issue": "Full loop architecture documented in GitHub issue #142 on VibeHarness repo.",
-    "iter3_fixes": "Escape in _select_via_combobox; work arrangement='Hybrid'; ONE-DROPDOWN-AT-A-TIME warning; calendar select_option is atomic in tool (no manual nav needed)"
+    "iter3_fixes": "Escape in _select_via_combobox; work arrangement='Hybrid'; ONE-DROPDOWN-AT-A-TIME warning; calendar select_option is atomic in tool (no manual nav needed); _check_dom_delta surfaces validation alerts on rejected Continue (FORM NOT ADVANCED steer) to break blind Continue loops"
   },
-  "run_pid": 14720,
-  "run_log": "C:\\git\\vibethinkharnessProto1\\vibe_run_iter2_restart.log",
+  "run_pid": null,
+  "run_log": "C:\\git\\vibethinkharnessProto1\\vibe_run_iter3.log",
   "task_id": "1"
 }
