@@ -264,13 +264,13 @@ def capture_page_snapshot(cli: PlaywrightCli, char_limit: int) -> str:
 
 
 def capture_page_snapshot_raw(cli: PlaywrightCli) -> str:
-    """Capture the COMPLETE, UNTRUNCATED `snapshot` of the live page (issue #37).
+    """Capture the COMPLETE, UNTRUNCATED `snapshot` of the live page (issues #37, #43).
 
-    Identical to :func:`capture_page_snapshot` but applies NO char cap, so callers
-    get ground truth on the snapshot's true size for diagnostic logging. Kept
-    deliberately separate from the truncating capture so the per-turn injection
-    path (#24/#43) is untouched. On any failure returns "" so a diagnostic dump
-    simply records nothing rather than crashing the run.
+    Same session-sharing and never-raises contract as :func:`capture_page_snapshot`,
+    but applies NO char cap. #37 uses it for ground-truth diagnostic logging; #43
+    uses it so the per-turn injection can apply the DYNAMIC context-budget truncation
+    (truncate only as much as the context window requires). Returns "" on any failure
+    (no session, CLI error, timeout) so callers record nothing rather than crash.
     """
     try:
         ok, output = cli.run("snapshot")
@@ -282,11 +282,12 @@ def capture_page_snapshot_raw(cli: PlaywrightCli) -> str:
 
 
 def make_raw_snapshot_provider(config: Config) -> Callable[[], str]:
-    """Build a per-turn provider of the RAW, untruncated page snapshot (issue #37).
+    """Build a per-turn provider of the RAW, untruncated page snapshot (issues #37, #43).
 
-    Mirrors :func:`make_snapshot_provider` but returns the full snapshot with no
-    char cap, for diagnostic ground-truth sizing. Uses the run's existing session
-    (same name/timeout from ``config``) so it reflects the page the model acts on.
+    Mirrors :func:`make_snapshot_provider` but returns the full snapshot with no char
+    cap — for #37 diagnostic ground-truth sizing and #43's dynamic-budget truncation.
+    Uses the run's existing session (same name/timeout from ``config``) so it reflects
+    the page the model acts on.
     """
     cli = PlaywrightCli(config.web_session, config.web_cli_timeout)
     return lambda: capture_page_snapshot_raw(cli)
@@ -300,9 +301,25 @@ def make_snapshot_provider(config: Config) -> Callable[[], str]:
     snapshot from the run's existing Playwright session and returns it truncated to
     ``config.web_snapshot_char_limit``. The session name and timeout come from
     ``config`` so the snapshot CLI shares the exact session the `browse` tool uses.
+
+    NOTE (#43): this fixed-cap provider is retained for backward compatibility and
+    tests; the live run now uses :func:`make_raw_snapshot_provider` plus the dynamic
+    budget so the snapshot is sized against the full message each turn.
     """
     cli = PlaywrightCli(config.web_session, config.web_cli_timeout)
     return lambda: capture_page_snapshot(cli, config.web_snapshot_char_limit)
+
+
+def make_raw_snapshot_provider(config: Config) -> Callable[[], str]:
+    """Build a per-turn provider that returns the UNTRUNCATED live snapshot (#43).
+
+    The dynamic snapshot budget (see :mod:`vibeharness.snapshot_budget`) needs the
+    raw snapshot so it can decide, against the full message, how much of it fits. As
+    with :func:`make_snapshot_provider` it binds the run's session/timeout from
+    ``config`` and never raises (returns "" when no page is available).
+    """
+    cli = PlaywrightCli(config.web_session, config.web_cli_timeout)
+    return lambda: capture_page_snapshot_raw(cli)
 
 
 class WebToolset(Toolset):

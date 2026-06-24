@@ -165,15 +165,16 @@ class PerTurnSnapshotInjectionTest(unittest.TestCase):
 
 
 class SnapshotCapDefaultTest(unittest.TestCase):
-    def test_default_cap_is_40000(self):
-        # Issue #29: raised 6000 -> 40000 (~10k tokens) per the #28 size analysis,
-        # so the auto-injected snapshot no longer truncates before late-DOM consent
-        # banners on common pages.
-        self.assertEqual(Config().web_snapshot_char_limit, 40000)
+    def test_default_cap_is_absolute_ceiling(self):
+        # Issue #43: web_snapshot_char_limit is no longer the PRIMARY cap (the dynamic
+        # budget is — see test_snapshot_budget.py). It is now an absolute ceiling /
+        # safety fallback, defaulted very high so the context window is the real limit.
+        self.assertGreaterEqual(Config().web_snapshot_char_limit, 1_000_000)
 
-    def test_provider_uses_config_default_cap(self):
-        # make_snapshot_provider must bind the (new) config default, so a snapshot
-        # up to 40000 chars passes through untruncated.
+    def test_provider_uses_config_ceiling(self):
+        # make_snapshot_provider binds the config ceiling, so a snapshot up to that
+        # ceiling passes through untruncated (the dynamic budget does the real work in
+        # the live run; this fixed-cap provider remains for back-compat).
         cli = _FakeSnapshotCli(["b" * 40000])
         provider = lambda: capture_page_snapshot(cli, Config().web_snapshot_char_limit)
         self.assertEqual(provider(), "b" * 40000)
