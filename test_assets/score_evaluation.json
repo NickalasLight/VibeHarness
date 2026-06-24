@@ -1,0 +1,66 @@
+{
+  "_meta": {
+    "description": "Answer key for scoring an automated job-application run against the FlashTec 'Senior .NET Engineer' form. Each entry maps a STABLE form field key (from job_app_benchmark/shared/applicationSchema.ts) to the CORRECT expected value derived from test_assets/jason_statham.json, plus a match type that score.py knows how to evaluate.",
+    "candidateFixture": "test_assets/jason_statham.json",
+    "formSchema": "job_app_benchmark/shared/applicationSchema.ts (option lists in shared/options.ts)",
+    "matchTypes": {
+      "exact": "Case-insensitive, whitespace-trimmed string equality.",
+      "one_of": "Actual must equal (case-insensitive) any value in 'expected' (a list). Used where the fixture value and the form's canonical option differ but are equivalent (phone formats, state abbrev vs full name, degree wording, 'heard about us' wording).",
+      "numeric": "Parse both sides as numbers (strip $ , spaces) and compare within 'tolerance'.",
+      "contains": "Free text. Passes when at least 'min_keywords' of the 'keywords' appear (case-insensitive substring) in the actual value.",
+      "contains_all": "Array/multi-select. Passes when at least 'min_keywords' of the listed keywords are present across the joined actual values."
+    },
+    "scoringNotes": "Fields with \"scored\": false are excluded from the denominator (cosmetic, optional, or EEO fields that are masked in the server audit log and whose fixture answers are 'Decline...' which are not valid form options)."
+  },
+
+  "fields": {
+    "firstName":        { "expected": "Jason", "match": "exact", "scored": true },
+    "lastName":         { "expected": "Statham", "match": "exact", "scored": true },
+    "email":            { "expected": "jason.statham.dev@example.com", "match": "exact", "scored": true },
+    "phone":            { "expected": ["+1 (214) 555-0199", "(214) 555-0199", "+12145550199", "214-555-0199", "2145550199"], "match": "one_of", "scored": true },
+
+    "addressLine1":     { "expected": ["1820 McKinney Avenue, Apt 14C", "1820 McKinney Avenue"], "match": "one_of", "scored": true },
+    "addressLine2":     { "expected": "", "match": "exact", "scored": false, "note": "Empty in fixture; not scored." },
+    "city":             { "expected": "Dallas", "match": "exact", "scored": true },
+    "state":            { "expected": ["TX", "Texas"], "match": "one_of", "scored": true },
+    "postalCode":       { "expected": ["75201", "75201-0000"], "match": "one_of", "scored": true },
+    "country":          { "expected": ["United States", "United States of America", "USA", "US"], "match": "one_of", "scored": true },
+
+    "workAuthorization": { "expected": ["U.S. Citizen", "US Citizen"], "match": "one_of", "scored": true },
+    "requireSponsorship": { "expected": ["No"], "match": "one_of", "scored": true },
+    "willingToRelocate": { "expected": ["No, I am not willing to relocate", "I already live in the Dallas, TX area", "No"], "match": "one_of", "scored": true, "note": "Fixture says 'No'; either the explicit decline option or the local-area option is acceptable since the candidate already lives in Dallas." },
+    "availableStartDate": { "expected": "2026-07-21", "match": "exact", "scored": true },
+    "workPreference":   { "expected": ["Hybrid"], "match": "one_of", "scored": true },
+
+    "currentTitle":     { "expected": "Senior Software Engineer", "match": "exact", "scored": true },
+    "currentCompany":   { "expected": "Lone Star Payments Inc.", "match": "contains", "keywords": ["Lone Star Payments"], "min_keywords": 1, "scored": true },
+    "totalExperienceYears": { "expected": 9, "match": "numeric", "tolerance": 0, "scored": true },
+    "dotnetExperienceYears": { "expected": 9, "match": "numeric", "tolerance": 0, "scored": true },
+    "skills":           { "expected": ["C#", ".NET / .NET Core", "ASP.NET Core", "SQL Server", "Azure", "Domain-Driven Design"], "match": "contains_all", "keywords": ["C#", ".NET", "ASP.NET", "SQL Server", "Azure", "Domain-Driven Design", "Entity Framework", "Docker", "Kubernetes", "gRPC", "CI/CD", "Unit Testing", "Microservices", "Web API"], "min_keywords": 4, "scored": true, "note": "Fixture skill strings are richer than the form's checkbox options; require a meaningful overlap of core .NET skills." },
+    "linkedinUrl":      { "expected": "https://www.linkedin.com/in/jason-statham-dotnet", "match": "exact", "scored": true },
+    "portfolioUrl":     { "expected": ["https://jstatham.dev", "https://github.com/jstatham-dev"], "match": "one_of", "scored": true, "note": "Fixture has both a portfolio and a github URL; either is an acceptable portfolio answer." },
+
+    "highestDegree":    { "expected": ["Bachelor's Degree", "Bachelor of Science", "Bachelors"], "match": "one_of", "scored": true, "note": "Fixture 'Bachelor of Science' maps to the form option 'Bachelor's Degree'." },
+    "school":           { "expected": "The University of Texas at Dallas", "match": "contains", "keywords": ["University of Texas at Dallas"], "min_keywords": 1, "scored": true },
+    "fieldOfStudy":     { "expected": "Computer Science", "match": "exact", "scored": true },
+    "graduationDate":   { "expected": ["2016-05", "2016-05-01"], "match": "one_of", "scored": true, "note": "Form may render a full ISO date; fixture is year-month." },
+
+    "salaryExpectation": { "expected": 165000, "match": "numeric", "tolerance": 0, "scored": true, "note": "Fixture is '$165,000'; numeric match strips $ and commas." },
+    "whyInterested":    { "expected": "free text", "match": "contains", "keywords": ["payments", "ledger", "Azure", ".NET", "event-driven", "five-nines", "Dallas", "throughput"], "min_keywords": 3, "scored": true, "note": "Free-text essay; pass if it references the core themes of the fixture's answer." },
+    "heardAboutUs":     { "expected": ["Company Website", "Company careers page", "Company Careers Page"], "match": "one_of", "scored": true, "note": "Fixture 'Company careers page' maps to the form option 'Company Website'." },
+    "referralName":     { "expected": "", "match": "exact", "scored": false, "note": "Empty in fixture; not scored." },
+
+    "gender":           { "expected": "Prefer not to disclose", "match": "one_of", "scored": false, "note": "EEO field; fixture declines and the value is masked in the server audit log. Not scored." },
+    "ethnicity":        { "expected": "Prefer not to disclose", "match": "one_of", "scored": false, "note": "EEO field; masked + declined. Not scored." },
+    "veteranStatus":    { "expected": "I am not a protected veteran", "match": "one_of", "scored": false, "note": "EEO field; masked in audit log. Not scored." },
+    "disabilityStatus": { "expected": "Prefer not to disclose", "match": "one_of", "scored": false, "note": "EEO field; masked + declined. Not scored." },
+
+    "signatureName":    { "expected": "Jason Statham", "match": "exact", "scored": true },
+
+    "certifyTrue":          { "expected": true, "match": "exact", "scored": false, "note": "Consent checkbox; required by the form to submit at all, so not a discriminating score field." },
+    "consentDataProcessing":{ "expected": true, "match": "exact", "scored": false, "note": "Consent checkbox; required to submit. Not scored." },
+    "signed":               { "expected": true, "match": "exact", "scored": false, "note": "Signature flag; required to submit. Not scored." },
+    "resumeFileId":         { "expected": "non-empty", "match": "contains", "keywords": [], "min_keywords": 0, "scored": false, "note": "Upload id is randomized at runtime; presence is required to submit but the id itself is not a stable expected value. Not scored here (a runner may separately assert a resume was attached)." },
+    "coverLetterFileId":    { "expected": "", "match": "exact", "scored": false, "note": "Optional upload; id randomized. Not scored." }
+  }
+}
