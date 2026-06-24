@@ -142,24 +142,31 @@ class VibeThinkerAdvisor:
               f"ctx=4096",
               flush=True)
 
-    def advise(self, task: str, turns: list) -> str:
-        """Generate free-text advice from the last ``self._interval`` turns."""
+    def advise(self, task: str, turns: list, reporter=None) -> str:
+        """Generate free-text advice from the last ``self._interval`` turns.
+
+        When ``reporter`` is supplied (a :class:`~vibeharness.reporting.Reporter`), the
+        advisor's token stream is rendered live in the terminal via the blue advisor lane.
+        Without a reporter the generation is silent (test / headless use).
+        """
         history = format_turns_for_advisor(turns, self._interval)
         system = _SYSTEM
         user = _build_user(task, history)
         label = "self" if self._self_advising else "advisor"
-        print(f"\n[advisor] calling {label} model for advice...", flush=True)
+        print(f"\n[advisor] {label} model generating advice...", flush=True)
+        if reporter is not None:
+            reporter.advisor_start()
+            on_token = reporter.advisor_token
+        else:
+            on_token = None
         # Single-phase: one /api/chat call, free-text output (no JSON schema constraint).
-        # The advisor is Qwen (or another single-phase model), not VibeThinker, so we use
-        # _reason() with a no-stop constraint — it generates the advice text directly.
-        advice = self._client._reason(system, user, on_token=None)
+        advice = self._client._reason(system, user, on_token=on_token)
+        if reporter is not None:
+            reporter.advisor_end()
         # Strip any Hermes tool-call blocks or <think> tags that may appear.
         advice = _THINK_RE.sub("", advice).strip()
         advice = _TOOL_CALL_RE.sub("", advice).strip()
         if not advice:
             advice = "(no advice generated)"
-        # Display up to 500 chars so the operator can read the advice; the FULL text
-        # is what gets injected into the base agent's user message (no truncation there).
-        display = advice[:500] + ("…" if len(advice) > 500 else "")
-        print(f"[advisor] hint (full text sent to agent):\n{display}", flush=True)
+        print(f"[advisor] advice stored — {len(advice)} chars sent to base agent.", flush=True)
         return advice

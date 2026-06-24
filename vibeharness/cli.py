@@ -574,7 +574,7 @@ def _run_locked(args, task, config, registry, codec, names, workdir, logger,
         _safe_log(logger, task, config, res)
         # Trigger advisor every N turns when enabled.
         if advisor is not None and res.turns and len(res.turns) % config.advisor_interval == 0:
-            advice = advisor.advise(task, res.turns)
+            advice = advisor.advise(task, res.turns, reporter=reporter)
             _advice_buffer.clear()
             _advice_buffer.append(advice)
 
