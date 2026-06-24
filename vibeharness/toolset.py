@@ -25,6 +25,16 @@ class Toolset(ABC):
     def create_tools(self, config: Config) -> list[Tool]:
         ...
 
+    def system_guidance(self) -> str | None:
+        """Short, role-specific guidance for working with this toolset's tools.
+
+        Returned text is assembled by :class:`~vibeharness.prompt.SystemPromptBuilder`
+        into a dedicated section of the system prompt, so the *system* prompt varies
+        by the active toolset(s) without any caller having to know the details. Return
+        ``None`` (the default) to contribute nothing.
+        """
+        return None
+
     def check_prerequisites(self) -> list[str]:
         """Return a list of human-readable problems (empty = ready to use)."""
         return []
@@ -44,6 +54,10 @@ class FilesystemToolset(Toolset):
         from .filesystem import FileSystem
         from .fs_tools import build_default_tools
         return build_default_tools(FileSystem(), config.observation_char_limit)
+
+    def system_guidance(self) -> str | None:
+        return ("Verify file work: read the file back after writing it. "
+                "Use create_file for a new file and write_file to modify an existing one.")
 
 
 class ToolsetCatalog:

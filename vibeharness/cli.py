@@ -187,8 +187,12 @@ def run_agent(args: argparse.Namespace) -> int:
     except UnknownCodec as e:
         print(f"error: {e}")
         return 2
+    # Vary the system prompt by the SELECTED toolset(s): each advertises its own short
+    # guidance, assembled into one "# Working with your tools" section.
+    guidance = SystemPromptBuilder.assemble_guidance(toolsets)
     system_prompt = SystemPromptBuilder(
-        registry, config.max_actions_per_turn, codec).build(task)   # task anchored at the front
+        registry, config.max_actions_per_turn, codec,
+        guidance=guidance).build(task)   # task anchored at the front
 
     if args.workdir:
         workdir = Path(args.workdir).resolve()
@@ -231,7 +235,9 @@ def _run_locked(args, task, config, registry, codec, names, workdir, logger,
     # Refresh the system prompt every turn so its "# Workspace" section reflects
     # files the agent creates as it goes. Scanning Path.cwd() each call (rather
     # than a cached tree) is what makes newly written files appear next turn.
-    builder = SystemPromptBuilder(registry, config.max_actions_per_turn, codec)
+    builder = SystemPromptBuilder(
+        registry, config.max_actions_per_turn, codec,
+        guidance=SystemPromptBuilder.assemble_guidance(toolsets))
     fs = FileSystem()
 
     def render_workspace() -> str:
@@ -317,7 +323,9 @@ def main(argv: list[str] | None = None) -> int:
         except KeyError as e:
             print(f"error: unknown toolset {e}. Available: {', '.join(catalog.names())}")
             return 2
-        print(SystemPromptBuilder(catalog.build_registry(toolsets, Config())).build())
+        print(SystemPromptBuilder(
+            catalog.build_registry(toolsets, Config()),
+            guidance=SystemPromptBuilder.assemble_guidance(toolsets)).build())
         return 0
     if not args.task and not args.task_file:
         print("error: no task given.\n")

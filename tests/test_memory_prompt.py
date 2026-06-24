@@ -84,5 +84,57 @@ class PromptTest(unittest.TestCase):
         self.assertIn("next action", prompt.lower())
 
 
+class ToolsetGuidanceTest(unittest.TestCase):
+    """The system prompt varies by the ACTIVE toolset(s) via system_guidance."""
+
+    def setUp(self):
+        self.catalog = default_catalog()
+
+    def _registry(self, names):
+        return self.catalog.build_registry(self.catalog.select(names), Config())
+
+    def _build(self, names):
+        toolsets = self.catalog.select(names)
+        registry = self.catalog.build_registry(toolsets, Config())
+        guidance = SystemPromptBuilder.assemble_guidance(toolsets)
+        return SystemPromptBuilder(registry, guidance=guidance).build("DO THE THING")
+
+    def test_fs_guidance_present_when_fs_active(self):
+        sp = self._build(["fs"])
+        self.assertIn("# Working with your tools", sp)
+        self.assertIn("read the file back", sp.lower())
+
+    def test_fs_guidance_absent_when_fs_not_active(self):
+        # web is the only other toolset and (for issue #19) carries no guidance,
+        # so a web-only prompt has no tools-guidance section at all.
+        sp = self._build(["web"])
+        self.assertNotIn("# Working with your tools", sp)
+        self.assertNotIn("read the file back", sp.lower())
+
+    def test_no_guidance_contributes_no_section(self):
+        # A toolset with no system_guidance must not emit an empty heading.
+        self.assertEqual(SystemPromptBuilder.assemble_guidance(self.catalog.select(["web"])), "")
+        sp = SystemPromptBuilder(self._registry(["web"]), guidance="").build()
+        self.assertNotIn("# Working with your tools", sp)
+
+    def test_default_construction_has_no_guidance_section(self):
+        # Existing callers like SystemPromptBuilder(registry) are unaffected.
+        sp = SystemPromptBuilder(self._registry(["fs"])).build()
+        self.assertNotIn("# Working with your tools", sp)
+
+    def test_guidance_is_order_stable_and_deduplicated(self):
+        fs = self.catalog.select(["fs"])[0]
+        # Same source listed twice must appear only once.
+        twice = SystemPromptBuilder.assemble_guidance([fs, fs])
+        once = SystemPromptBuilder.assemble_guidance([fs])
+        self.assertEqual(twice, once)
+        self.assertEqual(twice.count("read the file back"), 1)
+
+    def test_guidance_section_sits_between_tools_and_guidance(self):
+        sp = self._build(["fs"])
+        self.assertLess(sp.index("# Tools"), sp.index("# Working with your tools"))
+        self.assertLess(sp.index("# Working with your tools"), sp.index("# Guidance"))
+
+
 if __name__ == "__main__":
     unittest.main()

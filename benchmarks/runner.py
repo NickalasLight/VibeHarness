@@ -205,10 +205,12 @@ class BenchmarkRunner:
         with _in_temp_workdir() as workdir:
             task.run_setup(workdir)
 
-            registry = default_catalog().build_registry(
-                default_catalog().select(["fs"]), cfg)
+            toolsets = default_catalog().select(["fs"])
+            registry = default_catalog().build_registry(toolsets, cfg)
+            guidance = SystemPromptBuilder.assemble_guidance(toolsets)
             system_prompt = SystemPromptBuilder(
-                registry, cfg.max_actions_per_turn, codec).build(task.prompt)
+                registry, cfg.max_actions_per_turn, codec,
+                guidance=guidance).build(task.prompt)
 
             # Refresh the workspace tree into the system prompt each turn, exactly
             # like the CLI, so newly created files become visible to the agent.
@@ -222,7 +224,8 @@ class BenchmarkRunner:
                     tree = f"(could not list: {e})"
                 return f"Working directory: {cwd}\n{tree}"
 
-            builder = SystemPromptBuilder(registry, cfg.max_actions_per_turn, codec)
+            builder = SystemPromptBuilder(
+                registry, cfg.max_actions_per_turn, codec, guidance=guidance)
             provider = lambda: builder.build(task.prompt, workspace=render_workspace())
 
             client = self._client_factory(cfg)
