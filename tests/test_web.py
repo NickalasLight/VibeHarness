@@ -28,11 +28,41 @@ from vibeharness.web import (
 from tests._fakes import FakeCli
 
 
+class _SnapshotThenResultCli:
+    """A PlaywrightCli stand-in that answers `snapshot` with one canned page and
+    every other (action) command with a separate canned result. Lets a test set up
+    the live page the issue-#73 target guard validates against independently of what
+    the action itself returns. Records every call for argv assertions."""
+
+    def __init__(self, snapshot="", result_ok=True, result_output="### Page\nok"):
+        self._snapshot = snapshot
+        self._result_ok = result_ok
+        self._result_output = result_output
+        self.calls = []
+
+    def run(self, *args):
+        self.calls.append(list(args))
+        if args and args[0] == "snapshot":
+            return (bool(self._snapshot), self._snapshot)
+        return (self._result_ok, self._result_output)
+
+
 class SubtoolMappingTest(unittest.TestCase):
     """Each discrete subtool maps its validated args to the right playwright-cli argv,
     phrases a clear past-tense observation, and surfaces CLI failures as ok=False."""
 
-    def _make(self, cls, ok=True, output="### Page URL: https://example.com"):
+    # A snapshot listing every ref the mapping tests target, so the issue-#73
+    # target guard (which captures a fresh snapshot and checks the ref is present)
+    # lets these happy-path calls proceed to the CLI argv mapping.
+    _SNAPSHOT_WITH_REFS = (
+        "Page: \"Example\"\n"
+        "[e1] checkbox\n[e2] button\n[e3] textbox\n"
+        "[e5] link\n[e6] button\n[e9] dropdown\n"
+    )
+
+    def _make(self, cls, ok=True, output=None):
+        if output is None:
+            output = self._SNAPSHOT_WITH_REFS
         cli = FakeCli(ok=ok, output=output)
         return cls(cli, observation_limit=1000), cli
 
@@ -46,12 +76,14 @@ class SubtoolMappingTest(unittest.TestCase):
     def test_click_maps_to_click_target(self):
         tool, cli = self._make(ClickTool)
         tool.run({"target": "e6"})
-        self.assertEqual(cli.calls, [["click", "e6"]])
+        # Targeted tools snapshot first to validate the ref (issue #73), then act.
+        self.assertEqual(cli.calls[-1], ["click", "e6"])
+        self.assertIn(["snapshot"], cli.calls)
 
     def test_fill_maps_to_fill_target_text(self):
         tool, cli = self._make(FillTool)
         tool.run({"target": "e3", "text": "John"})
-        self.assertEqual(cli.calls, [["fill", "e3", "John"]])
+        self.assertEqual(cli.calls[-1], ["fill", "e3", "John"])
 
     def test_type_maps_to_type_text(self):
         tool, cli = self._make(TypeTool)
@@ -66,25 +98,25 @@ class SubtoolMappingTest(unittest.TestCase):
     def test_select_option_maps_to_select(self):
         tool, cli = self._make(SelectOptionTool)
         tool.run({"target": "e9", "value": "TX"})
-        self.assertEqual(cli.calls, [["select", "e9", "TX"]])
+        self.assertEqual(cli.calls[-1], ["select", "e9", "TX"])
 
     def test_check_and_uncheck_map_through(self):
         t1, c1 = self._make(CheckTool)
         t1.run({"target": "e1"})
-        self.assertEqual(c1.calls, [["check", "e1"]])
+        self.assertEqual(c1.calls[-1], ["check", "e1"])
         t2, c2 = self._make(UncheckTool)
         t2.run({"target": "e1"})
-        self.assertEqual(c2.calls, [["uncheck", "e1"]])
+        self.assertEqual(c2.calls[-1], ["uncheck", "e1"])
 
     def test_hover_maps_to_hover(self):
         tool, cli = self._make(HoverTool)
         tool.run({"target": "e5"})
-        self.assertEqual(cli.calls, [["hover", "e5"]])
+        self.assertEqual(cli.calls[-1], ["hover", "e5"])
 
     def test_drag_maps_to_drag_start_end(self):
         tool, cli = self._make(DragTool)
         tool.run({"target": "e1", "end": "e2"})
-        self.assertEqual(cli.calls, [["drag", "e1", "e2"]])
+        self.assertEqual(cli.calls[-1], ["drag", "e1", "e2"])
 
     def test_upload_maps_to_upload_file(self):
         tool, cli = self._make(UploadTool)
@@ -128,13 +160,146 @@ class SubtoolMappingTest(unittest.TestCase):
 
     def test_failed_action_surfaces_as_error_observation(self):
         # A failing CLI action (exits non-zero) must come back as a normal ok=False
-        # observation the agent can adapt to — not a hang (issue #4).
-        tool = ClickTool(FakeCli(ok=False, output="Error: element not found"),
-                         observation_limit=1000)
+        # observation the agent can adapt to — not a hang (issue #4). The ref IS on
+        # the page (so the issue-#73 guard lets it through) but the CLI run fails.
+        cli = _SnapshotThenResultCli(
+            snapshot="Page: \"X\"\n[e404] button \"Boom\"\n",
+            result_ok=False, result_output="Error: element not found")
+        tool = ClickTool(cli, observation_limit=1000)
         res = tool.run({"target": "e404"})
         self.assertFalse(res.ok)
         self.assertIn("failed", res.observation)
         self.assertIn("not found", res.observation)
+
+
+class SnapshotRefEnforcementTest(unittest.TestCase):
+    """Issue #73: a targeted web tool must validate its `target` against the CURRENT
+    live snapshot's refs (rejecting guessed CSS selectors before any browser call),
+    and must report a no-match as ok=False (the ok-on-no-match status bug)."""
+
+    # A realistic YouTube-consent snapshot (the exact shape from the ground-truth
+    # run): refs appear as [eN] tokens.
+    _SNAPSHOT = (
+        "Page: \"YouTube\"\n"
+        "URL: https://www.youtube.com/watch?v=2K9V8y4gZ3c\n"
+        "[e18] button \"Guide\"\n"
+        "[e87] dialog \"Before you continue to YouTube\" [active]\n"
+        "  [e156] button \"Reject the use of cookies\"\n"
+        "  [e163] button \"Accept the use of cookies\"\n"
+    )
+
+    def test_guessed_css_selector_rejected_and_lists_available_refs(self):
+        # The exact bug trigger from the ground-truth run: a guessed class selector.
+        cli = _SnapshotThenResultCli(snapshot=self._SNAPSHOT)
+        tool = ClickTool(cli, observation_limit=2000)
+        res = tool.run({"target": ".ytd-play-button"})
+        self.assertFalse(res.ok)
+        # The browser was never asked to click — only the validating snapshot ran.
+        self.assertNotIn(["click", ".ytd-play-button"], cli.calls)
+        self.assertEqual([c for c in cli.calls if c[0] == "click"], [])
+        # The message names the offending target and lists the real refs.
+        self.assertIn(".ytd-play-button", res.observation)
+        for ref in ("e18", "e87", "e156", "e163"):
+            self.assertIn(ref, res.observation)
+
+    def test_unknown_ref_rejected(self):
+        # A ref-shaped target that isn't on the page is still rejected.
+        cli = _SnapshotThenResultCli(snapshot=self._SNAPSHOT)
+        tool = ClickTool(cli, observation_limit=2000)
+        res = tool.run({"target": "e999"})
+        self.assertFalse(res.ok)
+        self.assertEqual([c for c in cli.calls if c[0] == "click"], [])
+        self.assertIn("e163", res.observation)  # available refs listed
+
+    def test_valid_ref_proceeds_to_cli(self):
+        # A ref that IS in the snapshot is allowed through to the playwright call.
+        cli = _SnapshotThenResultCli(snapshot=self._SNAPSHOT,
+                                     result_output="### Page\nclicked")
+        tool = ClickTool(cli, observation_limit=2000)
+        res = tool.run({"target": "e163"})
+        self.assertTrue(res.ok)
+        self.assertEqual(cli.calls[-1], ["click", "e163"])
+
+    def test_bracketed_ref_form_is_accepted(self):
+        # The snapshot prints [e163]; accept that bracketed form too.
+        cli = _SnapshotThenResultCli(snapshot=self._SNAPSHOT,
+                                     result_output="### Page\nclicked")
+        tool = ClickTool(cli, observation_limit=2000)
+        res = tool.run({"target": "[e163]"})
+        self.assertTrue(res.ok)
+        self.assertEqual(cli.calls[-1], ["click", "[e163]"])
+
+    def test_no_match_result_is_ok_false_regression(self):
+        # THE bug: playwright-cli exits 0 but its output says the target matched
+        # nothing. That must surface as ok=False, not ok=true-with-an-error.
+        # (Ref is present so it passes the guard and reaches the CLI.)
+        no_match = ('### Error\nError: ".ytd-play-button" does not match any elements.')
+        cli = _SnapshotThenResultCli(snapshot=self._SNAPSHOT,
+                                     result_ok=True, result_output=no_match)
+        tool = ClickTool(cli, observation_limit=2000)
+        res = tool.run({"target": "e163"})
+        self.assertFalse(res.ok, "a no-match must be ok=False (issue #73)")
+        self.assertIn("does not match any elements", res.observation)
+
+    def test_no_match_detection_helper(self):
+        from vibeharness.web import output_signals_no_match
+        self.assertTrue(output_signals_no_match(
+            '### Error\nError: ".x" does not match any elements.'))
+        self.assertTrue(output_signals_no_match("Error: ref not found"))
+        self.assertFalse(output_signals_no_match("### Page\n- Page Title: YouTube"))
+        self.assertFalse(output_signals_no_match(""))
+
+    def test_parse_snapshot_refs(self):
+        from vibeharness.web import parse_snapshot_refs
+        self.assertEqual(parse_snapshot_refs(self._SNAPSHOT),
+                         {"e18", "e87", "e156", "e163"})
+
+    def test_normalize_ref(self):
+        from vibeharness.web import normalize_ref
+        self.assertEqual(normalize_ref("e163"), "e163")
+        self.assertEqual(normalize_ref("[e163]"), "e163")
+        self.assertEqual(normalize_ref(" e163 "), "e163")
+        self.assertIsNone(normalize_ref(".ytd-play-button"))
+        self.assertIsNone(normalize_ref("#play"))
+        self.assertIsNone(normalize_ref("button"))
+
+    def test_guard_fails_open_when_snapshot_unavailable(self):
+        # If the snapshot can't be captured, don't block a legitimate action.
+        cli = _SnapshotThenResultCli(snapshot="", result_output="### Page\nok")
+        tool = ClickTool(cli, observation_limit=2000)
+        res = tool.run({"target": "e5"})
+        self.assertTrue(res.ok)
+        self.assertEqual(cli.calls[-1], ["click", "e5"])
+
+    def test_drag_validates_both_endpoints(self):
+        cli = _SnapshotThenResultCli(snapshot=self._SNAPSHOT)
+        tool = DragTool(cli, observation_limit=2000)
+        # e163 is valid, e999 is not -> reject, never drag.
+        res = tool.run({"target": "e163", "end": "e999"})
+        self.assertFalse(res.ok)
+        self.assertEqual([c for c in cli.calls if c[0] == "drag"], [])
+        self.assertIn("e999", res.observation)
+
+
+class SubtoolGuidanceTest(unittest.TestCase):
+    """Issue #73: descriptions and system guidance must require a snapshot ref and
+    forbid guessing a CSS selector."""
+
+    def test_click_description_requires_snapshot_ref(self):
+        tool = ClickTool(FakeCli(), 1000)
+        desc = tool.description.lower()
+        self.assertIn("ref", desc)
+        self.assertIn("never guess", desc)
+        # and the param doc spells out "never a guessed CSS selector".
+        target_doc = tool.parameters[0].description.lower()
+        self.assertIn("never", target_doc)
+        self.assertIn("css selector", target_doc)
+
+    def test_system_guidance_forbids_guessing_selectors(self):
+        guidance = WebToolset().system_guidance().lower()
+        self.assertIn("ref", guidance)
+        self.assertIn("never guess", guidance)
+        self.assertIn("css selector", guidance)
 
 
 class SubtoolSchemaTest(unittest.TestCase):
