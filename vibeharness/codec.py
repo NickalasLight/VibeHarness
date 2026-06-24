@@ -16,6 +16,7 @@ from __future__ import annotations
 import importlib
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -72,6 +73,22 @@ class ToolCallCodec(ABC):
 
 class UnknownCodec(KeyError):
     """Raised when no codec is registered under the requested name."""
+
+
+def available_codecs() -> list[str]:
+    """List installed codec names, discovered from the ``vibeharness.codecs`` package.
+
+    Scans the package directory for ``*_codec.py`` files and strips the ``_codec``
+    suffix, so each codec module contributes its name with no central registry to
+    edit. Dunder files (e.g. ``__init__.py``) are excluded; the result is sorted.
+    """
+    codecs_dir = Path(__file__).parent / "codecs"
+    names = [
+        path.stem[: -len("_codec")]
+        for path in codecs_dir.glob("*_codec.py")
+        if not path.stem.startswith("__")
+    ]
+    return sorted(names)
 
 
 def get_codec(name: str) -> ToolCallCodec:
