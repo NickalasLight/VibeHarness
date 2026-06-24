@@ -1,0 +1,41 @@
+name: mythos divergence review
+
+# Gates PRs INTO beta_mythos_fast on an explicit divergence-manifest review, so the
+# branch's intentional mythos-specific divergences (hermes codec, <tools> tool-schema
+# rendering, config defaults, chat template) are never silently clobbered by a beta sync.
+# See MYTHOS_DIVERGENCE.md. (Issue #107 / #109.)
+
+on:
+  pull_request:
+    branches: [beta_mythos_fast]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  divergence-review:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: List protected files touched by this PR
+        run: |
+          echo "Changed files in this PR (review against MYTHOS_DIVERGENCE.md):"
+          git diff --name-only "origin/${{ github.base_ref }}...HEAD" || true
+
+      - name: Require divergence-review acknowledgement in PR body
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          if echo "$PR_BODY" | grep -qi "DIVERGENCE-REVIEWED"; then
+            echo "✅ Divergence manifest review confirmed (DIVERGENCE-REVIEWED found in PR body)."
+          else
+            echo "::error::PRs into beta_mythos_fast must confirm divergence-manifest review."
+            echo "Review MYTHOS_DIVERGENCE.md, ensure no protected (mythos-specific) file is clobbered,"
+            echo "then add the token DIVERGENCE-REVIEWED to the PR body. Prefer the mythos-sync agent."
+            exit 1
+          fi
