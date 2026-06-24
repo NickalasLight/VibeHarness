@@ -96,3 +96,19 @@ class ToolsetCatalog:
 def default_catalog() -> ToolsetCatalog:
     from .web import WebToolset
     return ToolsetCatalog([FilesystemToolset(), WebToolset()])
+
+
+# An "agent type" is a NAMED DEFAULT TOOLSET SELECTION — nothing more. The agent's
+# prompt is *derived* from the active toolsets' system_guidance (issue #19), so there
+# is no parallel prompt registry here: choosing an agent only chooses which toolset(s)
+# are active by default. The mapping is intentionally explicit + tightly coupled to the
+# catalog: every agent name maps to the toolset(s) of the same name. Augment/override
+# at the CLI with --toolset.
+def agent_default_toolsets(catalog: ToolsetCatalog | None = None) -> dict[str, list[str]]:
+    """Map each agent type to its default active toolset(s).
+
+    Derived from the catalog so the set of agents stays in lock-step with the set of
+    toolsets: each toolset name is itself an agent that defaults to that one toolset.
+    """
+    cat = catalog or default_catalog()
+    return {name: [name] for name in cat.names()}

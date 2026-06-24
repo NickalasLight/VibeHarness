@@ -25,7 +25,7 @@ from .prompt import SystemPromptBuilder
 from .reporting import ConsoleReporter
 from .runlog import RunLogger
 from .settings import Settings, settable_keys
-from .toolset import ToolsetCatalog, default_catalog
+from .toolset import ToolsetCatalog, agent_default_toolsets, default_catalog
 from .validation import LLMValidator
 from .web import make_snapshot_provider
 
@@ -69,9 +69,13 @@ current default temperature: {saved_temp}
                    help="max tool calls the model may emit per turn for this run only")
     p.add_argument("--workdir", default=None, metavar="DIR",
                    help="working directory (default: current terminal directory)")
+    p.add_argument("--agent", default=None, metavar="TYPE",
+                   help="agent type for this run; selects a default toolset of the same name "
+                        f"({', '.join(agent_default_toolsets())}). e.g. --agent web. "
+                        "--toolset overrides/augments which toolset(s) are active.")
     p.add_argument("--toolset", action="append", metavar="NAME",
-                   help="toolset(s) to load; repeatable or comma-separated (default: fs). "
-                        "e.g. --toolset web,fs")
+                   help="toolset(s) to load; repeatable or comma-separated. Overrides/augments "
+                        "--agent's default. (default: fs). e.g. --toolset web,fs")
     p.add_argument("--headless", action="store_true",
                    help="run the web browser headless (default: headed so you can watch)")
     p.add_argument("--no-color", action="store_true", help="disable colored output")
@@ -80,15 +84,40 @@ current default temperature: {saved_temp}
     p.add_argument("--show-config", action="store_true", help="print current settings and exit")
     p.add_argument("--reset-config", action="store_true", help="clear saved settings and exit")
     p.add_argument("--list-toolsets", action="store_true", help="list available toolsets and exit")
+    p.add_argument("--list-agents", action="store_true", help="list available agent types and exit")
     p.add_argument("--print-system", action="store_true", help="print the system prompt and exit")
     return p
 
 
 def selected_toolset_names(args: argparse.Namespace) -> list[str]:
+    """Resolve the active toolset names: --toolset wins, else --agent's default,
+    else today's default (fs).
+
+    This is the precedence rule from issue #22: an --agent type is a *named default
+    toolset selection*, and --toolset overrides/augments it. So
+    ``--agent web --toolset web,fs`` → [web, fs]; ``--agent web`` → [web]; neither
+    given → [fs].
+    """
     names: list[str] = []
     for item in (args.toolset or []):
         names += [n.strip() for n in item.split(",") if n.strip()]
-    return names or ["fs"]
+    if names:
+        return names
+    agent = getattr(args, "agent", None)
+    if agent:
+        return agent_default_toolsets().get(agent, [agent])
+    return ["fs"]
+
+
+def agent_error(name: str) -> str | None:
+    """Return a user-facing error if ``name`` is not a known agent type, else None.
+
+    Centralised (mirrors :func:`codec_error`) so the run path and tests share one rule.
+    """
+    agents = agent_default_toolsets()
+    if name in agents:
+        return None
+    return f"error: unknown agent '{name}'. Available: {', '.join(agents)}"
 
 
 def codec_error(name: str) -> str | None:
@@ -128,6 +157,17 @@ def cmd_list_toolsets() -> int:
     return 0
 
 
+def cmd_list_agents() -> int:
+    catalog = default_catalog()
+    descriptions = dict(catalog.describe())
+    print("available agents:")
+    for name, toolsets in agent_default_toolsets(catalog).items():
+        desc = descriptions.get(name, "")
+        print(f"  {name:<6} toolset(s): {', '.join(toolsets):<10} {desc}")
+    print("\nselect with --agent; --toolset overrides/augments the default toolset(s).")
+    return 0
+
+
 def cmd_show_config() -> int:
     saved = Settings.load()
     effective = Settings.apply(Config())
@@ -162,6 +202,12 @@ def run_agent(args: argparse.Namespace) -> int:
     else:
         task = " ".join(args.task)
     config = resolve_config(args)
+    # Validate the agent type (if given) before any model work — mirrors --codec.
+    if getattr(args, "agent", None) is not None:
+        err = agent_error(args.agent)
+        if err is not None:
+            print(err)
+            return 2
     # Validate the (possibly overridden) codec before any model work.
     err = codec_error(config.codec)
     if err is not None:
@@ -328,6 +374,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_set(args.set[0], args.set[1])
     if args.list_toolsets:
         return cmd_list_toolsets()
+    if args.list_agents:
+        return cmd_list_agents()
     if args.print_system:
         catalog = default_catalog()
         try:
