@@ -19,6 +19,7 @@ from dataclasses import asdict, dataclass, field
 
 from typing import Callable
 
+from .codec import ToolCallCodec, get_codec
 from .config import Config
 from .llm import LLMClient
 from .memory import NarrativeMemory
@@ -83,7 +84,8 @@ class RunResult:
 class RalphAgent:
     def __init__(self, client: LLMClient, registry: ToolRegistry, system_prompt: str,
                  config: Config, validator: Validator, reporter: Reporter | None = None,
-                 system_prompt_provider: Callable[[], str] | None = None):
+                 system_prompt_provider: Callable[[], str] | None = None,
+                 codec: ToolCallCodec | None = None):
         self._client = client
         self._registry = registry
         self._system = system_prompt
@@ -94,12 +96,15 @@ class RalphAgent:
         # each turn to regenerate the system prompt (e.g. with a fresh workspace
         # tree); when None, the static system_prompt above is reused every turn.
         self._system_provider = system_prompt_provider
+        # The tool-call codec owns the action wire format: the decode constraint
+        # and how the raw payload is parsed back into (tool, args) pairs.
+        self._codec = codec or get_codec("json")
 
     def run(self, task: str, on_turn: Callable[["RunResult"], None] | None = None) -> RunResult:
         memory = NarrativeMemory()
         result = RunResult(task=task)
         limit = self._cfg.max_actions_per_turn
-        schema = self._registry.action_schema(max_items=limit if limit > 0 else None)
+        constraint = self._codec.constraint(self._registry, limit)
 
         # max_steps <= 0 means run until validation passes.
         turns = (itertools.count(1) if self._cfg.max_steps <= 0
@@ -109,14 +114,14 @@ class RalphAgent:
             system = self._system_provider() if self._system_provider else self._system
             user = build_turn_prompt(task, memory.render())
             decision = self._client.decide(
-                system, user, schema,
+                system, user, constraint,
                 on_reason=self._reporter.reasoning_token,
                 on_action=self._reporter.action_token,
             )
             turn = Turn(index=i, reasoning=decision.reasoning, raw_action=decision.action_json)
             result.turns.append(turn)
 
-            actions, error = self._parse(decision.action_json)
+            actions, error = self._codec.parse(decision.action_json)
             if error is not None:
                 self._record(turn, Action(None, {}, f"your last response was invalid and "
                                           f"could not be run: {error}.", ok=False), memory)
@@ -180,25 +185,3 @@ class RalphAgent:
         turn.actions.append(action)
         memory.record(action.observation)
         self._reporter.action_result(action)
-
-    @staticmethod
-    def _parse(action_json: str):
-        """Parse the turn's payload into a list of (tool, args). A lone object is
-        accepted as a one-element batch. Returns (actions, error_message)."""
-        try:
-            obj = json.loads(action_json)
-        except json.JSONDecodeError as e:
-            return None, f"not valid JSON ({e})"
-        if isinstance(obj, dict):
-            obj = [obj]
-        if not isinstance(obj, list) or not obj:
-            return None, "expected a non-empty JSON array of actions"
-        actions = []
-        for item in obj:
-            if not isinstance(item, dict) or "tool" not in item:
-                return None, "each action must be an object with a 'tool' field"
-            args = item.get("args", {})
-            if not isinstance(args, dict):
-                return None, "'args' must be an object"
-            actions.append((item["tool"], args))
-        return actions, None

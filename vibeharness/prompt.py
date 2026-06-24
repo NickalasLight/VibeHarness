@@ -4,15 +4,16 @@ The system prompt is deliberately lean and is assembled from the registry, so th
 documented tools never drift from the tools that exist. Each tool and its
 parameters are described once in plain English.
 
-The full JSON action-schema is intentionally NOT printed here. Output is already
-constrained at decode time by Ollama's ``format`` grammar (see
-``OllamaClient._act``, which passes ``registry.action_schema()`` as ``format``):
-every emitted action is guaranteed structurally valid regardless of the prompt.
-Re-printing that schema would be large, redundant, and would push the tool docs
-toward the low-attention middle of the context. A one-line shape reminder is enough.
+How to emit a tool call (the JSON array, an XML form, code, …) is owned by the
+active :class:`~vibeharness.codec.ToolCallCodec`, which supplies the format block
+via ``format_instructions``. The full action grammar is intentionally NOT printed
+here: output is already constrained at decode time (see ``OllamaClient._act``), so
+re-printing it would be large, redundant, and would push the tool docs toward the
+low-attention middle of the context.
 """
 from __future__ import annotations
 
+from .codec import ToolCallCodec, get_codec
 from .config import Config
 from .registry import ToolRegistry
 
@@ -23,12 +24,7 @@ choose one or more tools to make progress. Keep going until the task is fully do
 then call `validate`.
 
 # How the loop works
-- Each turn, output a JSON ARRAY of one or more actions of the form \
-{{"tool": <name>, "args": {{...}}}}; they run in order. Output only that array — \
-no prose. Use only the tools listed below.
-- Batch independent or predictable actions in one turn (e.g. write a file then read \
-it back); emit a single action when you must see its result before deciding. You may \
-emit at most {max_actions} actions per turn.
+{format_instructions}
 - Each action's result is added to the account. Use it to decide your next turn. On \
 an error, adapt — never repeat the same failing call.
 - When the task is genuinely done, end your turn with `validate` plus a short \
@@ -48,13 +44,17 @@ is required.
 
 
 class SystemPromptBuilder:
-    def __init__(self, registry: ToolRegistry, max_actions_per_turn: int = Config().max_actions_per_turn):
+    def __init__(self, registry: ToolRegistry,
+                 max_actions_per_turn: int = Config().max_actions_per_turn,
+                 codec: ToolCallCodec | None = None):
         self._registry = registry
         self._max_actions = max_actions_per_turn
+        self._codec = codec or get_codec("json")
 
     def build(self, task: str = "", workspace: str = "") -> str:
-        body = _SYSTEM_TEMPLATE.format(docs=self._registry.docs(),
-                                       max_actions=self._max_actions)
+        body = _SYSTEM_TEMPLATE.format(
+            docs=self._registry.docs(),
+            format_instructions=self._codec.format_instructions(self._max_actions))
         header = ""
         if task:
             # Anchor the task at the very front of the context (primacy / authoritative

@@ -1,0 +1,91 @@
+"""The tool-call codec seam.
+
+A :class:`ToolCallCodec` owns the *wire format* of tool calls end to end:
+  1. how the model is told to emit them   (a block injected into the system prompt),
+  2. how decoding is constrained to that shape (a :class:`DecodeConstraint`),
+  3. how the raw output is parsed back into ``(tool, args)`` pairs.
+
+Swapping the codec swaps the format — JSON, tagged-JSON, pure-XML, code-as-action,
+GBNF — without touching the agent loop, the prompt builder, or the LLM transport,
+each of which depends only on this seam. New formats are added as new, isolated
+modules under ``vibeharness.codecs`` (see :func:`get_codec`), so they share no code
+file with one another and merge without conflict.
+"""
+from __future__ import annotations
+
+import importlib
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .registry import ToolRegistry
+
+# A parsed tool call: the tool name and its argument dict.
+ToolCall = tuple[str, dict]
+
+
+@dataclass(frozen=True)
+class DecodeConstraint:
+    """How the action phase is constrained at decode time.
+
+    A codec fills in whichever mechanism its format needs; the LLM client applies
+    the one that is present and ignores the rest:
+
+      - ``json_schema``: a JSON-schema grammar (passed as Ollama's ``format``).
+      - ``gbnf``:        a raw GBNF grammar (honoured only by a llama.cpp backend).
+      - ``stop``:        extra stop strings, appended to the backend's own controls.
+
+    All three empty -> free (unconstrained) generation, parsed purely by the codec.
+    """
+    json_schema: dict | None = None
+    gbnf: str | None = None
+    stop: tuple[str, ...] = ()
+
+
+class ToolCallCodec(ABC):
+    """The contract every tool-call format implements. Stateless."""
+
+    name: str = ""
+
+    @abstractmethod
+    def format_instructions(self, max_actions: int) -> str:
+        """The format-specific block injected into the system prompt, telling the
+        model exactly how to emit one or more tool calls in this wire format. A
+        ``max_actions`` of 0 (or less) means no per-turn cap."""
+
+    @abstractmethod
+    def constraint(self, registry: "ToolRegistry", max_actions: int) -> DecodeConstraint:
+        """The decode-time constraint for the action phase (may be unconstrained)."""
+
+    @abstractmethod
+    def parse(self, raw: str) -> "tuple[list[ToolCall] | None, str | None]":
+        """Parse raw model output into a list of ``(tool, args)``; on malformed
+        output return ``(None, <human-readable reason>)``."""
+
+
+class UnknownCodec(KeyError):
+    """Raised when no codec is registered under the requested name."""
+
+
+def get_codec(name: str) -> ToolCallCodec:
+    """Resolve a codec by name.
+
+    Each codec lives in its own isolated module ``vibeharness.codecs.<name>_codec``
+    exposing a module-level ``CODEC`` instance, so a new format is added as a new
+    file with no edits to any shared registry.
+    """
+    mod_name = f".codecs.{name}_codec"
+    try:
+        module = importlib.import_module(mod_name, __package__)
+    except ModuleNotFoundError as e:
+        # Only swallow "the codec module itself is absent"; a genuine missing
+        # dependency inside an existing codec should surface, not masquerade as
+        # an unknown-codec error.
+        if e.name in (f"{__package__}.codecs.{name}_codec", f"vibeharness.codecs.{name}_codec"):
+            raise UnknownCodec(f"no tool-call codec named '{name}'") from e
+        raise
+    codec = getattr(module, "CODEC", None)
+    if not isinstance(codec, ToolCallCodec):
+        raise UnknownCodec(f"module for codec '{name}' exposes no CODEC instance")
+    return codec

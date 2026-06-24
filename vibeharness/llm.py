@@ -18,6 +18,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Callable
 
+from .codec import DecodeConstraint
 from .config import Config
 
 # A sink for streamed tokens; receives each chunk of text as it is generated.
@@ -31,12 +32,12 @@ class OllamaUnavailable(RuntimeError):
 @dataclass(frozen=True)
 class Decision:
     reasoning: str        # phase-1 text (discarded by the agent, kept for logs)
-    action_json: str      # phase-2 constrained JSON (the actual action)
+    action_json: str      # phase-2 constrained action payload (parsed by the codec)
 
 
 class LLMClient(ABC):
     @abstractmethod
-    def decide(self, system: str, user: str, action_schema: dict,
+    def decide(self, system: str, user: str, constraint: DecodeConstraint,
                on_reason: TokenSink | None = None,
                on_action: TokenSink | None = None) -> Decision:
         ...
@@ -46,11 +47,11 @@ class OllamaClient(LLMClient):
     def __init__(self, config: Config):
         self._cfg = config
 
-    def decide(self, system: str, user: str, action_schema: dict,
+    def decide(self, system: str, user: str, constraint: DecodeConstraint,
                on_reason: TokenSink | None = None,
                on_action: TokenSink | None = None) -> Decision:
         reasoning = self._reason(system, user, on_reason)
-        action = self._act(system, user, reasoning, action_schema, on_action)
+        action = self._act(system, user, reasoning, constraint, on_action)
         return Decision(reasoning=reasoning, action_json=action)
 
     def generate(self, prompt: str, max_chars: int | None = None,
@@ -102,17 +103,22 @@ class OllamaClient(LLMClient):
         }, on_token)
 
     # ---- phase 2: constrained action via raw continuation ----
-    def _act(self, system: str, user: str, reasoning: str, action_schema: dict,
+    def _act(self, system: str, user: str, reasoning: str, constraint: DecodeConstraint,
              on_token: TokenSink | None) -> str:
         prompt = self._render_chatml(system, user) + self._continue_after_reasoning(reasoning)
-        text = self._stream("/api/generate", {
+        payload = {
             "model": self._cfg.model,
             "raw": True,
             "prompt": prompt,
-            "format": action_schema,
             "options": {**self._options(), "temperature": self._cfg.action_temperature,
-                        "num_predict": self._cfg.action_tokens, "stop": ["<|im_end|>"]},
-        }, on_token)
+                        "num_predict": self._cfg.action_tokens,
+                        "stop": ["<|im_end|>", *constraint.stop]},
+        }
+        # Ollama only constrains via a JSON-schema `format`; a GBNF grammar needs a
+        # llama.cpp backend, so it is ignored here (the codec still parses freely).
+        if constraint.json_schema is not None:
+            payload["format"] = constraint.json_schema
+        text = self._stream("/api/generate", payload, on_token)
         return text.strip()
 
     # ---- streaming transport ----
