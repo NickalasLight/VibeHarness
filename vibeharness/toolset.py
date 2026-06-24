@@ -56,8 +56,9 @@ class FilesystemToolset(Toolset):
         return build_default_tools(FileSystem(), config.observation_char_limit)
 
     def system_guidance(self) -> str | None:
-        return ("Verify file work: read the file back after writing it. "
-                "Use create_file for a new file and write_file to modify an existing one.")
+        return ("Use create_file for a new file and write_file to change an existing one. "
+                "After any write, read the file back to confirm it holds exactly what you intended "
+                "before moving on.")
 
 
 class ToolsetCatalog:
