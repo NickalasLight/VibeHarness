@@ -1,0 +1,193 @@
+# Sample output of vibeharness.snapshot_prose.aria_yaml_to_prose (issue #64)
+# Source raw snapshot: C:\git\vh-ashley38\.vibe\20260624_074859-diagnostics\turn-003-snapshot-20260624_075650_524351.txt
+# Raw ARIA-YAML: 44843 chars  ->  WebArena-style prose: 14993 chars
+# Every actionable element keeps its native [refeN] -> tool-resolvable identifier.
+# ---------------------------------------------------------------------------
+
+Page: "Rick Astley - Never Gonna Give You Up (Official Video) (4K Remaster) - YouTube"
+URL: https://www.youtube.com/watch?v=dQw4w9WgXcQ
+A dialog "Before you continue to YouTube" [e1206] is OPEN IN FRONT of the page and is blocking it; clear it (click its Accept/Reject/Dismiss control) before acting on anything behind it.
+
+[e70] button "Guide"
+[e89] link "YouTube Home" -> /
+[e99] button "Skip navigation"
+[e74] search
+  [e104] dropdown "Search" [expanded]
+  [e79] button "Search"
+[e112] button "Settings"
+[e118] link "Sign in" -> https://accounts.google.com/ServiceLogin?service=youtube&uilel=3&passive=true&continue=https%3A%2F%2Fwww.youtube.com%2Fsignin%3Faction_handle_signin%3Dtrue%26app%3Ddesktop%26hl%3Den%26next%3Dhttps%253A%252F%252Fwww.youtube.com%252Fwatch%253Fv%253DdQw4w9WgXcQ&hl=en&ec=65620
+[e5] generic "YouTube Video Player"
+  [e142] generic "WICK ZzzQuil"
+  [e143] generic "zzzquil.de"
+  [e144] link "Mehr infos This link opens in new tab"
+  [e148] generic "Sponsored"
+  [e150] button "My Ad Center"
+  text: •
+  [e153] generic "1 of 2"
+  [e154] link "zzzquil.de This link opens in new tab"
+  [e17] slider "Seek slider" [disabled]
+  [-] slider "Click or scroll the panel for the precise seeking." [disabled]
+  [e28] button "Pause (k)"
+  [e31] button "Mute (m)"
+  [-] slider "Volume"
+  [e35] button "0 Minutes 0 Seconds of 0 Minutes 6 Seconds"
+  [e159] button "Autoplay is on"
+  [e38] button "Settings"
+  [e40] button "Theater mode (t)"
+  [e41] button "Full screen (f)"
+[e170] heading "Rick Astley - Never Gonna Give You Up (Official Video) (4K Remaster)" [level=1]
+[e174] link "Rick Astley" -> /@RickAstleyYT
+  [e176] img "Rick Astley"
+[e181] generic "Rick Astley"
+  [e182] link "Rick Astley" -> /channel/UCuAXFkgsw1L7xaCfnd5JJOw
+[e187] img "Official Artist Channel"
+[e191] generic "4.51 million subscribers"
+[e197] button "Subscribe to Rick Astley."
+[e214] button "like this video along with 19,176,808 other people"
+[e226] button "Dislike this video"
+[e236] button "Share"
+[e248] button "Save to playlist"
+[e258] button "More actions"
+text: 1.7B views 16 years ago
+[e272] link "#RickAstley" -> /hashtag/rickastley
+[e273] link "#NeverGonnaGiveYouUp" -> /hashtag/nevergonnagiveyouup
+[e274] link "#OfficialMusicVideo" -> /hashtag/officialmusicvideo
+[-] tooltip "tooltip"
+[e280] button "...more"
+text: •
+[e284] heading "Rick Astley - Event Tickets" [level=1]
+[-] tooltip "tooltip"
+[e291] link "Jul 7" -> javascript:void(0)
+[e298] link "Nearest event · München, Germany" -> javascript:void(0)
+[e300] link "Eventim" -> https://www.youtube.com/redirect?event=ticket_shelf&redir_token=QUFFLUhqbWVWX2RJSEx3VDgwR2cxY3VTWjU0TnJ4UEpYQXxBQ3Jtc0tsVWtBVkM0LTJoSTNFcngtVko1WG5PSzU5emktV3BJNFhOeV9SR0g1dzNwWFRtU3pWMVNjbWxhS0lKZF9lcEJ2ZmFUZVVyVFl6bVIxeWt6VnZhanhFbThCTXlLRUtFMTFrWkIwUUhZTGdTWEE5SWJrZw&q=https%3A%2F%2Fwww.bandsintown.com%2Ft%2F1037215752%3Fticket_id%3D1212719063%26app_id%3Dyt_feed%26came_from%3D286%26utm_medium%3Dweb%26utm_source%3Dyt_feed%26utm_campaign%3Dticket
+[e301] link "VIEW TICKETS" -> javascript:void(0)
+[e307] table
+  [e308] row "Jun 24 Llangollen, United Kingdom · Llangollen International Musical Eisteddfod · View tickets"
+    [e309] cell "Jun 24"
+    [e311] cell "Llangollen, United Kingdom · Llangollen International Musical Eisteddfod · View tickets"
+      [e316] link "View tickets" -> javascript:void(0)
+  [e317] row "Jun 25 Lincoln, United Kingdom · Lincoln Castle · View tickets"
+    [e318] cell "Jun 25"
+    [e320] cell "Lincoln, United Kingdom · Lincoln Castle · View tickets"
+      [e325] link "View tickets" -> javascript:void(0)
+  [e326] row "Jun 27 Tetbury, United Kingdom · Westonbirt, The National Arboretum · View tickets"
+    [e327] cell "Jun 27"
+    [e329] cell "Tetbury, United Kingdom · Westonbirt, The National Arboretum · View tickets"
+      [e334] link "View tickets" -> javascript:void(0)
+[e336] button "Show more"
+[e352] generic "Sponsored - WICK ZzzQuil zzzquil.de"
+  [e356] button "Wick ZzzQuil Gute Nacht"
+  text: ·
+[e368] link "Mehr infos" -> https://www.googleadservices.com/pagead/aclk?sa=L&ai=CbwPNUHE7arXLD_qIt_gPrLTlqQ3q2r_9hwGN0rfn0BWwkB8QASAAYKmwvoDMAYIBF2NhLXB1Yi02MjE5ODExNzQ3MDQ5MzcxoAGYx7mmAakC_9zbBuwQsz6oAwSqBKQDT9DPMBSIxNaefqWXzaKHDNhT8UfybBOPDoOQR9pq4XYJvVe9CkufRzf_2DbOtO9ld91IFM9uqYpvrSjBMC4ozW38pdd-O3RK-X-eERH4G9D3CZkpSJbol99RFcZwIR-WRyO3CjjWog52ojOOxHhjZ7xE8LBHOHpaXRWEg66qCe1ihIAud6k66WxwJ2gVQJ8HJZ0dj-IEsLtcubjrGb_HNs33DeIUEgxWCz_tsKCP4JM6DuFoN2r5hSxV6IukNswYIXJcgtnGwtNGipo19PV8nqM6A4dH_lmg5HSU7G6skWqVs5TsFWpy9TuZcFvsshouCGzJ2jRS30k9w8OGO1-qZQZKNmmN-44K0mQSv1EQPdC9qV_GTOOSpFZB3Kmv0ZDsoqrpny6iflzntMPvXQrKo4bp7XD9tclzerdSjbJsVWfvxJh0-Ujf-VVnv0pEYereYtwQ3ONn6uvACxsyqzg6sqCh_t-rM5oGbJpcrSYAfS2kqJKAh62rAl5Tf6LpUlRgzcGxVTL-Rt60bS-KdHVK_DjlV7xBEBb02ujakeUCnOB3osm6iAW4vYfUWMAFiQGgBlOAB9C4xtkCkAcBqAfywLECqAe4xLECqAfhtrECqAelz7ECqAfnnbECqAfonbECqAfvtbECqAfwtbECqAf507ECqAfJ2rECqAep4LECqAeECKgHptSxAqgHqNIbqAe2B6gHsJuxAqgHrrGxAqgH_bKxAqgHyM-xAqgHyc-xAqgHzcexAqgH8dGxAqgH_NWxAqgH-9WxAqgHjNaxAqgHi9axAqgHmuKxAqgHm-KxAqgHndexAqgHndSxAqgHgcYbqAf8r7ECqAe-2bECqAerxRuoB7ehsQKoB9WpsQKoB9imsQKoB-fasQKoB961sQKSCAs0Y3cybWZRTXd5NLgIAdIIPAiAwYBQEAEYXjIIo4LAgICAoAw6FYDCgICAkIACgICAgICQhuADqoCAEEjZoNI1UBRY-JCbrpiflQNgAfIIH2NhLXl0LWhvc3QtcHViLTk4MDk5MzI4Njc0NjEyMDWaCVVodHRwczovL3p6enF1aWwuZGUvcHJvZHVrdGUvenp6cXVpbC1pbnRlbnMtZWluc2NobGFmaGlsZmUtbWl0LWhvaGVyZXItZG9zaXMtbWVsYXRvbmlusQkOpTq1IxlE4MgJcsgJsQHICcIBmAsBoQugcR24pB5oJ7oLSQgBEAEYBiADKAEwEEABSAFgAGgAcAKIAQCYAQGiARUKABgAIABYAGAAcACgAgGoAgPYAgHYAQGAAgGIAge6Awl2aWJydXphYmHQCxPSDAIQAZoNAROqDQJBVMgNAdINfWh0dHBzOi8venp6cXVpbC5kZS9wcm9kdWt0ZS96enpxdWlsLWludGVucy1laW5zY2hsYWZoaWxmZS1taXQtaG9oZXJlci1kb3Npcy1tZWxhdG9uaW4_Z2FkX3NvdXJjZT0yJmdhZF9jYW1wYWlnbmlkPTIzNzk4NjAzNDQ4uBP___________8BsBQBwBXJgIBA0BUB2BUBkBYBgBcBihcYCAMYASABKAEwATgBQAFIAVABWAFgAmgBoBcBqRdTXGTf1XyKOLoXBigAMAA4AdAYAfAYAcIZAggB&gclid=EAIaIQobChMItbObrpiflQMVesQNCR0sWjnVEAEYASAAEgJtafD_BwE&num=1&cid=CAASF-Ro93rquuv02l6Pw0RyGgvOXjr2-yx4&sig=AOD64_2P-Y3z5_kM07Gkem7hwg5Mjd4OKA&ctype=137&ms=%5BCLICK_MS%5D&adclksrc=%5BCLICK_SOURCE%5D
+[e375] button "My Ad Center"
+[e389] link -> /watch?v=YwSGOeaePoQ
+[e403] heading "Chillout Lounge | Luxury Golden Hour Vibes & Relaxing Music For Smooth Sunset Relaxation" [level=3]
+  [e404] link "Chillout Lounge | Luxury Golden Hour Vibes & Relaxing Music For Smooth Sunset Relaxation" -> /watch?v=YwSGOeaePoQ
+[e413] button "More actions"
+[e423] link -> /watch?v=6440p7IILgs
+[e437] heading "Relax Bossa LIVE 24/7 - Bossa Nova Covers of Popular Songs 50 Hits 2026 For Easy Listening & Relax 🎧" [level=3]
+  [e438] link "Relax Bossa LIVE 24/7 - Bossa Nova Covers of Popular Songs 50 Hits 2026 For Easy Listening & Relax 🎧" -> /watch?v=6440p7IILgs
+[e447] button "More actions"
+[e457] link -> /watch?v=muNqEUMiDxI
+[e471] heading "June 2026 🌞 Soft and Happy Chill House Music For A Nice Day | Indie/Pop/Folk/Acoustic Playlist" [level=3]
+  [e472] link "June 2026 🌞 Soft and Happy Chill House Music For A Nice Day | Indie/Pop/Folk/Acoustic Playlist" -> /watch?v=muNqEUMiDxI
+[e481] button "More actions"
+[e491] link -> /watch?v=4uEQwTh2X_s
+[e502] heading "Thrilling 80s Music Compilation – Sounds That Shaped a Generation by Michael Jackson & More" [level=3]
+  [e503] link "Thrilling 80s Music Compilation – Sounds That Shaped a Generation by Michael Jackson & More 3 hours, 44 minutes" -> /watch?v=4uEQwTh2X_s
+[e511] generic "3 weeks ago"
+[e514] button "More actions"
+[e524] link -> /watch?v=wfEzgmK-_Ig&list=RDwfEzgmK-_Ig&start_radio=1&pp=oAcB
+[e538] heading "30 Most Listened Classical Melodies (No Ads) 🎵 Beethoven, Chopin, Mozart, Bach 🎁 Relax, Healing" [level=3]
+  [e539] link "30 Most Listened Classical Melodies (No Ads) 🎵 Beethoven, Chopin, Mozart, Bach 🎁 Relax, Healing 2 hours, 11 minutes" -> /watch?v=wfEzgmK-_Ig&list=RDwfEzgmK-_Ig&start_radio=1&pp=oAcB
+[e547] generic "4 days ago"
+[e555] button "More actions"
+[e565] link -> /watch?v=x6i-4ZY3tSA&list=RDx6i-4ZY3tSA&start_radio=1&pp=oAcB0gcJCT8LAYcqIYzv
+[e579] heading "SUMMER DEEP HOUSE Musics Mix 2026 ♫ Bruno Mars, Lady Gaga,Dua Lipa, Adele,Ed Sheeran, The Weeknd #29" [level=3]
+  [e580] link "SUMMER DEEP HOUSE Musics Mix 2026 ♫ Bruno Mars, Lady Gaga,Dua Lipa, Adele,Ed Sheeran, The Weeknd #29 2 hours, 59 minutes" -> /watch?v=x6i-4ZY3tSA&list=RDx6i-4ZY3tSA&start_radio=1&pp=oAcB0gcJCT8LAYcqIYzv
+[e588] generic "Streamed 3 weeks ago"
+[e591] button "More actions"
+[e601] link -> /watch?v=vlEbK-KFX68&list=RDvlEbK-KFX68&start_radio=1&pp=oAcB
+[e615] heading "Ultimate 80s Hits" [level=3]
+  [e616] link "Ultimate 80s Hits 1 hour, 58 minutes" -> /watch?v=vlEbK-KFX68&list=RDvlEbK-KFX68&start_radio=1&pp=oAcB
+[e624] generic "1 year ago"
+[e627] button "More actions"
+[e637] link -> /watch?v=7n9Dqsy3aj4
+[e651] heading "Office Jazz ☕ Elegant Spring Coffee Jazz Music & Soft Bossa Nova Instrumental for Joyful Moods" [level=3]
+  [e652] link "Office Jazz ☕ Elegant Spring Coffee Jazz Music & Soft Bossa Nova Instrumental for Joyful Moods" -> /watch?v=7n9Dqsy3aj4
+[e661] button "More actions"
+[e671] link -> /watch?v=0QVOc1aagSE&list=RD0QVOc1aagSE&start_radio=1&pp=oAcB0gcJCT8LAYcqIYzv
+[e685] heading "Daft Punk ft. Pharell Williams Get lucky Extended Version Original Video Full HD" [level=3]
+  [e686] link "Daft Punk ft. Pharell Williams Get lucky Extended Version Original Video Full HD 18 minutes" -> /watch?v=0QVOc1aagSE&list=RD0QVOc1aagSE&start_radio=1&pp=oAcB0gcJCT8LAYcqIYzv
+[e694] generic "12 years ago"
+[e697] button "More actions"
+[e707] link -> /watch?v=79fzeNUqQbQ&list=RD79fzeNUqQbQ&start_radio=1&pp=oAcB
+[e721] heading "Madonna - Like A Prayer (Official Video)" [level=3]
+  [e722] link "Madonna - Like A Prayer (Official Video) 5 minutes, 38 seconds" -> /watch?v=79fzeNUqQbQ&list=RD79fzeNUqQbQ&start_radio=1&pp=oAcB
+[e735] generic "16 years ago"
+[e738] button "More actions"
+[e748] link -> /watch?v=8NFTgWGso1s&list=RD8NFTgWGso1s&start_radio=1&pp=oAcB
+[e762] heading "Best of the 80s Playlist | Iconic Hits That Ruled Radio and Pop Culture" [level=3]
+  [e763] link "Best of the 80s Playlist | Iconic Hits That Ruled Radio and Pop Culture 2 hours, 28 minutes" -> /watch?v=8NFTgWGso1s&list=RD8NFTgWGso1s&start_radio=1&pp=oAcB
+[e771] generic "3 months ago"
+[e774] button "More actions"
+[e784] link -> /watch?v=dgwQnAJpkzs
+[e798] heading "Chill Jazz at a Classic London Café 🎶 Relaxing Bossa Nova Music for Focus, Study & Peaceful Morning" [level=3]
+  [e799] link "Chill Jazz at a Classic London Café 🎶 Relaxing Bossa Nova Music for Focus, Study & Peaceful Morning" -> /watch?v=dgwQnAJpkzs
+[e808] button "More actions"
+[e818] link -> /watch?v=gHwsEC2ducg&list=RDgHwsEC2ducg&start_radio=1&pp=oAcB
+[e832] heading "SUMMER DEEP HOUSE Musics Mix 2026 ♫ Bruno Mars, Lady Gaga,Dua Lipa, Adele,Ed Sheeran, The Weeknd #02" [level=3]
+  [e833] link "SUMMER DEEP HOUSE Musics Mix 2026 ♫ Bruno Mars, Lady Gaga,Dua Lipa, Adele,Ed Sheeran, The Weeknd #02 2 hours, 59 minutes" -> /watch?v=gHwsEC2ducg&list=RDgHwsEC2ducg&start_radio=1&pp=oAcB
+[e841] generic "Streamed 3 weeks ago"
+[e844] button "More actions"
+[e854] link -> /watch?v=ZO9bLLx-4ko&list=RDZO9bLLx-4ko&start_radio=1&pp=oAcB
+[e868] heading "25 Most Listened Classical Melodies (No Ads) 🎶 Beethoven, Mozart, Chopin, Vivaldi 🎼 Relaxation, Heal" [level=3]
+  [e869] link "25 Most Listened Classical Melodies (No Ads) 🎶 Beethoven, Mozart, Chopin, Vivaldi 🎼 Relaxation, Heal 2 hours, 24 minutes" -> /watch?v=ZO9bLLx-4ko&list=RDZO9bLLx-4ko&start_radio=1&pp=oAcB
+[e877] generic "2 weeks ago"
+[e880] button "More actions"
+[e890] link -> /watch?v=Zi_XLOBDo_Y&list=RDZi_XLOBDo_Y&start_radio=1&pp=oAcB
+[e904] heading "Michael Jackson - Billie Jean (Official Video)" [level=3]
+  [e905] link "Michael Jackson - Billie Jean (Official Video) 4 minutes, 56 seconds" -> /watch?v=Zi_XLOBDo_Y&list=RDZi_XLOBDo_Y&start_radio=1&pp=oAcB
+[e918] generic "16 years ago"
+[e921] button "More actions"
+[e931] link -> /watch?v=82PF8ZuKi-Y&list=RD82PF8ZuKi-Y&start_radio=1&pp=oAcB
+[e945] heading "Best of 80s Music Legends - Tears For Fears, Madonna, Cyndi Lauper, Modern Talking, Michael Jackson" [level=3]
+  [e946] link "Best of 80s Music Legends - Tears For Fears, Madonna, Cyndi Lauper, Modern Talking, Michael Jackson 1 hour" -> /watch?v=82PF8ZuKi-Y&list=RD82PF8ZuKi-Y&start_radio=1&pp=oAcB
+[e954] generic "Streamed 2 days ago"
+[e962] button "More actions"
+[e972] link -> /watch?v=NWItxGY5NNk&list=RDNWItxGY5NNk&start_radio=1&pp=oAcB
+[e986] heading "80'S MUSIC ON THE ROAD | 2 Hours of Classic '80s Hits" [level=3]
+  [e987] link "80'S MUSIC ON THE ROAD | 2 Hours of Classic '80s Hits 2 hours, 16 minutes" -> /watch?v=NWItxGY5NNk&list=RDNWItxGY5NNk&start_radio=1&pp=oAcB
+[e995] generic "3 weeks ago"
+[e998] button "More actions"
+[e1008] link -> /watch?v=btPJPFnesV4&list=RDbtPJPFnesV4&start_radio=1&pp=oAcB
+[e1022] heading "Survivor - Eye Of The Tiger (Official HD Video)" [level=3]
+  [e1023] link "Survivor - Eye Of The Tiger (Official HD Video) 4 minutes, 5 seconds" -> /watch?v=btPJPFnesV4&list=RDbtPJPFnesV4&start_radio=1&pp=oAcB
+text: Survivor Band
+[e1036] generic "16 years ago"
+[e1039] button "More actions"
+[e1049] link -> /watch?v=bdGseK7U7A0&list=RDbdGseK7U7A0&start_radio=1&pp=oAcB
+[e1063] heading "Greatest Of Michael Jackson" [level=3]
+  [e1064] link "Greatest Of Michael Jackson 1 hour, 15 minutes" -> /watch?v=bdGseK7U7A0&list=RDbdGseK7U7A0&start_radio=1&pp=oAcB
+[e1072] generic "1 year ago"
+[e1075] button "More actions"
+[e1085] link -> /watch?v=uzaVxDQ6Dk4&list=RDuzaVxDQ6Dk4&start_radio=1&pp=oAcB
+[e1099] heading "Whiskey Blues Playlist 20 Best Slow Blues Songs Late Night Blues Mix" [level=3]
+  [e1100] link "Whiskey Blues Playlist 20 Best Slow Blues Songs Late Night Blues Mix 2 hours, 3 minutes" -> /watch?v=uzaVxDQ6Dk4&list=RDuzaVxDQ6Dk4&start_radio=1&pp=oAcB
+[e1108] generic "2 months ago"
+[e1111] button "More actions"
+[e1123] button "Show more"
+[e1133] heading "Comments" [level=2]
+[e1206] dialog "Before you continue to YouTube" [active]
+  [e1219] button "Language: English"
+  [e1231] link "Sign in" -> https://accounts.google.com/ServiceLogin?service=youtube&uilel=3&passive=true&continue=https%3A%2F%2Fwww.youtube.com%2Fsignin%3Faction_handle_signin%3Dtrue%26app%3Ddesktop%26hl%3Den%26next%3Dhttps%253A%252F%252Fwww.youtube.com%252Fwatch%253Fv%253DdQw4w9WgXcQ&hl=en
+  [-] tooltip "tooltip"
+  [e1241] heading "Before you continue to YouTube" [level=2]
+  text: We use
+  [e1246] link "cookies" -> https://policies.google.com/technologies/cookies?hl=en
+  text: and data to
+  [e1293] button "Reject the use of cookies and other data for the purposes described"
+  [e1300] button "Accept the use of cookies and other data for the purposes described"
+  [e1308] link "More options" -> https://consent.youtube.com/d?continue=https://www.youtube.com/watch%3Fv%3DdQw4w9WgXcQ%26cbrd%3D1&gl=AT&m=0&pc=yt&cm=2&hl=en&src=2&escs=AZ8E49Bgblo8_kcuKSF48TfjcUvYrXP17iy8M3sLr_Jv2hpR9mgs4iT_bTh0iOCmE_WlyCcUaRVt4-G5L2Qr8VqB52UpKtdmqRiT
+  [e1315] link "Privacy Policy" -> https://policies.google.com/privacy?hl=en
+  [e1318] link "Terms of Service" -> https://policies.google.com/terms?hl=en
