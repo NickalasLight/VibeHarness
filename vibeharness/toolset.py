@@ -131,9 +131,14 @@ def agent_default_toolsets(catalog: ToolsetCatalog | None = None) -> dict[str, l
 # Why these defaults:
 #   - fs:        MULTIPLE actions/turn (keep the global Config default). Filesystem
 #                steps are predictable enough to batch (write a file, read it back).
-#   - web:       up to 4 actions/turn. (Raised from 1: snapshot-ref enforcement (#73)
-#                now rejects stale/invalid refs with a hard error, so batching a few
-#                web actions per turn is safe and lets the agent make faster progress.)
+#   - web:       up to 12 actions/turn. (Raised 1 -> 4 -> 12.) snapshot-ref enforcement
+#                (#73) rejects stale/invalid refs with a hard error, so batching is safe;
+#                the qwen2.5-coder:3b iter-1 run PROVED the model reliably emits a correct
+#                10-13-call batch (fill every text field on a page in one turn), but the
+#                old cap of 4 silently DROPPED the surplus (9 of 13 in turn 2), forcing
+#                slow re-issue turns AND triggering the (harmful) advisor more often. A
+#                job-application PAGE has up to ~10 fields; 12 lets a whole page be filled
+#                in a single turn, the biggest throughput lever for this benchmark.
 #   - validator: 1 (single-shot pass/fail; never batches).
 #
 # Any agent NOT listed here falls back to the global Config default (so new agents
@@ -147,4 +152,4 @@ def agent_default_max_actions(
     ``default`` is the global Config default and is used for the ``fs`` agent so the
     multi-action batching it ships with stays driven by one source of truth.
     """
-    return {"fs": default, "web": 4, "validator": 1}
+    return {"fs": default, "web": 12, "validator": 1}

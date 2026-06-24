@@ -234,16 +234,17 @@ class TestInteractableLabelingRealSnapshot(unittest.TestCase):
                 return line
         return None
 
-    def test_search_combobox_is_fillable_text_field_with_fill_affordance(self):
-        # HEADLINE FIX: the YouTube search box is `combobox "Search" [ref=e104]`. It must
-        # render as a FILLABLE TEXT FIELD that cues `fill` — never "dropdown"/select_option.
+    def test_search_combobox_cues_select_option_with_fill_fallback(self):
+        # REVISED (iter-1): an ambiguous `combobox "Search" [ref=e104]` now cues
+        # select_option FIRST (which has an open-then-click fallback for button-comboboxes,
+        # the job-form State/Country case), while still mentioning fill for the editable
+        # case. The ref must be preserved and the line must name the control.
         line = self._line_with("e104")
         self.assertIsNotNone(line, "search combobox e104 dropped from prose")
         self.assertTrue(line.lstrip().startswith("[e104]"), line)   # ref preserved
-        self.assertIn('text field "Search"', line)
-        self.assertIn("type a value with fill", line)
-        self.assertNotIn("dropdown", line)
-        self.assertNotIn("select_option", line)
+        self.assertIn('"Search"', line)
+        self.assertIn("select_option", line)
+        self.assertIn("fill", line)   # editable fallback still mentioned
 
     def test_button_line_has_click_affordance(self):
         # The "Search" submit button (e79) is a real button -> click.
@@ -305,14 +306,15 @@ class TestInteractableLabelingFixtures(unittest.TestCase):
         self.assertIn("(no ref)", line)
         self.assertIn("not directly targetable", line)
 
-    def test_combobox_default_is_text_field_not_dropdown(self):
-        # The safer-failure-mode default for an unqualified combobox.
+    def test_combobox_default_cues_select_option(self):
+        # REVISED (iter-1): an unqualified combobox cues select_option (open+pick fallback
+        # works for button-comboboxes) with fill named as the editable fallback.
         raw = '```yaml\n- combobox "Search" [ref=e1]\n```'
         prose = aria_yaml_to_prose(raw)
         line = next(l for l in prose.splitlines() if "e1" in l)
-        self.assertIn("text field", line)
+        self.assertIn("dropdown", line)
+        self.assertIn("select_option", line)
         self.assertIn("fill", line)
-        self.assertNotIn("dropdown", line)
 
 
 if __name__ == "__main__":

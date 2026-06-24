@@ -94,7 +94,7 @@ class AgentLoopTest(unittest.TestCase):
                            FakeValidator(passed=True))
         result = agent.run("ping")
         self.assertEqual(tool.calls, 1)  # the duplicate did not run
-        self.assertIn("ALREADY did this exact action", result.transcript())
+        self.assertIn("was already successfully set to", result.transcript())
 
     def test_anti_loop_steers_repeated_failed_action(self):
         # #125 iter 6: a repeated FAILING action (e.g. an invalid ref) must also be steered,
@@ -125,7 +125,69 @@ class AgentLoopTest(unittest.TestCase):
                            FakeValidator(passed=True))
         result = agent.run("boom")
         self.assertEqual(tool.calls, 1)  # the failed action was not retried
-        self.assertIn("already FAILED", result.transcript())
+        self.assertIn("and it FAILED", result.transcript())
+
+    def test_soft_repeat_click_reruns_after_success(self):
+        # iter-1 fix: `click` is a SOFT-REPEAT tool. Clicking the SAME button again is the
+        # correct recovery after a validation-blocked submit, so a repeated SUCCESSFUL click
+        # must RUN again (not be blocked as an "already set" no-op). This is the bug that
+        # froze the job form on page 1 (re-click Continue was permanently blocked).
+        class ClickTool(Tool):
+            name = "click"
+            description = "clicks an element"
+
+            def __init__(self):
+                self.calls = 0
+
+            @property
+            def parameters(self):
+                return []
+
+            def run(self, args) -> ToolResult:
+                self.calls += 1
+                return ToolResult(True, f"you clicked {args.get('target')} (#{self.calls}).")
+
+        tool = ClickTool()
+        registry = ToolRegistry([tool])
+        client = FakeLLMClient([
+            {"tool": "click", "args": {"target": "e81"}},   # turn 1: runs
+            {"tool": "click", "args": {"target": "e81"}},   # turn 2: identical -> still RUNS
+            VALIDATE,
+        ])
+        agent = RalphAgent(client, registry, "SYS", Config(max_steps=10),
+                           FakeValidator(passed=True))
+        agent.run("click twice")
+        self.assertEqual(tool.calls, 2)  # the repeated click DID run again
+
+    def test_soft_repeat_click_is_bounded(self):
+        # iter-1 fix: a soft-repeat click is allowed to repeat, but a no-op click (e.g. on a
+        # heading that changes nothing) must NOT loop forever — after _SOFT_REPEAT_LIMIT
+        # identical repeats it is steered, so the tool runs at most 1 + LIMIT times.
+        class ClickTool(Tool):
+            name = "click"
+            description = "clicks an element"
+
+            def __init__(self):
+                self.calls = 0
+
+            @property
+            def parameters(self):
+                return []
+
+            def run(self, args) -> ToolResult:
+                self.calls += 1
+                return ToolResult(True, f"you clicked {args.get('target')} (#{self.calls}).")
+
+        tool = ClickTool()
+        registry = ToolRegistry([tool])
+        # Emit the SAME click many times; it must be capped at 1 + _SOFT_REPEAT_LIMIT runs.
+        actions = [{"tool": "click", "args": {"target": "e35"}} for _ in range(8)]
+        actions.append(VALIDATE)
+        client = FakeLLMClient(actions)
+        agent = RalphAgent(client, registry, "SYS", Config(max_steps=12),
+                           FakeValidator(passed=True))
+        agent.run("loop heading")
+        self.assertEqual(tool.calls, 1 + RalphAgent._SOFT_REPEAT_LIMIT)
 
     def test_loop_guard_exemption_only_advancing_navigation(self):
         # #125 iter 9: open_browser / goto reset state on repeat -> must be guarded

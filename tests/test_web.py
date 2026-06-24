@@ -302,6 +302,105 @@ class SubtoolGuidanceTest(unittest.TestCase):
         self.assertIn("css selector", guidance)
 
 
+class CalendarHelperTest(unittest.TestCase):
+    """iter-1: deterministic custom-calendar (DatePicker) navigation helpers."""
+
+    SNAP = (
+        '- dialog "Earliest available start date calendar" [ref=e189]:\n'
+        '  - button "Previous year" [ref=e191] [cursor=pointer]: «\n'
+        '  - button "Previous month" [ref=e192] [cursor=pointer]: ‹\n'
+        '  - generic [ref=e193]: July 2026\n'
+        '  - button "Next month" [ref=e194] [cursor=pointer]: ›\n'
+        '  - button "Next year" [ref=e195] [cursor=pointer]: »\n'
+        '  - button "2026-07-21" [ref=e221] [cursor=pointer]: "21"\n'
+        '  - button "2026-07-22" [ref=e222] [cursor=pointer]: "22"\n'
+    )
+
+    def test_calendar_view_month_parses_header(self):
+        from vibeharness.web import calendar_view_month
+        self.assertEqual(calendar_view_month(self.SNAP), (2026, 6))  # 0-based July
+        self.assertIsNone(calendar_view_month('- listbox "State":\n  - option "TX"'))
+
+    def test_find_day_button_ref_matches_iso(self):
+        from vibeharness.web import find_day_button_ref
+        self.assertEqual(find_day_button_ref(self.SNAP, "2026-07-21"), "e221")
+        self.assertEqual(find_day_button_ref(self.SNAP, "2026-07-22"), "e222")
+        self.assertIsNone(find_day_button_ref(self.SNAP, "2026-07-30"))
+
+    def test_find_nav_button_ref(self):
+        from vibeharness.web import find_nav_button_ref
+        self.assertEqual(find_nav_button_ref(self.SNAP, "Next year"), "e195")
+        self.assertEqual(find_nav_button_ref(self.SNAP, "Previous month"), "e192")
+        self.assertIsNone(find_nav_button_ref(self.SNAP, "Next decade"))
+
+
+class CalendarNavigationTest(unittest.TestCase):
+    """iter-1: SelectOptionTool._select_calendar_date drives a custom calendar to the
+    target ISO date by stepping the month/year nav buttons, then clicking the day."""
+
+    MONTHS = ["January", "February", "March", "April", "May", "June", "July",
+              "August", "September", "October", "November", "December"]
+
+    class _CalCli:
+        """A fake calendar: starts at Jan 2020, responds to nav-button and day clicks."""
+
+        def __init__(self):
+            self.y, self.m = 2020, 0       # 0-based month
+            self.clicked_day = None
+
+        def _snap(self):
+            label = f"{CalendarNavigationTest.MONTHS[self.m]} {self.y}"
+            iso = lambda d: f"{self.y:04d}-{self.m + 1:02d}-{d:02d}"
+            days = "\n".join(
+                f'  - button "{iso(d)}" [ref=e2{d:02d}] [cursor=pointer]: "{d}"'
+                for d in range(1, 29))
+            return (
+                '- dialog "calendar" [ref=e189]:\n'
+                '  - button "Previous year" [ref=e191]: «\n'
+                '  - button "Previous month" [ref=e192]: ‹\n'
+                f'  - generic [ref=e193]: {label}\n'
+                '  - button "Next month" [ref=e194]: ›\n'
+                '  - button "Next year" [ref=e195]: »\n'
+                f'{days}\n')
+
+        def run(self, *args):
+            verb = args[0]
+            if verb == "snapshot":
+                return True, f"```yaml\n{self._snap()}\n```"
+            if verb == "click":
+                ref = args[1]
+                if ref == "e194":
+                    self.m += 1
+                    if self.m > 11:
+                        self.m, self.y = 0, self.y + 1
+                elif ref == "e192":
+                    self.m -= 1
+                    if self.m < 0:
+                        self.m, self.y = 11, self.y - 1
+                elif ref == "e195":
+                    self.y += 1
+                elif ref == "e191":
+                    self.y -= 1
+                else:
+                    self.clicked_day = ref
+                return True, "### Ran Playwright code"
+            return True, ""
+
+        def snapshot(self):
+            return True, f"```yaml\n{self._snap()}\n```"
+
+    def test_navigates_forward_to_target_and_clicks_day(self):
+        from vibeharness.web import SelectOptionTool, capture_page_snapshot_raw
+        cli = self._CalCli()
+        tool = SelectOptionTool(cli, observation_limit=2000)
+        snap = capture_page_snapshot_raw(cli)
+        result = tool._select_calendar_date("e166", "2026-07-21", snap)
+        self.assertTrue(result.ok, result.observation)
+        self.assertIn("2026-07-21", result.observation)
+        self.assertEqual((cli.y, cli.m), (2026, 6))      # reached July 2026
+        self.assertEqual(cli.clicked_day, "e221")        # clicked the 21st
+
+
 class SubtoolSchemaTest(unittest.TestCase):
     def test_each_subtool_call_schema_names_itself(self):
         for cls in _WEB_TOOL_CLASSES:

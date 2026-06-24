@@ -2,8 +2,8 @@
 
 The number of tool calls allowed PER TURN is configurable by agent type, not just
 by the global ``Config.max_actions_per_turn``. Defaults: fs keeps the global
-(multiple) default; web == 4 (raised from 1 now that snapshot-ref enforcement #73
-guards stale refs); validator == 1.
+(multiple) default; web == 12 (raised 1 -> 4 -> 12 now that snapshot-ref enforcement
+#73 guards stale refs and the 3B model reliably batches a full page of fills); validator == 1.
 
 These tests assert ONE source of truth: the cap the CLI resolves for an agent is
 the cap the prompt STATES *and* the cap the agent loop ENFORCES. No model / Ollama
@@ -60,12 +60,13 @@ class IsolatedSettings(unittest.TestCase):
 
 
 class MappingTest(IsolatedSettings):
-    def test_defaults_are_fs_multiple_web_four_validator_one(self):
+    def test_defaults_are_fs_multiple_web_twelve_validator_one(self):
         mapping = agent_default_max_actions()
         # fs keeps the GLOBAL (multiple) default — the single source of truth.
         self.assertEqual(mapping["fs"], Config.max_actions_per_turn)
         self.assertGreater(mapping["fs"], 1)  # "multiple"
-        self.assertEqual(mapping["web"], 4)
+        # web raised 4 -> 12 (iter-1): the model batches a whole page of fills in one turn.
+        self.assertEqual(mapping["web"], 12)
         self.assertEqual(mapping["validator"], 1)
 
     def test_fs_default_tracks_supplied_global_default(self):
@@ -74,8 +75,8 @@ class MappingTest(IsolatedSettings):
 
 
 class ResolutionPrecedenceTest(IsolatedSettings):
-    def test_agent_web_resolves_to_four(self):
-        self.assertEqual(_resolved_cap(["task", "--agent", "web"]), 4)
+    def test_agent_web_resolves_to_twelve(self):
+        self.assertEqual(_resolved_cap(["task", "--agent", "web"]), 12)
 
     def test_agent_validator_resolves_to_one(self):
         self.assertEqual(_resolved_cap(["task", "--agent", "validator"]), 1)
@@ -117,8 +118,8 @@ class PromptStatesResolvedCapTest(IsolatedSettings):
         self.assertEqual(_resolved_cap(argv), cap)
         self.assertIn(f"at most {cap} actions per turn", prompt)
 
-    def test_web_prompt_states_four(self):
-        self._assert_prompt_states(["task", "--agent", "web"], 4)
+    def test_web_prompt_states_twelve(self):
+        self._assert_prompt_states(["task", "--agent", "web"], 12)
 
     def test_validator_prompt_states_one(self):
         self._assert_prompt_states(["task", "--agent", "validator"], 1)
@@ -169,7 +170,7 @@ class LoopEnforcesResolvedCapTest(IsolatedSettings):
         # And the model was told it was capped.
         first_turn = result.turns[0]
         notes = " ".join(a.observation for a in first_turn.actions)
-        self.assertIn("per-turn limit of 1", notes)
+        self.assertIn("per-turn limit is 1", notes)
 
     def test_fs_cap_runs_up_to_cap(self):
         cap = Config.max_actions_per_turn
@@ -186,8 +187,8 @@ class LoopEnforcesResolvedCapTest(IsolatedSettings):
         self.assertTrue(os.path.exists(self._p("f1.txt")))
         self.assertFalse(os.path.exists(self._p("f2.txt")))
         notes = " ".join(a.observation for a in result.turns[0].actions)
-        self.assertIn("per-turn limit of 2", notes)
-        self.assertIn("3 ignored", notes)
+        self.assertIn("per-turn limit is 2", notes)
+        self.assertIn("3 action(s) were NOT executed", notes)
 
 
 if __name__ == "__main__":

@@ -192,6 +192,12 @@ class RalphAgent:
         # alternative call (select_option / click / evaluate) so a low-capability model
         # that ignores soft warnings is forced to see the concrete fix every turn.
         target_block_counts: dict[str, int] = {}
+        # SOFT-REPEAT counter (iter-1): how many times each identical click/upload signature
+        # has been re-emitted. A click/upload is allowed to repeat (re-click Continue after a
+        # validation block; re-open a combobox), but a successful-yet-pointless repeat (e.g.
+        # clicking a HEADING that does nothing) would otherwise loop forever now that clicks
+        # are not no-op-blocked. After _SOFT_REPEAT_LIMIT identical repeats we steer instead.
+        soft_repeat_counts: dict[str, int] = {}
 
         # max_steps <= 0 means run until validation passes.
         turns = (itertools.count(1) if self._cfg.max_steps <= 0
@@ -297,6 +303,29 @@ class RalphAgent:
                                 break
                             continue
                         sig = self._action_signature(tool_name, args)
+                        # SOFT-REPEAT (iter-1 fix): click/upload are not value-sets. A repeat
+                        # is legitimate (re-click Continue after a validation block; re-open a
+                        # combobox; retry an upload once the chooser is ready). Let them RUN on
+                        # repeat — but BOUND it: after _SOFT_REPEAT_LIMIT identical repeats,
+                        # steer instead, so a successful-yet-pointless click (e.g. on a heading
+                        # that does nothing) cannot loop forever. This keeps the page-1 deadlock
+                        # fix (re-click Continue) while preventing the heading-click loop.
+                        if (sig is not None and sig in attempted
+                                and tool_name in self._SOFT_REPEAT_TOOLS):
+                            tgt = args.get("target", "")
+                            reps = soft_repeat_counts.get(sig, 0)
+                            if reps < self._SOFT_REPEAT_LIMIT:
+                                soft_repeat_counts[sig] = reps + 1
+                                action = self._execute(tool_name, args)
+                                self._record(turn, action, memory)
+                                attempted[sig] = action.ok
+                                if not action.ok and tgt:
+                                    target_block_counts[tgt] = target_block_counts.get(tgt, 0) + 1
+                                elif action.ok and isinstance(tgt, str) and tgt:
+                                    handled_refs.add(tgt)
+                                continue
+                            # Exceeded the repeat budget: fall through to the steer message
+                            # so the model is told this exact click is going nowhere.
                         if sig is not None and sig in attempted:
                             target = args.get("target", "")
                             value = args.get("text") or args.get("value") or ""
@@ -618,6 +647,22 @@ class RalphAgent:
     # (#125 iter 9: the model called open_browser 63x because it was exempt; each call
     # reset the page to blank and never reached `goto`.)
     _LOOP_EXEMPT_TOOLS = frozenset({"navigate_back", "navigate_forward"})
+
+    # Tools whose repetition is NOT a value-set no-op and must NOT be hard-blocked on the
+    # second attempt (iter-1 fix). A CLICK is not a "set field to value" op: re-clicking the
+    # SAME "Continue →"/"Next"/"Submit" button is the CORRECT recovery after the first click
+    # was rejected by client-side validation (e.g. State/Country still empty), and re-clicking
+    # a combobox trigger legitimately re-opens it. In iter-1 the duplicate guard treated the
+    # Continue button (e81) as "already set to ''" and permanently BLOCKED every re-click, so
+    # the run got stuck on page 1 forever once it had fixed the earlier errors. `upload` has
+    # no value to compare and was false-blocked too. For these we still TRACK attempts (so the
+    # escalating failure-loop pressure below can fire after 3 genuine repeats) but we do NOT
+    # block the FIRST repeat: the page may have changed and the action may now succeed.
+    _SOFT_REPEAT_TOOLS = frozenset({"click", "upload"})
+    # Max identical re-runs allowed for a soft-repeat tool before it is steered. 2 covers the
+    # real recovery case (re-click Continue/Submit after the first click was validation-blocked)
+    # while stopping a no-op click (e.g. on a heading) from looping forever.
+    _SOFT_REPEAT_LIMIT = 2
 
     def _action_signature(self, tool_name: str | None, args: dict) -> str | None:
         """A stable signature for an executed action, or ``None`` if this tool is exempt

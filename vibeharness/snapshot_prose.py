@@ -244,14 +244,26 @@ _AFF_FILL = "type a value with fill"
 _AFF_CLICK = "click"
 _AFF_SELECT = "pick an option with select_option"
 _AFF_TOGGLE = "toggle with check/uncheck"
+# A bare ``combobox`` is ambiguous in the ARIA tree: it may be an EDITABLE text field
+# (e.g. a search box) OR a button-style option-picker (the job-form State/Country/etc.
+# dropdowns, which are <button role="combobox" aria-haspopup="listbox"> — fill FAILS on
+# them). Playwright's snapshot does NOT expose aria-haspopup, so we cannot tell them apart.
+# We cue select_option FIRST because the select_option tool has a built-in fallback (#125):
+# on a custom combobox it CLICKS the trigger to open the listbox and CLICKS the matching
+# option — so select_option works for BOTH the picker case and (harmlessly) leaves an
+# editable box for fill. This reverses the old fill-first default, which made the 3B model
+# fail on all 12 of the job form's comboboxes (iter-1).
+_AFF_COMBO = "pick an option with select_option (it opens the dropdown); if it is editable, use fill"
 
 # role (lowercased) -> (label, affordance). ``None`` affordance = surfaced for context but
 # not itself a primary action target (e.g. ``option`` inside a listbox, ``tab``).
 #
-# HEADLINE FIX (#70 step 1): a bare ``combobox`` is NOT a <select> dropdown — in practice
-# (e.g. the YouTube search box) it is an editable text field. Rendering it as "dropdown"
-# wrongly cues ``select_option``; we render it as a FILLABLE TEXT FIELD cueing ``fill``
-# (the safer failure mode). Genuine option-pickers are ``listbox``/``select``/``menu``.
+# COMBOBOX (#70, revised iter-1): a bare ``combobox`` is ambiguous — it can be an editable
+# text field (YouTube search) OR a button option-picker (the job form's State/Country/...
+# dropdowns). The #70 default cued ``fill``, which FAILS on every button-combobox. Since the
+# ``select_option`` tool now has an open-then-click fallback for custom comboboxes (#125),
+# we cue ``select_option`` (works for pickers; falls through for editable). Genuine native
+# pickers are ``listbox``/``select``/``menu``. See ``_AFF_COMBO`` for the full rationale.
 _ROLE_INFO: dict[str, tuple[str, str | None]] = {
     "link": ("link", _AFF_CLICK),
     "button": ("button", _AFF_CLICK),
@@ -262,7 +274,7 @@ _ROLE_INFO: dict[str, tuple[str, str | None]] = {
     # fillable text inputs -> fill
     "textbox": ("text field", _AFF_FILL),
     "searchbox": ("search field", _AFF_FILL),
-    "combobox": ("text field", _AFF_FILL),   # unqualified/editable combobox -> safe default
+    "combobox": ("dropdown", _AFF_COMBO),     # ambiguous combobox -> select_option (has open+pick fallback)
     "spinbutton": ("number field", _AFF_FILL),
     # genuine option pickers -> select_option
     "listbox": ("dropdown list", _AFF_SELECT),

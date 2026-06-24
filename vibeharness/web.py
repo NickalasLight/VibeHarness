@@ -221,6 +221,43 @@ def find_option_ref_by_text(snapshot: str, value: str) -> str | None:
     return exact or starts or contains
 
 
+# An ISO date value (yyyy-mm-dd) the task supplies for a date field.
+_ISO_DATE_RE = re.compile(r"^\s*(\d{4})-(\d{2})-(\d{2})\s*$")
+# A calendar day cell button carries its ISO date as the accessible name/aria-label.
+# e.g. ``- button "2026-07-21" [ref=e221] [cursor=pointer]: "21"``
+_DAY_BUTTON_RE = re.compile(r'button\s+"(\d{4}-\d{2}-\d{2})"[^\n]*?ref=(e\d+)', re.IGNORECASE)
+# The calendar header label, e.g. ``generic [ref=e193]: January 2020`` (month + year).
+_CAL_MONTHYEAR_RE = re.compile(
+    r"(January|February|March|April|May|June|July|August|September|October|"
+    r"November|December)\s+(\d{4})", re.IGNORECASE)
+_MONTHS = ["january", "february", "march", "april", "may", "june", "july",
+           "august", "september", "october", "november", "december"]
+
+
+def find_day_button_ref(snapshot: str, iso_date: str) -> str | None:
+    """Ref of the calendar day-cell button whose ISO aria-label == ``iso_date``, or None."""
+    for m in _DAY_BUTTON_RE.finditer(snapshot or ""):
+        if m.group(1) == iso_date.strip():
+            return m.group(2)
+    return None
+
+
+def find_nav_button_ref(snapshot: str, label: str) -> str | None:
+    """Ref of a calendar nav button by its accessible name (e.g. 'Next year')."""
+    pat = re.compile(rf'button\s+"{re.escape(label)}"[^\n]*?ref=(e\d+)', re.IGNORECASE)
+    m = pat.search(snapshot or "")
+    return m.group(1) if m else None
+
+
+def calendar_view_month(snapshot: str) -> tuple[int, int] | None:
+    """(year, month-1) currently shown in an open calendar, or None if not a calendar."""
+    m = _CAL_MONTHYEAR_RE.search(snapshot or "")
+    if not m:
+        return None
+    month = _MONTHS.index(m.group(1).lower())
+    return int(m.group(2)), month
+
+
 def output_signals_no_match(output: str) -> bool:
     """True when playwright-cli's (exit-0) output text indicates the action hit no
     element — a ref/selector that resolved to nothing. The CLI reports these as an
@@ -843,15 +880,32 @@ class FillTool(_WebTool):
                 # Find nearby interactable refs from a fresh snapshot.
                 snapshot = capture_page_snapshot_raw(self._cli) or ""
                 nearby = _nearby_interactable_refs(target, snapshot)
-                obs = (
-                    f"ERROR: '{target}' is NOT interactable for text input. "
-                    f"Playwright resolved it to: {html_snippet}  "
-                    f"This element cannot accept fill/type — it is a label, div, span, "
-                    f"or other non-input element. "
-                    f"Nearby interactable elements: {nearby}. "
-                    f"Pick one of those refs instead, or use select_option/click if "
-                    f"it is a dropdown or combobox."
-                )
+                # If the element is a combobox/select/listbox, fill will NEVER work — the
+                # correct tool is select_option on the SAME ref (it opens a custom combobox
+                # and clicks the matching option for you). Make that the explicit, primary
+                # instruction so the 3B model stops retrying fill (iter-1: State/Country).
+                snip_l = html_snippet.lower()
+                is_dropdown = ('role="combobox"' in snip_l or 'role="listbox"' in snip_l
+                               or "<select" in snip_l or 'haspopup="listbox"' in snip_l)
+                if is_dropdown:
+                    obs = (
+                        f"ERROR: '{target}' is a DROPDOWN (combobox/select), not a text box — "
+                        f"fill/type will NEVER work on it. Use select_option on the SAME ref: "
+                        f"select_option(target='{target}', value='<the exact option text>'). "
+                        f"That opens the dropdown and clicks the matching option for you. "
+                        f"Do NOT call fill/type on '{target}' again. "
+                        f"Playwright resolved it to: {html_snippet}"
+                    )
+                else:
+                    obs = (
+                        f"ERROR: '{target}' is NOT interactable for text input. "
+                        f"Playwright resolved it to: {html_snippet}  "
+                        f"This element cannot accept fill/type — it is a label, div, span, "
+                        f"or other non-input element. "
+                        f"Nearby interactable elements: {nearby}. "
+                        f"Pick one of those refs instead, or use select_option/click if "
+                        f"it is a dropdown or combobox."
+                    )
                 return ToolResult(False, obs)
             return result
         # Action succeeded — append DOM change delta if any new elements appeared.
@@ -944,6 +998,15 @@ class SelectOptionTool(_WebTool):
         if not ok or output_signals_no_match(out):
             return None  # couldn't even open it -> let the native error stand
         snapshot = capture_page_snapshot_raw(self._cli)
+        # CALENDAR date picker (iter-1): a DatePicker opens a calendar dialog, not a list of
+        # options. A 3B model cannot blindly navigate from the default month to the target by
+        # clicking month-nav arrows, so drive it deterministically here: parse the requested
+        # ISO date, click Next/Previous year+month the exact number of times to reach the
+        # target month, then click the day cell whose aria-label == the ISO date.
+        if _ISO_DATE_RE.match(value or ""):
+            cal = self._select_calendar_date(target, value, snapshot)
+            if cal is not None:
+                return cal
         ref = find_option_ref_by_text(snapshot, value)
         if ref is None:
             # Opened but no auto-match: leave it open and tell the model to click the option.
@@ -958,6 +1021,65 @@ class SelectOptionTool(_WebTool):
                               f"option ({ref}) failed: {self._trim(out2)}")
         return ToolResult(True, f"you selected '{value}' in the '{target}' combobox (opened it and "
                           f"clicked option {ref}). Result:\n{self._trim(out2)}")
+
+    def _select_calendar_date(self, target: str, iso_date: str,
+                              snapshot: str) -> ToolResult | None:
+        """Drive an OPEN custom calendar to ``iso_date`` (yyyy-mm-dd) and click the day.
+
+        Returns a ToolResult on success/explicit failure, or ``None`` if the open popup is
+        NOT a calendar (so the caller falls back to the normal option-matching path). Steps
+        the month/year nav buttons the exact number of times needed, then clicks the day
+        cell whose ISO aria-label matches. Deterministic — no model month-navigation needed."""
+        view = calendar_view_month(snapshot)
+        if view is None:
+            return None  # not a calendar -> let the caller try option matching
+        m = _ISO_DATE_RE.match(iso_date)
+        target_y, target_m = int(m.group(1)), int(m.group(2)) - 1  # 0-based month
+        snap = snapshot
+        cur_y, cur_m = view
+        # Bounded loop: navigate to the target month. 700 steps covers ~58 years either way;
+        # the cap purely prevents an infinite loop if the calendar markup is unexpected.
+        for _ in range(700):
+            # Signed month delta from the currently-shown month to the target.
+            delta = (target_y - cur_y) * 12 + (target_m - cur_m)
+            if delta == 0:
+                break
+            # Jump by year when >=12 months off (faster), else step a single month.
+            if delta >= 12:
+                label = "Next year"
+            elif delta <= -12:
+                label = "Previous year"
+            elif delta > 0:
+                label = "Next month"
+            else:
+                label = "Previous month"
+            nav = find_nav_button_ref(snap, label)
+            if nav is None:
+                return None  # unexpected markup -> let caller fall back
+            self._cli.run("click", nav)
+            # Re-read the calendar header after the nav click to get the new view.
+            snap = capture_page_snapshot_raw(self._cli)
+            view = calendar_view_month(snap)
+            if view is None:
+                break
+            cur_y, cur_m = view
+        # Now click the day cell carrying the exact ISO date.
+        snap = capture_page_snapshot_raw(self._cli)
+        day_ref = find_day_button_ref(snap, iso_date)
+        if day_ref is None:
+            return ToolResult(True, f"you opened the '{target}' date picker and navigated to "
+                              f"{iso_date[:7]}. Click the day cell whose label is exactly "
+                              f"'{iso_date}' by its ref (use the calendar nav buttons if the "
+                              f"month is still wrong).")
+        ok, out = self._cli.run("click", day_ref)
+        if ok and output_signals_no_match(out):
+            ok = False
+        if not ok:
+            return ToolResult(False, f"you opened the '{target}' date picker and reached "
+                              f"{iso_date[:7]}, but clicking the day '{iso_date}' ({day_ref}) "
+                              f"failed: {self._trim(out)}")
+        return ToolResult(True, f"you set the '{target}' date to {iso_date} (opened the calendar, "
+                          f"navigated to {iso_date[:7]}, and clicked day {day_ref}).")
 
 
 class CheckTool(_WebTool):
