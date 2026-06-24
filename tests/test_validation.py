@@ -260,6 +260,30 @@ class ValidatorSystemPromptTest(unittest.TestCase):
         # warns against guessed/invented selectors
         self.assertTrue("guessed" in sys or "invented" in sys)
 
+    def test_failure_demands_concrete_prioritized_ref_specific_next_steps(self):
+        # Issue #69: on FAIL the validator must give a concrete, prioritized,
+        # ref-specific next-step recommendation — not just diagnose.
+        sys = VALIDATOR_SYSTEM.lower()
+        # do not merely diagnose
+        self.assertIn("not merely diagnose", sys)
+        # concrete + prioritized
+        self.assertIn("concrete", sys)
+        self.assertIn("prioritized", sys)
+        # the SINGLE most important next action + its exact ref, then follow-ups
+        self.assertIn("single most important next action", sys)
+        self.assertIn("exact ref", sys)
+        self.assertTrue("follow-up" in sys or "follow up" in sys)
+        # short + imperative direction for a small model
+        self.assertIn("imperative", sys)
+        # mislabeled controls: still name the ref
+        self.assertIn("mislabeled", sys)
+
+    def test_failure_reason_is_what_the_agent_reads_verbatim(self):
+        # The guidance must land in `reason` (which is fed back to the main agent).
+        sys = VALIDATOR_SYSTEM.lower()
+        self.assertIn("reason", sys)
+        self.assertIn("verbatim", sys)
+
 
 if __name__ == "__main__":
     unittest.main()
