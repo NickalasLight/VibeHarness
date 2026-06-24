@@ -210,6 +210,17 @@ class WebToolset(Toolset):
     description = ("Browse the web with a stateful browser: navigate, read page content and "
                    "links via snapshot, click, fill forms, upload files, and screenshot.")
 
+    def system_guidance(self) -> str | None:
+        return (
+            "A snapshot is your only view of the page, so take a fresh one after every "
+            "navigation or click and read it before deciding what to do next. "
+            "Act only on elements present in the current snapshot, referencing them by their "
+            "ref — never guess a selector or element id. "
+            "If a cookie/consent banner or modal dialog blocks what you need, clear it first: "
+            "locate its Accept / Agree / Reject / Dismiss / Continue control in the snapshot and "
+            "click that ref before doing anything else."
+        )
+
     def create_tools(self, config: Config) -> list[Tool]:
         cli = PlaywrightCli(config.web_session, config.web_cli_timeout)
         return [BrowseTool(cli, config.web_observation_char_limit)]

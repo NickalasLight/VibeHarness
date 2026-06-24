@@ -105,15 +105,52 @@ class ToolsetGuidanceTest(unittest.TestCase):
         self.assertIn("read the file back", sp.lower())
 
     def test_fs_guidance_absent_when_fs_not_active(self):
-        # web is the only other toolset and (for issue #19) carries no guidance,
-        # so a web-only prompt has no tools-guidance section at all.
+        # A web-only prompt now carries the web toolset's own guidance (issue #23),
+        # so the tools-guidance section IS present — but it must not contain the
+        # filesystem-specific note, since the fs toolset is not active.
         sp = self._build(["web"])
-        self.assertNotIn("# Working with your tools", sp)
+        self.assertIn("# Working with your tools", sp)
         self.assertNotIn("read the file back", sp.lower())
 
+    def test_web_guidance_present_when_web_active(self):
+        sp = self._build(["web"])
+        self.assertIn("# Working with your tools", sp)
+        # banner/consent dismissal wording
+        lower = sp.lower()
+        self.assertTrue(
+            "consent" in lower or "accept" in lower or "dismiss" in lower,
+            "web guidance should cover dismissing a consent banner / dialog",
+        )
+        # snapshot-as-only-view wording
+        self.assertIn("snapshot", lower)
+
+    def test_web_guidance_absent_when_only_fs_active(self):
+        sp = self._build(["fs"])
+        # fs guidance present, but no web-specific wording leaks in
+        self.assertIn("read the file back", sp.lower())
+        self.assertNotIn("snapshot", sp.lower())
+        self.assertNotIn("consent", sp.lower())
+
+    def test_both_guidances_present_when_web_and_fs_active(self):
+        sp = self._build(["web", "fs"])
+        self.assertIn("# Working with your tools", sp)
+        self.assertIn("read the file back", sp.lower())   # fs
+        self.assertIn("snapshot", sp.lower())              # web
+
+    def test_no_guidance_contains_benchmark_specific_strings(self):
+        for names in (["fs"], ["web"], ["web", "fs"]):
+            sp = self._build(names).lower()
+            for forbidden in ("youtube", "rick", "embed"):
+                self.assertNotIn(forbidden, sp,
+                                 f"{forbidden!r} leaked into guidance for {names}")
+
     def test_no_guidance_contributes_no_section(self):
-        # A toolset with no system_guidance must not emit an empty heading.
-        self.assertEqual(SystemPromptBuilder.assemble_guidance(self.catalog.select(["web"])), "")
+        # A source with no system_guidance must not emit an empty heading. (Both
+        # shipped toolsets now carry guidance, so use a stub source for the empty case.)
+        class _Silent:
+            def system_guidance(self):
+                return None
+        self.assertEqual(SystemPromptBuilder.assemble_guidance([_Silent()]), "")
         sp = SystemPromptBuilder(self._registry(["web"]), guidance="").build()
         self.assertNotIn("# Working with your tools", sp)
 
