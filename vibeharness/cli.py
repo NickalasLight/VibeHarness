@@ -356,7 +356,17 @@ def _run_locked(args, task, config, registry, codec, names, workdir, logger,
         guidance=SystemPromptBuilder.assemble_guidance(toolsets))
     fs = FileSystem()
 
+    # The "# Workspace" directory tree is only meaningful to an agent that can
+    # actually touch the filesystem. A web-only worker (no `fs` tools) gets no
+    # workspace section at all — the file tree is irrelevant noise competing with
+    # its live page snapshot + tool guidance. Returning "" makes the builder omit
+    # the section (mirrors the page/guidance empty-section behaviour). When fs IS
+    # active (fs, or fs+web, …) we render as before, now minus hidden folders.
+    fs_active = "fs" in names
+
     def render_workspace() -> str:
+        if not fs_active:
+            return ""
         cwd = Path.cwd()
         try:
             tree = fs.tree(str(cwd))
