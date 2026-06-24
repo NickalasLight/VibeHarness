@@ -3,14 +3,30 @@ import os
 import tempfile
 import unittest
 
-from vibeharness.agent import RalphAgent
+from vibeharness.agent import Action, RalphAgent
 from vibeharness.config import Config
 from vibeharness.filesystem import FileSystem
 from vibeharness.fs_tools import build_default_tools
 from vibeharness.registry import ToolRegistry
 from vibeharness.reporting import NullReporter
+from vibeharness.tools import Tool, ToolResult
 
 from tests._fakes import FakeLLMClient, FakeValidator, RecordingLLMClient
+
+
+class BoomTool(Tool):
+    """A tool that raises an unexpected (non-ToolResult) error when run, to model a
+    mid-turn crash that escapes the normal tool-error handling."""
+
+    name = "boom"
+    description = "raises mid-turn"
+
+    @property
+    def parameters(self):
+        return []
+
+    def run(self, args) -> ToolResult:
+        raise RuntimeError("kaboom from a tool mid-turn")
 
 
 class RecordingReporter(NullReporter):
@@ -137,6 +153,43 @@ class AgentLoopTest(unittest.TestCase):
         seen = []
         self._agent([VALIDATE]).run("t", on_turn=lambda r: seen.append(len(r.turns)))
         self.assertEqual(seen, [1])   # one turn, checkpointed once
+
+    def test_unexpected_mid_turn_error_flushes_partial_turn_then_reraises(self):
+        # A turn that completes one real action and then hits an unexpected tool
+        # error (#16). The agent must: keep the completed action on the turn, call
+        # on_turn ONCE so the partial result reaches a checkpoint, then re-raise so
+        # the caller still sees the crash. Without the failsafe, on_turn never fires
+        # for this turn and the completed action is lost.
+        registry = ToolRegistry(build_default_tools(FileSystem(), 1000) + [BoomTool()])
+        actions = [[
+            {"tool": "list_directory", "args": {"path": self.dir}},
+            {"tool": "boom", "args": {}},
+        ]]
+        agent = RalphAgent(FakeLLMClient(actions), registry, "SYS",
+                           Config(max_steps=5), FakeValidator())
+        checkpoints = []
+        with self.assertRaises(RuntimeError):
+            agent.run("t", on_turn=lambda r: checkpoints.append(
+                [a.tool for a in r.turns[-1].actions]))
+        # the failsafe flushed exactly once, and that snapshot already held the
+        # completed list_directory action (plus the recorded failure marker)
+        self.assertEqual(len(checkpoints), 1)
+        self.assertIn("list_directory", checkpoints[0])
+
+    def test_error_before_any_action_still_flushes_a_turn(self):
+        # If the crash strikes before the Turn is even appended (e.g. the system
+        # prompt provider raises), the failsafe must still create a turn, flush it,
+        # and re-raise — so the run is never silently turn-less on a crash.
+        def boom_provider():
+            raise RuntimeError("provider blew up before turn 1 produced anything")
+
+        client = FakeLLMClient([VALIDATE])
+        agent = RalphAgent(client, self.registry, "SYS", Config(max_steps=5),
+                           FakeValidator(), system_prompt_provider=boom_provider)
+        seen = []
+        with self.assertRaises(RuntimeError):
+            agent.run("t", on_turn=lambda r: seen.append(len(r.turns)))
+        self.assertEqual(seen, [1])   # one turn was synthesised and flushed
 
     def test_validator_stream_reaches_reporter(self):
         reporter = RecordingReporter()
