@@ -233,45 +233,119 @@ def _is_interesting(node: _Node) -> bool:
     return node.ref is not None
 
 
-# Roles we want to surface a leading human cue for. Everything else prints its raw role.
-_ROLE_LABEL = {
-    "link": "link",
-    "button": "button",
-    "textbox": "textbox",
-    "combobox": "dropdown",
-    "checkbox": "checkbox",
-    "radio": "radio",
-    "slider": "slider",
-    "tab": "tab",
-    "menuitem": "menuitem",
-    "option": "option",
-    "searchbox": "searchbox",
-    "switch": "switch",
-    "spinbutton": "spinbutton",
+# --- Role -> human label + tool affordance (issue #70) --------------------------------
+# Each actionable role gets a stable human-readable LABEL plus an AFFORDANCE suffix whose
+# verb names the *exact* web subtool (:mod:`vibeharness.web`) the agent should reach for.
+# This is derived from the ROLE ALONE — Playwright's ARIA-YAML here exposes no
+# ``editable``/``value`` props, so we cannot inspect them. Tools (web.py): ``fill`` (set a
+# text field), ``click`` (button/link), ``select_option`` (a real <select>/listbox),
+# ``check``/``uncheck`` (checkbox/radio).
+_AFF_FILL = "type a value with fill"
+_AFF_CLICK = "click"
+_AFF_SELECT = "pick an option with select_option"
+_AFF_TOGGLE = "toggle with check/uncheck"
+
+# role (lowercased) -> (label, affordance). ``None`` affordance = surfaced for context but
+# not itself a primary action target (e.g. ``option`` inside a listbox, ``tab``).
+#
+# HEADLINE FIX (#70 step 1): a bare ``combobox`` is NOT a <select> dropdown — in practice
+# (e.g. the YouTube search box) it is an editable text field. Rendering it as "dropdown"
+# wrongly cues ``select_option``; we render it as a FILLABLE TEXT FIELD cueing ``fill``
+# (the safer failure mode). Genuine option-pickers are ``listbox``/``select``/``menu``.
+_ROLE_INFO: dict[str, tuple[str, str | None]] = {
+    "link": ("link", _AFF_CLICK),
+    "button": ("button", _AFF_CLICK),
+    "tab": ("tab", _AFF_CLICK),
+    "menuitem": ("menuitem", _AFF_CLICK),
+    "menuitemcheckbox": ("checkbox", _AFF_TOGGLE),
+    "menuitemradio": ("radio", _AFF_TOGGLE),
+    # fillable text inputs -> fill
+    "textbox": ("text field", _AFF_FILL),
+    "searchbox": ("search field", _AFF_FILL),
+    "combobox": ("text field", _AFF_FILL),   # unqualified/editable combobox -> safe default
+    "spinbutton": ("number field", _AFF_FILL),
+    # genuine option pickers -> select_option
+    "listbox": ("dropdown list", _AFF_SELECT),
+    "select": ("dropdown list", _AFF_SELECT),
+    "menu": ("menu", _AFF_SELECT),
+    # toggles -> check/uncheck
+    "checkbox": ("checkbox", _AFF_TOGGLE),
+    "radio": ("radio", _AFF_TOGGLE),
+    "switch": ("switch", _AFF_TOGGLE),
+    # surfaced for context, no single primary tool verb
+    "option": ("option", None),
+    "slider": ("slider", None),
 }
+
+# Actionable roles (have a tool affordance). Used to disambiguate the [-] placeholder: an
+# actionable role with NO ref is targetable-in-principle but the tree gave no handle.
+_ACTIONABLE_ROLES = frozenset(r for r, (_, aff) in _ROLE_INFO.items() if aff is not None)
+
+
+def _role_info(role: str) -> tuple[str, str | None]:
+    """(label, affordance) for a role, falling back to the raw role + no affordance."""
+    return _ROLE_INFO.get(role.lower(), (role, None))
 
 
 def _render_node_line(node: _Node, depth: int) -> str:
     """Render a single kept node into a WebArena-style line, ref-keyed.
 
-    Format:  ``<indent>[<ref>] <role> "<name>"<state>[ -> <url>]``
-    The leading ``[<ref>]`` is the tool-resolvable identifier (issue #64 step 3). Nodes
-    with no ref get ``[-]`` so the columnar shape is preserved and the agent can see at a
-    glance the element is not directly clickable.
+    Format:  ``<indent>[<ref>] <label> "<name>"<state>[ -> <url>] — <affordance>``
+    The leading ``[<ref>]`` is the tool-resolvable identifier (issue #64 step 3). The
+    trailing ``— <affordance>`` (issue #70 step 2) names the exact web subtool verb for
+    the role so a small model is not left to guess (e.g. a text field cues ``fill``, a
+    button cues ``click``).
+
+    The ``[-]`` placeholder is disambiguated (#70 step 3): a *decorative* refless node
+    just gets ``[-]``; an *actionable-role* refless node is flagged ``(no ref) … not
+    directly targetable`` so the agent does not waste a tool call trying to act on a
+    handle that does not exist.
     """
     indent = "  " * depth
     if node.role == "__text__":
         return f'{indent}text: {node.text}'
-    ident = f"[{node.ref}]" if node.ref else "[-]"
-    role = _ROLE_LABEL.get(node.role.lower(), node.role)
-    line = f"{indent}{ident} {role}"
+    role_l = node.role.lower()
+    label, affordance = _role_info(node.role)
+    is_actionable = role_l in _ACTIONABLE_ROLES
+
+    if node.ref:
+        ident = f"[{node.ref}]"
+    elif is_actionable:
+        # actionable role but the tree gave no ref -> say so explicitly
+        ident = "(no ref)"
+    else:
+        ident = "[-]"
+
+    line = f"{indent}{ident} {label}"
     if node.name and node.name.strip():
         line += f' "{node.name}"'
+    elif role_l == "link" and node.url:
+        # unnamed link (#70 step 4): hint its destination so it is not a mystery target
+        line += f' "{_link_hint(node.url)}"'
     if node.props:
         line += " " + " ".join(f"[{p}]" for p in node.props)
-    if node.url and node.role.lower() == "link":
+    if node.url and role_l == "link":
         line += f" -> {node.url}"
+
+    if node.ref and affordance:
+        line += f" — {affordance}"
+    elif is_actionable and not node.ref:
+        line += " — not directly targetable"
     return line
+
+
+def _link_hint(url: str) -> str:
+    """A short human hint for an unnamed link, derived from its href (#70 step 4)."""
+    u = url.strip()
+    if u.startswith("javascript:") or u in ("", "#"):
+        return "link"
+    # keep the last meaningful path segment (or the query's v= for YouTube watch links)
+    m = re.search(r"[?&]v=([^&]+)", u)
+    if m:
+        return f"watch {m.group(1)}"
+    tail = u.rstrip("/").rsplit("/", 1)[-1]
+    tail = tail.split("?", 1)[0]
+    return tail or u
 
 
 def _walk(node: _Node, depth: int, out: list[str], recent: list[str]) -> None:
