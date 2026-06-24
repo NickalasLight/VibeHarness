@@ -95,6 +95,7 @@ class RunnerTest(unittest.TestCase):
             client_factory=client_factory_for(actions),
             validator_factory=pass_validator_factory,
             verbose=False,
+            save_logs=False,   # these cases assert behaviour, not logging; keep cwd clean
         )
 
     def test_task_one_passes_with_correct_script(self):
@@ -182,6 +183,49 @@ class RunnerTest(unittest.TestCase):
             self.assertIn("greeting.txt", txt.read_text(encoding="utf-8"))
             json.loads(js.read_text(encoding="utf-8"))  # valid JSON dump
 
+    def test_vibe_log_is_written_to_persistent_dir(self):
+        # The fix: a benchmark run leaves a .vibe chat log (RunLogger format) under a
+        # persistent log dir, surviving the throwaway temp sandbox.
+        import tempfile
+        from pathlib import Path
+        task = get_tasks([1])[0]
+        actions = [
+            {"tool": "create_file",
+             "args": {"path": "greeting.txt", "content": "Hello, world!"}},
+            VALIDATE,
+        ]
+        with tempfile.TemporaryDirectory() as td:
+            runner = BenchmarkRunner(
+                Config(max_steps=5),
+                client_factory=client_factory_for(actions),
+                validator_factory=pass_validator_factory,
+                verbose=False, log_dir=td)
+            runner.run_task("json", task)
+            cell = Path(td) / "json" / f"{task.number:02d}_{task.id}" / ".vibe"
+            logs = list(cell.glob("*.json"))
+            self.assertEqual(len(logs), 1, f".vibe json log not written under {cell}")
+            payload = json.loads(logs[0].read_text(encoding="utf-8"))
+            # Schema parity with the CLI's RunLogger output, incl. per-turn traces.
+            self.assertEqual(payload["task"], task.prompt)
+            self.assertIn("turns", payload)
+            self.assertTrue(payload["turns"], "turns should be recorded")
+            self.assertIn("reasoning", payload["turns"][0])
+            self.assertTrue(list(cell.glob("*.md")), ".vibe markdown log not written")
+
+    def test_no_save_writes_no_logs(self):
+        import tempfile
+        from pathlib import Path
+        task = get_tasks([1])[0]
+        with tempfile.TemporaryDirectory() as td:
+            runner = BenchmarkRunner(
+                Config(max_steps=5),
+                client_factory=client_factory_for([VALIDATE]),
+                validator_factory=pass_validator_factory,
+                verbose=False, save_logs=False, log_dir=td)
+            runner.run_task("json", task)
+            self.assertEqual(list(Path(td).rglob("*")), [],
+                             "no logs should be written when save_logs=False")
+
     def test_each_task_runs_in_isolated_workdir(self):
         # Two tasks in one codec run must not see each other's files: task 1 creates
         # greeting.txt; task 3 (dir tree) should pass independently in its own sandbox.
@@ -215,7 +259,7 @@ class CliTest(unittest.TestCase):
              "args": {"path": "greeting.txt", "content": "Hello, world!"}},
             VALIDATE,
         ]
-        rc = main(["--codec", "json", "--tasks", "1", "--max-steps", "4"],
+        rc = main(["--codec", "json", "--tasks", "1", "--max-steps", "4", "--no-save"],
                   client_factory=client_factory_for(actions),
                   validator_factory=pass_validator_factory)
         self.assertEqual(rc, 0)

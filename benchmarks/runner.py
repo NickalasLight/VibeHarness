@@ -35,6 +35,7 @@ import tempfile
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
+from datetime import datetime
 from pathlib import Path
 from pkgutil import iter_modules
 from typing import Callable, Iterator, Optional
@@ -45,6 +46,7 @@ from vibeharness.config import Config
 from vibeharness.filesystem import FileSystem, FileSystemError
 from vibeharness.llm import LLMClient, OllamaClient
 from vibeharness.prompt import SystemPromptBuilder
+from vibeharness.runlog import RunLogger
 from vibeharness.toolset import default_catalog
 from vibeharness.validation import LLMValidator, Validator
 
@@ -168,7 +170,9 @@ class BenchmarkRunner:
                  client_factory: ClientFactory = _default_client_factory,
                  validator_factory: ValidatorFactory = _default_validator_factory,
                  verbose: bool = True,
-                 transcript_dir: Path | str | None = None):
+                 transcript_dir: Path | str | None = None,
+                 save_logs: bool = True,
+                 log_dir: Path | str | None = None):
         self._cfg = config or Config()
         self._client_factory = client_factory
         self._validator_factory = validator_factory
@@ -177,6 +181,18 @@ class BenchmarkRunner:
         # observation) is saved per (codec, task) for later analysis. Resolved to an
         # ABSOLUTE path now because each task runs inside a chdir'd temp sandbox.
         self._transcript_dir = Path(transcript_dir).resolve() if transcript_dir else None
+        # Per-run .vibe chat logs (same RunLogger format the CLI writes), saved by
+        # default. They CANNOT live in the task's working dir — that is a throwaway
+        # temp sandbox that is deleted on exit — so they go under a persistent root,
+        # resolved to an ABSOLUTE path now (before any chdir): one .vibe folder per
+        # (codec, task) cell at <log_root>/<codec>/<NN_taskid>/.vibe/<stamp>.{json,md}.
+        self._run_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        if not save_logs:
+            self._log_root: Path | None = None
+        elif log_dir is not None:
+            self._log_root = Path(log_dir).resolve()
+        else:
+            self._log_root = (Path.cwd() / "benchmark_runs" / self._run_stamp).resolve()
 
     def _log(self, msg: str) -> None:
         if self._verbose:
@@ -198,6 +214,16 @@ class BenchmarkRunner:
                 encoding="utf-8")
         except Exception as e:  # pragma: no cover - defensive
             self._log(f"  (warning: could not save transcript for {task.id}: {e})")
+
+    def _save_vibe_log(self, logger: RunLogger, task: Task, cfg: Config, result) -> None:
+        """Write the run's `.vibe/<stamp>.{json,md}` (RunLogger format — identical
+        schema to the CLI's logs). Called every turn so a killed/crashed run keeps
+        its partial trace, exactly like the CLI. Best-effort: a logging failure must
+        never fail the benchmark, but it is surfaced (never silently swallowed)."""
+        try:
+            logger.write(task.prompt, cfg, result)
+        except Exception as e:
+            self._log(f"  (warning: could not write .vibe log for {task.id}: {e})")
 
     def run_task(self, codec_name: str, task: Task) -> TaskResult:
         """Run a single task under a single codec in its own temp sandbox."""
@@ -233,12 +259,21 @@ class BenchmarkRunner:
             agent = RalphAgent(client, registry, system_prompt, cfg, validator,
                                system_prompt_provider=provider, codec=codec)
 
+            # Stream a .vibe chat log to a PERSISTENT per-cell dir (outside the temp
+            # sandbox, which is deleted on exit). on_turn fires after every turn, so
+            # even a crashed run keeps the turns it completed.
+            on_turn = None
+            if self._log_root is not None:
+                cell = self._log_root / codec_name / f"{task.number:02d}_{task.id}"
+                logger = RunLogger(cell, datetime.now())
+                on_turn = lambda res: self._save_vibe_log(logger, task, cfg, res)
+
             start = time.perf_counter()
             error: Optional[str] = None
             finished = False
             turns = 0
             try:
-                result = agent.run(task.prompt)
+                result = agent.run(task.prompt, on_turn=on_turn)
                 turns = len(result.turns)
                 finished = result.finished
             except Exception as e:  # e.g. OllamaUnavailable — record, don't crash
@@ -249,6 +284,8 @@ class BenchmarkRunner:
                 return TaskResult(task.id, task.number, False,
                                   f"run error: {error}", turns, elapsed, finished, error)
 
+            if on_turn is not None:   # final write (covers a 0-turn run too)
+                self._save_vibe_log(logger, task, cfg, result)
             self._save_transcript(codec_name, task, result)
             passed, detail = task.run_check(workdir)
             return TaskResult(task.id, task.number, passed, detail,
@@ -268,6 +305,14 @@ class BenchmarkRunner:
         return card
 
     def run(self, codec_names: list[str], tasks: list[Task]) -> list[CodecScorecard]:
+        # Surface where (or whether) per-run .vibe logs are saved. A disabled state
+        # is warned about loudly rather than left silent — the absence of logs must
+        # never be mistaken for "the run produced nothing".
+        if self._log_root is not None:
+            self._log(f"saving per-run .vibe logs under {self._log_root}")
+        else:
+            print("warning: per-run .vibe logging is disabled (--no-save); "
+                  "this run will leave no chat logs.", file=sys.stderr)
         return [self.run_codec(name, tasks) for name in codec_names]
 
 
@@ -339,6 +384,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--transcript-dir", default=None, metavar="DIR",
                    help="save each run's full transcript (+JSON dump) under "
                         "DIR/<codec>/<task>.{txt,json} for later analysis")
+    p.add_argument("--log-dir", default=None, metavar="DIR",
+                   help="root for per-run .vibe chat logs (RunLogger format, like the "
+                        "CLI). Default: ./benchmark_runs/<timestamp>. Each cell writes "
+                        "DIR/<codec>/<NN_taskid>/.vibe/<stamp>.{json,md}")
+    p.add_argument("--no-save", action="store_true",
+                   help="disable per-run .vibe chat logs (they are saved by default)")
     p.add_argument("--list-codecs", action="store_true",
                    help="list available codecs and exit")
     return p
@@ -387,7 +438,8 @@ def main(argv: list[str] | None = None,
 
     config = resolve_config(args)
     runner = BenchmarkRunner(config, client_factory, validator_factory,
-                             transcript_dir=args.transcript_dir)
+                             transcript_dir=args.transcript_dir,
+                             save_logs=not args.no_save, log_dir=args.log_dir)
     cards = runner.run(codec_names, tasks)
 
     print("\n=== comparison ===")
