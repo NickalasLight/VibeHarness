@@ -52,8 +52,31 @@ class Config:
     # well under 32768. If 32768 proves unstable in live runs, drop to 16384 (also
     # an observed-fitting size) — both keep the single-runner invariant.
     num_ctx: int = 32768
-    reason_tokens: int = 2048         # phase 1 (free reasoning, discarded)
-    action_tokens: int = 16384        # phase 2 (constrained JSON action) — can be large
+    # ISSUE #92 (token rebalance): the output reservation
+    # (reason_tokens + action_tokens) is subtracted from num_ctx before anything else
+    # can be fed in (see vibeharness.snapshot_budget.input_budget_tokens). With the
+    # pinned 32768 window, the OLD reservation (2048 + 16384 = 18432, 56% of the
+    # window) left only ~13312 input tokens — so after a heavy ~11k-token page
+    # snapshot, barely ~2k tokens remained for the system prompt + history, and the
+    # snapshot got trimmed in realistic multi-step turns. We rebalance:
+    #
+    #   action_tokens 16384 -> 4096. Phase 2 emits the CONSTRAINED JSON tool call
+    #   (see llm.py::_act). It is capped at max_actions_per_turn (=4) tool calls; even
+    #   four web actions with verbose string args is a few hundred tokens — well under
+    #   1k. 16384 was wildly oversized. 4096 keeps ~10x headroom over the realistic
+    #   worst case while reclaiming 12288 tokens of input budget.
+    #
+    #   reason_tokens 2048 -> 4096. Phase 1 is the model's free <think> chain (llm.py
+    #   ::_reason, stops at </think>). The VibeThinker 3B emits LONG reasoning, so 2048
+    #   risked truncating its thinking mid-chain. We DOUBLE it to 4096 so reasoning is
+    #   not starved, while staying small enough to keep a large positive input budget.
+    #
+    # New reservation = 4096 + 4096 = 8192 (was 18432). With the 1024 safety margin,
+    # input_budget = 32768 - 8192 - 1024 = 23552 tokens (was 13312) — a ~11k-token
+    # snapshot + a realistic ~2-3k-token system prompt + several k of history all fit
+    # without dropping the snapshot. See tests/test_snapshot_budget.py.
+    reason_tokens: int = 4096         # phase 1 (free reasoning, discarded) — see #92
+    action_tokens: int = 4096         # phase 2 (constrained JSON action) — see #92
 
     # observation rendering
     observation_char_limit: int = 12000  # truncate big tool outputs in the narrative
