@@ -31,6 +31,10 @@ class PlaywrightCli:
         self._session = session
         self._timeout = timeout
         self._binary = shutil.which(BINARY)
+        # Handle to the most recent child this wrapper spawned. Retained so that a
+        # later ``close()`` can tree-kill any browser daemon/grandchildren that the
+        # session left alive (issue #15) — not just the direct CLI child.
+        self._last_proc: "subprocess.Popen | None" = None
 
     @property
     def available(self) -> bool:
@@ -69,6 +73,8 @@ class PlaywrightCli:
         # crash the reader thread and return empty output.
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 text=True, encoding="utf-8", errors="replace", **popen_kw)
+        # Remember this child so teardown/close can reap its whole tree (#15).
+        self._last_proc = proc
         try:
             stdout, stderr = proc.communicate(timeout=self._timeout)
         except subprocess.TimeoutExpired:
@@ -118,6 +124,32 @@ class PlaywrightCli:
             proc.kill()
         except Exception:
             pass
+
+    def close(self) -> None:
+        """Tear the session down for good — gracefully if possible, forcibly always.
+
+        Two layers, both best-effort and exception-safe (issue #15):
+
+        1. Ask ``playwright-cli`` to ``close`` the session so the browser shuts down
+           cleanly. This itself goes through bounded ``run`` (kills its own tree on
+           timeout), so a wedged close can never hang teardown.
+        2. Regardless of whether ``close`` succeeded, tree-kill the LAST child this
+           wrapper spawned (the ``open``/``close`` invocation and, on POSIX, its whole
+           process group — the Node daemon + chrome grandchildren). A crashed run may
+           have skipped a clean close, or ``close`` may have orphaned the daemon; this
+           guarantees no ``chrome``/``node`` tree is left leaking.
+
+        Idempotent: calling it again after the tree is already reaped is a harmless
+        no-op. Never raises — teardown must always complete.
+        """
+        try:
+            self.run("close")
+        except Exception:
+            pass
+        proc = self._last_proc
+        if proc is not None:
+            self._kill_tree(proc)
+            self._last_proc = None
 
 
 # action -> (CLI arg builder, required params, past-tense verb)
@@ -270,14 +302,45 @@ class WebToolset(Toolset):
                     f"npm install -g @playwright/cli@latest"]
         return []
 
+    def __init__(self) -> None:
+        # One CLI wrapper for the whole run so the ``open`` child handle survives to
+        # teardown and its tree can be reaped (issue #15). Created lazily in setup().
+        self._cli: PlaywrightCli | None = None
+        self._atexit_hook: Callable[[], None] | None = None
+
     def setup(self, config: Config) -> None:
         # Open the browser once for the run. Headed by default so a human can watch.
+        self._cli = PlaywrightCli(config.web_session, config.web_cli_timeout)
+        # Defensive last-resort reaper: if the run is hard-killed (Ctrl-C escaping the
+        # cli finally, os._exit, an unhandled signal) the toolset's teardown may never
+        # run. Registering close() with atexit ensures the browser tree is still reaped
+        # on interpreter shutdown. teardown() unregisters it once it has run cleanly so
+        # we never double-reap on a normal exit (close() is idempotent regardless).
+        import atexit
+        self._atexit_hook = self._cli.close
+        atexit.register(self._atexit_hook)
         flags: list[str] = []
         if not config.web_headless:
             flags.append("--headed")
         if config.web_browser:
             flags += ["--browser", config.web_browser]
-        PlaywrightCli(config.web_session, config.web_cli_timeout).run("open", *flags)
+        self._cli.run("open", *flags)
 
     def teardown(self, config: Config) -> None:
-        PlaywrightCli(config.web_session, config.web_cli_timeout).run("close")
+        """Close the session AND reap its whole browser process tree. Must never raise
+        (the cli run path swallows teardown errors, but we are defensive here too)."""
+        try:
+            if self._atexit_hook is not None:
+                import atexit
+                atexit.unregister(self._atexit_hook)
+                self._atexit_hook = None
+            cli = self._cli
+            if cli is None:
+                # teardown without a prior setup (e.g. setup failed early): still make
+                # a best-effort close of any session left over by name.
+                cli = PlaywrightCli(config.web_session, config.web_cli_timeout)
+            cli.close()
+        except Exception:
+            pass
+        finally:
+            self._cli = None
