@@ -9,10 +9,24 @@ from __future__ import annotations
 import fnmatch
 import os
 import shutil
+from dataclasses import dataclass
 
 
 class FileSystemError(Exception):
     """Raised for any filesystem operation failure, with a readable message."""
+
+
+# One page of a paged read. Pages are fixed-size windows over the file's text.
+PAGE_SIZE = 10000
+
+
+@dataclass(frozen=True)
+class Page:
+    """A single window of a file's text, plus where it sits in the whole."""
+    text: str
+    page_number: int
+    total_pages: int
+    total_chars: int
 
 
 # Files we won't try to read/search as text.
@@ -55,6 +69,29 @@ class FileSystem:
         if max_chars is not None and len(data) > max_chars:
             return data[:max_chars] + f"\n... [truncated, {len(data)} chars total]"
         return data
+
+    def read_page(self, path: str, page: int = 1) -> Page:
+        """Read one PAGE_SIZE-char window of a file.
+
+        Pages are 1-indexed. An empty file is a single (empty) page so callers
+        always get page 1 of 1. Out-of-range pages raise FileSystemError.
+        """
+        full = self.resolve(path)
+        if not os.path.isfile(full):
+            raise FileSystemError(f"'{path}' does not exist or is not a file")
+        try:
+            with open(full, "r", encoding="utf-8", errors="replace") as f:
+                data = f.read()
+        except OSError as e:
+            raise FileSystemError(f"could not read '{path}': {e}")
+        total_chars = len(data)
+        total_pages = max(1, (total_chars + PAGE_SIZE - 1) // PAGE_SIZE)
+        if page < 1 or page > total_pages:
+            raise FileSystemError(
+                f"page {page} is out of range for '{path}' "
+                f"(it has {total_pages} page(s))")
+        start = (page - 1) * PAGE_SIZE
+        return Page(data[start:start + PAGE_SIZE], page, total_pages, total_chars)
 
     def search(self, query: str, path: str = ".", target: str = "content",
                max_results: int = 50) -> list[str]:
@@ -136,6 +173,27 @@ class FileSystem:
             shutil.move(src_full, self.resolve(dst))
         except OSError as e:
             raise FileSystemError(f"could not move '{src}' to '{dst}': {e}")
+
+    def copy(self, src: str, dst: str) -> None:
+        """Copy a file or directory, preserving content + metadata and the
+        original. Auto-creates the destination's parent dir; refuses if the
+        destination already exists."""
+        src_full = self.resolve(src)
+        dst_full = self.resolve(dst)
+        if not os.path.exists(src_full):
+            raise FileSystemError(f"source '{src}' does not exist")
+        if os.path.exists(dst_full):
+            raise FileSystemError(f"destination '{dst}' already exists")
+        parent = os.path.dirname(dst_full)
+        if parent and not os.path.isdir(parent):
+            os.makedirs(parent, exist_ok=True)
+        try:
+            if os.path.isdir(src_full):
+                shutil.copytree(src_full, dst_full)
+            else:
+                shutil.copy2(src_full, dst_full)
+        except OSError as e:
+            raise FileSystemError(f"could not copy '{src}' to '{dst}': {e}")
 
     @staticmethod
     def _read_or_empty(full: str) -> str:

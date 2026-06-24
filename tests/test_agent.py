@@ -59,7 +59,7 @@ class AgentLoopTest(unittest.TestCase):
 
     def test_sequential_turns_then_validate_passes(self):
         actions = [
-            {"tool": "write_file", "args": {"path": self.p("a.txt"), "content": "hello hello hello"}},
+            {"tool": "create_file", "args": {"path": self.p("a.txt"), "content": "hello hello hello"}},
             {"tool": "read_file", "args": {"path": self.p("a.txt")}},
             VALIDATE,
         ]
@@ -76,7 +76,7 @@ class AgentLoopTest(unittest.TestCase):
 
     def test_multiple_actions_in_one_turn(self):
         actions = [[
-            {"tool": "write_file", "args": {"path": self.p("a.txt"), "content": "batched"}},
+            {"tool": "create_file", "args": {"path": self.p("a.txt"), "content": "batched"}},
             {"tool": "read_file", "args": {"path": self.p("a.txt")}},
             VALIDATE,
         ]]

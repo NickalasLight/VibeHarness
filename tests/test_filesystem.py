@@ -2,7 +2,7 @@ import os
 import tempfile
 import unittest
 
-from vibeharness.filesystem import FileSystem, FileSystemError
+from vibeharness.filesystem import PAGE_SIZE, FileSystem, FileSystemError
 
 
 class FileSystemTest(unittest.TestCase):
@@ -47,6 +47,69 @@ class FileSystemTest(unittest.TestCase):
         out = self.fs.read(self.p("a.txt"), max_chars=10)
         self.assertIn("truncated", out)
         self.assertTrue(out.startswith("x" * 10))
+
+    # ---- paged read ----
+    def test_read_page_small_is_single_page(self):
+        self.fs.write(self.p("a.txt"), "hello")
+        page = self.fs.read_page(self.p("a.txt"))
+        self.assertEqual(page.text, "hello")
+        self.assertEqual(page.page_number, 1)
+        self.assertEqual(page.total_pages, 1)
+        self.assertEqual(page.total_chars, 5)
+
+    def test_read_page_multi_page(self):
+        self.fs.write(self.p("a.txt"), "x" * (PAGE_SIZE * 2 + 5))
+        p1 = self.fs.read_page(self.p("a.txt"), 1)
+        self.assertEqual(len(p1.text), PAGE_SIZE)
+        self.assertEqual(p1.total_pages, 3)
+        self.assertEqual(p1.total_chars, PAGE_SIZE * 2 + 5)
+        p3 = self.fs.read_page(self.p("a.txt"), 3)
+        self.assertEqual(len(p3.text), 5)
+        self.assertEqual(p3.page_number, 3)
+
+    def test_read_page_out_of_range_raises(self):
+        self.fs.write(self.p("a.txt"), "small")
+        with self.assertRaises(FileSystemError):
+            self.fs.read_page(self.p("a.txt"), 2)
+        with self.assertRaises(FileSystemError):
+            self.fs.read_page(self.p("a.txt"), 0)
+
+    def test_read_page_empty_file_is_one_page(self):
+        self.fs.write(self.p("a.txt"), "")
+        page = self.fs.read_page(self.p("a.txt"))
+        self.assertEqual(page.total_pages, 1)
+        self.assertEqual(page.text, "")
+
+    # ---- copy ----
+    def test_copy_file_preserves_bytes_over_cap(self):
+        big = "z" * (PAGE_SIZE * 3)  # larger than any observation cap
+        self.fs.write(self.p("src.txt"), big)
+        self.fs.copy(self.p("src.txt"), self.p("dst.txt"))
+        self.assertEqual(self.fs.read(self.p("src.txt")), big)   # original preserved
+        self.assertEqual(self.fs.read(self.p("dst.txt")), big)   # full bytes copied
+
+    def test_copy_directory(self):
+        self.fs.write(self.p("d", "a.txt"), "one")
+        self.fs.write(self.p("d", "sub", "b.txt"), "two")
+        self.fs.copy(self.p("d"), self.p("d2"))
+        self.assertEqual(self.fs.read(self.p("d2", "a.txt")), "one")
+        self.assertEqual(self.fs.read(self.p("d2", "sub", "b.txt")), "two")
+        self.assertTrue(os.path.isdir(self.p("d")))  # original preserved
+
+    def test_copy_auto_creates_dest_parent(self):
+        self.fs.write(self.p("src.txt"), "x")
+        self.fs.copy(self.p("src.txt"), self.p("new", "deep", "dst.txt"))
+        self.assertEqual(self.fs.read(self.p("new", "deep", "dst.txt")), "x")
+
+    def test_copy_missing_source_raises(self):
+        with self.assertRaises(FileSystemError):
+            self.fs.copy(self.p("nope.txt"), self.p("dst.txt"))
+
+    def test_copy_dest_exists_raises(self):
+        self.fs.write(self.p("src.txt"), "x")
+        self.fs.write(self.p("dst.txt"), "y")
+        with self.assertRaises(FileSystemError):
+            self.fs.copy(self.p("src.txt"), self.p("dst.txt"))
 
     # ---- listing ----
     def test_list_dir_marks_directories(self):
