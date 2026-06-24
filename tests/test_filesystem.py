@@ -197,6 +197,34 @@ class FileSystemTest(unittest.TestCase):
         with self.assertRaises(FileSystemError):
             self.fs.tree(self.p("nope"))
 
+    def test_tree_excludes_hidden_files_and_dirs(self):
+        # Normal entries that MUST survive.
+        self.fs.write(self.p("visible.txt"), "x")
+        self.fs.make_directory(self.p("src"))
+        self.fs.write(self.p("src", "mod.py"), "y")
+        # Hidden harness/tooling artifacts that MUST be pruned.
+        self.fs.make_directory(self.p(".vibe"))
+        self.fs.write(self.p(".vibe", "turn1.json"), "{}")
+        self.fs.make_directory(self.p(".playwright-cli"))
+        self.fs.make_directory(self.p(".git"))
+        self.fs.write(self.p(".env"), "SECRET=1")        # hidden dotfile
+        # Nested hidden dir under a visible dir is pruned recursively too.
+        self.fs.make_directory(self.p("src", ".foo"))
+        self.fs.write(self.p("src", ".foo", "cache.bin"), "z")
+        out = self.fs.tree(self.dir)
+        # Visible content present.
+        self.assertIn("visible.txt", out)
+        self.assertIn("src/", out)
+        self.assertIn("mod.py", out)
+        # Hidden content absent.
+        self.assertNotIn(".vibe", out)
+        self.assertNotIn("turn1.json", out)
+        self.assertNotIn(".playwright-cli", out)
+        self.assertNotIn(".git", out)
+        self.assertNotIn(".env", out)
+        self.assertNotIn(".foo", out)
+        self.assertNotIn("cache.bin", out)
+
 
 if __name__ == "__main__":
     unittest.main()
