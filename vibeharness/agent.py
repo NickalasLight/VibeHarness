@@ -16,10 +16,18 @@ from __future__ import annotations
 import inspect
 import itertools
 import json
+import re
 import threading
 from dataclasses import asdict, dataclass, field
 
 from typing import Callable
+
+# Matches the first JSON/Hermes tool-call block in a model response so we can
+# extract the free-text preamble the model emitted before it.
+_TOOL_BLOCK_RE = re.compile(
+    r"<tool_call>|```(?:json)?",
+    re.DOTALL,
+)
 
 from .codec import ToolCallCodec, get_codec
 from .config import Config
@@ -197,6 +205,18 @@ class RalphAgent:
 
                 turn = Turn(index=i, reasoning=decision.reasoning, raw_action=decision.action_json)
                 result.turns.append(turn)
+
+                # For single-phase models (two_phase=False, e.g. Qwen) the reasoning
+                # field is always "". The model's preamble — whatever it wrote before
+                # the <tool_call> block — lives in raw_action instead. Record it into
+                # the narrative so the model can reference its own prior thinking on
+                # the next turn (helps catch "I already did X" confusions).
+                if not decision.reasoning:
+                    m = _TOOL_BLOCK_RE.search(decision.action_json or "")
+                    preamble = (decision.action_json[:m.start()].strip() if m
+                                else "").strip()
+                    if preamble:
+                        memory.record(f"you reasoned: {preamble[:400]}")
 
                 actions, error = self._codec.parse(decision.action_json)
                 if error is not None:

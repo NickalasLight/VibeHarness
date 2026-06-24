@@ -41,13 +41,48 @@ def _build_user(task: str, history: str) -> str:
     )
 
 
+_TOOL_CALL_RE = re.compile(
+    r"<tool_call>.*?</tool_call>|```json.*?```|```.*?```|\{[^{}]*\"name\"[^{}]*\}",
+    re.DOTALL,
+)
+
+
+def _extract_preamble(raw_action: str) -> str:
+    """Return the free-text preamble Qwen emitted before its tool call, if any.
+
+    Qwen's single-phase output is: [optional preamble text] <tool_call>...</tool_call>.
+    The preamble is whatever came before the first JSON/Hermes block — it is the model's
+    reasoning in plain English and is valuable context for the advisor.  Returns "" if
+    the output is pure tool-call with no preamble, or if raw_action is empty.
+    """
+    if not raw_action:
+        return ""
+    m = _TOOL_CALL_RE.search(raw_action)
+    if m:
+        preamble = raw_action[:m.start()].strip()
+    else:
+        preamble = raw_action.strip()
+    return preamble[:300] if preamble else ""
+
+
 def format_turns_for_advisor(turns: list, n: int) -> str:
-    """Render the last ``n`` turns as readable action history for the advisor prompt."""
+    """Render the last ``n`` turns as readable action history for the advisor prompt.
+
+    Includes each turn's:
+    - Qwen's preamble reasoning (text it emitted before the tool call, if any)
+    - The parsed action (tool name + args)
+    - The observation (what the tool returned)
+    This gives VibeThinker full visibility into what Qwen was "thinking" before each action.
+    """
     import json
     recent = turns[-n:] if len(turns) >= n else turns
     lines = []
     for turn in recent:
         lines.append(f"Turn {turn.index}:")
+        # Include Qwen's preamble reasoning if present (two_phase=False path).
+        preamble = _extract_preamble(getattr(turn, "raw_action", "") or "")
+        if preamble:
+            lines.append(f"  [reasoning] {preamble}")
         for a in turn.actions:
             status = "OK" if a.ok else "FAIL"
             tool = a.tool or "(none)"
@@ -67,19 +102,24 @@ class VibeThinkerAdvisor:
     """
 
     def __init__(self, config: Config) -> None:
+        # num_ctx=4096: the advisor only sees ~5 turns of history (~1-2k tokens).
+        # Cutting from 32768 → 4096 saves ~1.2 GB of KV-cache VRAM on the advisor model,
+        # allowing it to co-exist with Q8_0 Qwen via OLLAMA_MAX_LOADED_MODELS=1 (swap).
         advisor_cfg = replace(
             config,
             model=config.advisor_model,
             temperature=config.advisor_temperature,
             action_temperature=config.advisor_temperature,
-            reason_tokens=2048,   # advisor reasoning cap — shorter than the main agent
-            action_tokens=1024,   # advice text cap
+            reason_tokens=1024,   # advisor reasoning cap (shorter CoT — advice is simple)
+            action_tokens=512,    # advice text cap
             two_phase=True,       # VibeThinker must reason before answering
+            num_ctx=4096,         # small ctx: saves ~1.2 GB VRAM vs 32768
         )
         self._client = OllamaClient(advisor_cfg)
         self._interval = config.advisor_interval
         print(f"[advisor] VibeThinkerAdvisor active — model={config.advisor_model} "
-              f"temp={config.advisor_temperature} every={config.advisor_interval} turns",
+              f"temp={config.advisor_temperature} every={config.advisor_interval} turns "
+              f"ctx=4096",
               flush=True)
 
     def advise(self, task: str, turns: list) -> str:

@@ -476,10 +476,13 @@ def _run_locked(args, task, config, registry, codec, names, workdir, logger,
     reporter.run_start(task, str(workdir), config)
     print(f" toolsets: {', '.join(names)} (+ validate)")
 
-    # Advisor: allow two models in VRAM simultaneously BEFORE constructing OllamaClient
-    # (ensure_single_runner_env uses setdefault so this must come first).
+    # Advisor: use model-swap mode (OLLAMA_MAX_LOADED_MODELS=1) so Qwen and VibeThinker
+    # take turns in VRAM rather than co-existing. With Q8_0 both models at 3.3 GB each
+    # plus KV caches would exceed 8 GB; swapping costs ~15-30s per advisor call but
+    # both models get the full card. ensure_single_runner_env uses setdefault so we
+    # must set this BEFORE OllamaClient is constructed.
     if config.advisor_enabled:
-        os.environ["OLLAMA_MAX_LOADED_MODELS"] = "2"
+        os.environ["OLLAMA_MAX_LOADED_MODELS"] = "1"
         advisor = VibeThinkerAdvisor(config)
     else:
         advisor = None
