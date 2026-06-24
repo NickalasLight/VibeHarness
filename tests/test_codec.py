@@ -31,6 +31,9 @@ class JSONCodecTest(unittest.TestCase):
     def test_format_instructions_omit_cap_when_unbounded(self):
         self.assertNotIn("at most", self.codec.format_instructions(0))
 
+    def test_turn_action_hint_mentions_json(self):
+        self.assertIn("JSON array", self.codec.turn_action_hint())
+
     def test_constraint_is_a_json_schema_with_maxitems(self):
         c = self.codec.constraint(self.registry, 2)
         self.assertIsInstance(c, DecodeConstraint)

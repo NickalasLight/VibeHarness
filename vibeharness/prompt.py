@@ -73,7 +73,8 @@ class SystemPromptBuilder:
         return header + body if header else body
 
 
-def build_turn_prompt(task: str, narrative: str) -> str:
+def build_turn_prompt(task: str, narrative: str,
+                      action_hint: str = "Respond with a JSON array of one or more actions.") -> str:
     """The per-turn user message.
 
     The task is anchored in the two high-attention zones only: the FRONT (the system
@@ -82,12 +83,14 @@ def build_turn_prompt(task: str, narrative: str) -> str:
     end of the context and weakest to the middle ("lost in the middle"), so these two
     placements pin the task without the bloat of a third copy in the low-attention
     middle. The growing history sits in the middle, where it is reference, not the goal.
+
+    ``action_hint`` is the active codec's end-of-turn format reminder, so the recency
+    nudge always matches the wire format the model is being asked to produce.
     """
     return (
         f"# What you have done so far\n{narrative}\n\n"
         f"# Reminder — your exact task (verbatim) is:\n{task}\n\n"
         f"# Your next action\n"
         f"Choose the next action (or several, as a batch) to make progress on the task "
-        f"above, ending with `validate` once you believe it is complete. Respond with a "
-        f"JSON array of one or more actions."
+        f"above, ending with `validate` once you believe it is complete. {action_hint}"
     )

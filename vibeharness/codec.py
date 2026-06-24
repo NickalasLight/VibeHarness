@@ -54,6 +54,12 @@ class ToolCallCodec(ABC):
         model exactly how to emit one or more tool calls in this wire format. A
         ``max_actions`` of 0 (or less) means no per-turn cap."""
 
+    def turn_action_hint(self) -> str:
+        """A brief, format-specific reminder placed at the very end of each turn
+        prompt (the recency zone) of how to shape the response. Overridden per
+        codec so the end-of-turn nudge matches this codec's wire format."""
+        return "Respond in the exact format described above."
+
     @abstractmethod
     def constraint(self, registry: "ToolRegistry", max_actions: int) -> DecodeConstraint:
         """The decode-time constraint for the action phase (may be unconstrained)."""

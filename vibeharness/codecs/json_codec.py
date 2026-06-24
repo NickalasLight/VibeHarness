@@ -28,6 +28,9 @@ class JSONCodec(ToolCallCodec):
             + cap
         )
 
+    def turn_action_hint(self) -> str:
+        return "Respond with a JSON array of one or more actions."
+
     def constraint(self, registry: ToolRegistry, max_actions: int) -> DecodeConstraint:
         limit = max_actions if max_actions and max_actions > 0 else None
         return DecodeConstraint(json_schema=registry.action_schema(max_items=limit))

@@ -112,7 +112,7 @@ class RalphAgent:
         for i in turns:
             self._reporter.turn_start(i)
             system = self._system_provider() if self._system_provider else self._system
-            user = build_turn_prompt(task, memory.render())
+            user = build_turn_prompt(task, memory.render(), self._codec.turn_action_hint())
             decision = self._client.decide(
                 system, user, constraint,
                 on_reason=self._reporter.reasoning_token,
