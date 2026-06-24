@@ -54,6 +54,22 @@ class CapturePageSnapshotTest(unittest.TestCase):
         self.assertIn("truncated", text)
         self.assertLess(len(text), 5000)
 
+    def test_truncates_at_configured_cap(self):
+        # capture_page_snapshot truncates at exactly the cap it is given: the kept
+        # body is char_limit chars, plus the appended "+N chars truncated" marker.
+        cli = _FakeSnapshotCli(["q" * 50000])
+        text = capture_page_snapshot(cli, char_limit=40000)
+        self.assertTrue(text.startswith("q" * 40000))
+        self.assertIn("truncated", text)
+        self.assertIn("10000 chars truncated", text)
+
+    def test_under_new_default_cap_not_truncated(self):
+        # A page at/under the new 40000-char default is returned whole.
+        cli = _FakeSnapshotCli(["a" * 40000])
+        text = capture_page_snapshot(cli, char_limit=Config().web_snapshot_char_limit)
+        self.assertEqual(text, "a" * 40000)
+        self.assertNotIn("truncated", text)
+
     def test_failed_snapshot_returns_empty(self):
         cli = _FakeSnapshotCli(["boom"], ok=False)
         self.assertEqual(capture_page_snapshot(cli, char_limit=1000), "")
@@ -119,6 +135,21 @@ class PerTurnSnapshotInjectionTest(unittest.TestCase):
             "T", page=capture_page_snapshot(cli, char_limit=200))
         self.assertIn("# Current page (live snapshot)", sp)
         self.assertIn("truncated", sp)
+
+
+class SnapshotCapDefaultTest(unittest.TestCase):
+    def test_default_cap_is_40000(self):
+        # Issue #29: raised 6000 -> 40000 (~10k tokens) per the #28 size analysis,
+        # so the auto-injected snapshot no longer truncates before late-DOM consent
+        # banners on common pages.
+        self.assertEqual(Config().web_snapshot_char_limit, 40000)
+
+    def test_provider_uses_config_default_cap(self):
+        # make_snapshot_provider must bind the (new) config default, so a snapshot
+        # up to 40000 chars passes through untruncated.
+        cli = _FakeSnapshotCli(["b" * 40000])
+        provider = lambda: capture_page_snapshot(cli, Config().web_snapshot_char_limit)
+        self.assertEqual(provider(), "b" * 40000)
 
 
 class SnapshotProviderFactoryTest(unittest.TestCase):
