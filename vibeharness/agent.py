@@ -133,7 +133,12 @@ class RalphAgent:
     def _validate(self, task: str, args: dict, turn: Turn, memory: NarrativeMemory,
                   result: RunResult) -> None:
         self._reporter.note("validating — checking the task against a validator…")
-        verdict = self._validator.validate(task, memory.render(), args.get("summary", ""))
+        self._reporter.validator_start()
+        verdict = self._validator.validate(
+            task, memory.render(), args.get("summary", ""),
+            on_reason=self._reporter.validator_reasoning_token,
+            on_action=self._reporter.validator_verdict_token,
+        )
         result.validations.append({"turn": turn.index, "passed": verdict.passed,
                                    "reason": verdict.reason, "reasoning": verdict.reasoning})
         if verdict.passed:

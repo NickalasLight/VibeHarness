@@ -32,6 +32,17 @@ class Reporter(ABC):
     @abstractmethod
     def run_end(self, result: "RunResult") -> None: ...
 
+    # ---- validator subagent stream ----
+    # The main agent hands control to a separate validator subagent. These hooks
+    # let a reporter render that subagent's live generation distinctly from the
+    # main agent's turn.
+    @abstractmethod
+    def validator_start(self) -> None: ...
+    @abstractmethod
+    def validator_reasoning_token(self, text: str) -> None: ...
+    @abstractmethod
+    def validator_verdict_token(self, text: str) -> None: ...
+
 
 class NullReporter(Reporter):
     def run_start(self, task, workdir, config): pass
@@ -41,11 +52,15 @@ class NullReporter(Reporter):
     def action_result(self, action): pass
     def note(self, text): pass
     def run_end(self, result): pass
+    def validator_start(self): pass
+    def validator_reasoning_token(self, text): pass
+    def validator_verdict_token(self, text): pass
 
 
 # ANSI styling (enabled on Windows 10+ consoles).
 _C = {"reset": "\033[0m", "dim": "\033[2m", "bold": "\033[1m",
-      "green": "\033[32m", "red": "\033[31m", "cyan": "\033[36m", "yellow": "\033[33m"}
+      "green": "\033[32m", "red": "\033[31m", "cyan": "\033[36m", "yellow": "\033[33m",
+      "magenta": "\033[35m"}
 
 
 def _enable_ansi() -> None:
@@ -63,6 +78,8 @@ class ConsoleReporter(Reporter):
             _enable_ansi()
         self._reason_open = False
         self._action_open = False
+        self._val_reason_open = False
+        self._val_verdict_open = False
 
     def _c(self, code: str, text: str) -> str:
         return f"{_C[code]}{text}{_C['reset']}" if self._color else text
@@ -94,6 +111,23 @@ class ConsoleReporter(Reporter):
 
     def note(self, text: str) -> None:
         self._w(self._c("dim", f"│ {text}\n"))
+
+    # ---- validator subagent stream (rendered in magenta, clearly labeled) ----
+    def validator_start(self) -> None:
+        self._val_reason_open = self._val_verdict_open = False
+        self._w(self._c("magenta", "\n│ ╭─ validator subagent ─────\n"))
+
+    def validator_reasoning_token(self, text: str) -> None:
+        if not self._val_reason_open:
+            self._w(self._c("magenta", "│ ╎ thinking: "))
+            self._val_reason_open = True
+        self._w(self._c("magenta", text))
+
+    def validator_verdict_token(self, text: str) -> None:
+        if not self._val_verdict_open:
+            self._w(self._c("magenta", "\n│ ╎ verdict: "))
+            self._val_verdict_open = True
+        self._w(self._c("magenta", text))
 
     def action_result(self, action) -> None:
         color = "green" if action.ok else "red"

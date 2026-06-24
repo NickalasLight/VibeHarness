@@ -15,7 +15,7 @@ import json
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
-from .llm import LLMClient
+from .llm import LLMClient, TokenSink
 from .tools import Param, Tool, ToolResult
 
 VALIDATOR_SYSTEM = """\
@@ -68,7 +68,9 @@ def build_validator_prompt(task: str, history: str, claim: str) -> str:
 
 class Validator(ABC):
     @abstractmethod
-    def validate(self, task: str, history: str, claim: str) -> Verdict:
+    def validate(self, task: str, history: str, claim: str,
+                 on_reason: "TokenSink | None" = None,
+                 on_action: "TokenSink | None" = None) -> Verdict:
         ...
 
 
@@ -78,9 +80,12 @@ class LLMValidator(Validator):
     def __init__(self, client: LLMClient):
         self._client = client
 
-    def validate(self, task: str, history: str, claim: str) -> Verdict:
+    def validate(self, task: str, history: str, claim: str,
+                 on_reason: "TokenSink | None" = None,
+                 on_action: "TokenSink | None" = None) -> Verdict:
         user = build_validator_prompt(task, history, claim)
-        decision = self._client.decide(VALIDATOR_SYSTEM, user, VERDICT_SCHEMA)
+        decision = self._client.decide(VALIDATOR_SYSTEM, user, VERDICT_SCHEMA,
+                                       on_reason=on_reason, on_action=on_action)
         try:
             data = json.loads(decision.action_json)
         except json.JSONDecodeError:
