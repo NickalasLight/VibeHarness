@@ -148,6 +148,37 @@ class ToolsTest(unittest.TestCase):
         self.assertTrue(res.ok)
         self.assertEqual(self.fs.read(self.p("a.txt")), "AB")
 
+    def test_prepend_without_read_ok(self):
+        # prepend, like append, adds content without discarding the rest, so it
+        # bypasses the read-before-overwrite guard even on an unread file.
+        self._create(self.p("a.txt"), "A")
+        res = self._writer().run({"path": self.p("a.txt"), "content": "B", "mode": "prepend"})
+        self.assertTrue(res.ok)
+        self.assertEqual(self.fs.read(self.p("a.txt")), "BA")
+
+    def test_write_prepend_observation_verb(self):
+        self._create(self.p("a.txt"), "a")
+        res = self._writer().run({"path": self.p("a.txt"), "content": "b", "mode": "prepend"})
+        self.assertIn("prepended to", res.observation)
+
+    def test_manage_copy_existing_destination_errors(self):
+        mp = ManagePathTool(self.fs)
+        self._create(self.p("a.txt"), "data")
+        self._create(self.p("b.txt"), "other")
+        res = mp.run({"action": "copy", "path": self.p("a.txt"),
+                      "destination": self.p("b.txt")})
+        self.assertFalse(res.ok)
+        self.assertIn("error", res.observation)
+        # the original destination is untouched
+        self.assertEqual(self.fs.read(self.p("b.txt")), "other")
+
+    def test_read_tracker_marks_and_reports(self):
+        tracker = ReadTracker()
+        self.assertFalse(tracker.has_read(self.p("a.txt")))
+        tracker.mark(self.p("a.txt"))
+        self.assertTrue(tracker.has_read(self.p("a.txt")))
+        self.assertFalse(tracker.has_read(self.p("b.txt")))
+
     def test_default_toolset_names(self):
         names = {t.name for t in build_default_tools(self.fs, 1000)}
         self.assertEqual(names, {"list_directory", "read_file", "create_file",

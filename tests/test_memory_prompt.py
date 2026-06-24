@@ -70,6 +70,11 @@ class PromptTest(unittest.TestCase):
         sp = SystemPromptBuilder(self.registry).build("DO THE THING")
         self.assertNotIn("# Workspace", sp)
 
+    def test_system_prompt_renders_action_cap(self):
+        # The per-turn action cap is plumbed from the builder into the template.
+        sp = SystemPromptBuilder(self.registry, max_actions_per_turn=3).build()
+        self.assertIn("at most 3 actions", sp)
+
     def test_turn_prompt_reminds_task_at_the_end(self):
         prompt = build_turn_prompt("make a file", "First, you did a thing")
         self.assertIn("make a file", prompt)
