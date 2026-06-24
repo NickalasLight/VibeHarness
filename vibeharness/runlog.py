@@ -42,6 +42,48 @@ class RunLogger:
     def json_path(self) -> Path:
         return self.dir / f"{self.stamp}.json"
 
+    @property
+    def diagnostics_dir(self) -> Path:
+        """Per-turn diagnostic dumps live in a subfolder of this run's ``.vibe/`` so
+        they sit alongside the run log without cluttering the top level (issue #37)."""
+        return self.dir / f"{self.stamp}-diagnostics"
+
+    def dump_turn_diagnostics(self, turn: int, *, snapshot: str | None = None,
+                              system_prompt: str | None = None) -> None:
+        """Write per-turn diagnostic dumps into ``<stamp>-diagnostics/`` (issue #37).
+
+        Two optional dumps, each only written when its text is supplied:
+          - ``turn-<NNN>-snapshot-<ts>.txt`` — the COMPLETE, untruncated page
+            snapshot (ground truth on its true size), prefixed with its char length.
+          - ``turn-<NNN>-system-prompt-<ts>.txt`` — the EXACT system prompt string
+            injected into the model that turn.
+
+        Best-effort and exception-safe: a failure here must NEVER abort the agent
+        loop, so every step is guarded and errors are swallowed. Files are stamped
+        with the turn number (zero-padded) plus a sub-second timestamp so repeated
+        turns never collide and ordering is obvious.
+        """
+        try:
+            self.diagnostics_dir.mkdir(parents=True, exist_ok=True)
+            _hide(self.dir)
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            tag = f"turn-{turn:03d}"
+            if snapshot is not None:
+                body = (f"# turn {turn} raw page snapshot (untruncated)\n"
+                        f"# char length: {len(snapshot)}\n"
+                        f"# captured at: {ts}\n\n{snapshot}")
+                (self.diagnostics_dir / f"{tag}-snapshot-{ts}.txt").write_text(
+                    body, encoding="utf-8", errors="backslashreplace")
+            if system_prompt is not None:
+                body = (f"# turn {turn} injected system prompt\n"
+                        f"# char length: {len(system_prompt)}\n"
+                        f"# captured at: {ts}\n\n{system_prompt}")
+                (self.diagnostics_dir / f"{tag}-system-prompt-{ts}.txt").write_text(
+                    body, encoding="utf-8", errors="backslashreplace")
+        except Exception:
+            # Diagnostics are a best-effort aid; never let a dump failure break the run.
+            pass
+
     def write(self, task: str, config: Config, result: RunResult) -> Path:
         """Write/overwrite the log for the current state. Safe to call each turn."""
         self.dir.mkdir(parents=True, exist_ok=True)

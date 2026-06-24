@@ -9,6 +9,7 @@ Run ``vibe --help`` to see every command and parameter.
 from __future__ import annotations
 
 import argparse
+import itertools
 import os
 import sys
 from dataclasses import replace
@@ -27,7 +28,7 @@ from .runlog import RunLogger
 from .settings import Settings, settable_keys
 from .toolset import ToolsetCatalog, agent_default_toolsets, default_catalog
 from .validation import LLMValidator
-from .web import make_snapshot_provider
+from .web import make_raw_snapshot_provider, make_snapshot_provider
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -305,8 +306,29 @@ def _run_locked(args, task, config, registry, codec, names, workdir, logger,
     def render_page() -> str:
         return snapshot_provider() if snapshot_provider else ""
 
-    system_prompt_provider = lambda: builder.build(
-        task, workspace=render_workspace(), page=render_page())
+    # Diagnostic capture of the RAW, untruncated snapshot for ground-truth sizing
+    # (issue #37). Kept entirely separate from the truncating render_page above so
+    # the per-turn injection path is untouched; this captures the same session's
+    # snapshot with no char cap. None when web is inactive (no snapshot to dump).
+    raw_snapshot_provider = (
+        make_raw_snapshot_provider(config) if "web" in names else None)
+
+    # Per-turn diagnostic logging (issue #37): each turn, dump the COMPLETE raw page
+    # snapshot (+ its length) and the EXACT system prompt injected into the model into
+    # the run's .vibe diagnostics folder. The provider is the single per-turn seam, so
+    # wrapping it captures exactly what the model saw. A counter advances each call;
+    # all logging is guarded so a dump failure can never break the turn.
+    turn_counter = itertools.count(1)
+
+    def system_prompt_provider() -> str:
+        prompt = builder.build(task, workspace=render_workspace(), page=render_page())
+        try:
+            turn = next(turn_counter)
+            raw_snapshot = raw_snapshot_provider() if raw_snapshot_provider else None
+            logger.dump_turn_diagnostics(turn, snapshot=raw_snapshot, system_prompt=prompt)
+        except Exception:
+            pass   # diagnostics must never abort the turn
+        return prompt
     agent = RalphAgent(client, registry, system_prompt, config, validator,
                        reporter=reporter, system_prompt_provider=system_prompt_provider,
                        codec=codec)

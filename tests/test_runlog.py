@@ -81,5 +81,59 @@ class RunLoggerTest(unittest.TestCase):
         self.assertFalse(data["finished"])
 
 
+class TurnDiagnosticsTest(unittest.TestCase):
+    """Per-turn diagnostic dumps (issue #37): the raw untruncated snapshot and the
+    exact injected system prompt are written into <stamp>-diagnostics/."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.workspace = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_snapshot_dump_has_turn_number_full_text_and_length(self):
+        logger = RunLogger(self.workspace, STAMP)
+        snap = "live page text " * 100   # well over any inline cap
+        logger.dump_turn_diagnostics(3, snapshot=snap, system_prompt=None)
+        files = list(logger.diagnostics_dir.glob("turn-003-snapshot-*.txt"))
+        self.assertEqual(len(files), 1, "exactly one turn-3 snapshot dump expected")
+        text = files[0].read_text(encoding="utf-8")
+        self.assertIn(f"char length: {len(snap)}", text)   # records true size
+        self.assertIn(snap, text)                            # full, untruncated text
+
+    def test_system_prompt_dump_contains_the_injected_prompt(self):
+        logger = RunLogger(self.workspace, STAMP)
+        prompt = "# YOUR ASSIGNED TASK\ndo a thing\n\n# Working with your tools\n..."
+        logger.dump_turn_diagnostics(7, snapshot=None, system_prompt=prompt)
+        files = list(logger.diagnostics_dir.glob("turn-007-system-prompt-*.txt"))
+        self.assertEqual(len(files), 1)
+        self.assertIn(prompt, files[0].read_text(encoding="utf-8"))
+
+    def test_omitted_dumps_are_not_written(self):
+        # When web is inactive, snapshot is None and only the prompt dump appears.
+        logger = RunLogger(self.workspace, STAMP)
+        logger.dump_turn_diagnostics(1, snapshot=None, system_prompt="prompt text")
+        self.assertEqual(list(logger.diagnostics_dir.glob("*-snapshot-*.txt")), [])
+        self.assertEqual(len(list(logger.diagnostics_dir.glob("*-system-prompt-*.txt"))), 1)
+
+    def test_dump_failure_is_swallowed(self):
+        # A throwing dump (here: an unwritable diagnostics dir) must NOT raise — the
+        # agent loop calls this per turn and a logging failure can't be allowed to break it.
+        logger = RunLogger(self.workspace, STAMP)
+        # Force mkdir to explode by pointing diagnostics_dir at something unusable.
+        broken = Path(self.tmp.name) / "afile"
+        broken.write_text("x", encoding="utf-8")   # a FILE where a dir is expected
+        logger.dir = broken                         # mkdir(parents=True) under a file fails
+        logger.dump_turn_diagnostics(1, snapshot="s", system_prompt="p")  # must not raise
+
+    def test_unicode_snapshot_does_not_crash_the_dump(self):
+        logger = RunLogger(self.workspace, STAMP)
+        nasty = "snap \udce9 \U0001f600 café"   # lone surrogate + astral + accent
+        logger.dump_turn_diagnostics(2, snapshot=nasty, system_prompt=nasty)
+        self.assertTrue(list(logger.diagnostics_dir.glob("turn-002-snapshot-*.txt")))
+        self.assertTrue(list(logger.diagnostics_dir.glob("turn-002-system-prompt-*.txt")))
+
+
 if __name__ == "__main__":
     unittest.main()

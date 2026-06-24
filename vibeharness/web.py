@@ -263,6 +263,35 @@ def capture_page_snapshot(cli: PlaywrightCli, char_limit: int) -> str:
     return text[:char_limit] + f"\n…[+{len(text) - char_limit} chars truncated]"
 
 
+def capture_page_snapshot_raw(cli: PlaywrightCli) -> str:
+    """Capture the COMPLETE, UNTRUNCATED `snapshot` of the live page (issue #37).
+
+    Identical to :func:`capture_page_snapshot` but applies NO char cap, so callers
+    get ground truth on the snapshot's true size for diagnostic logging. Kept
+    deliberately separate from the truncating capture so the per-turn injection
+    path (#24/#43) is untouched. On any failure returns "" so a diagnostic dump
+    simply records nothing rather than crashing the run.
+    """
+    try:
+        ok, output = cli.run("snapshot")
+    except Exception:
+        return ""
+    if not ok:
+        return ""
+    return (output or "").strip()
+
+
+def make_raw_snapshot_provider(config: Config) -> Callable[[], str]:
+    """Build a per-turn provider of the RAW, untruncated page snapshot (issue #37).
+
+    Mirrors :func:`make_snapshot_provider` but returns the full snapshot with no
+    char cap, for diagnostic ground-truth sizing. Uses the run's existing session
+    (same name/timeout from ``config``) so it reflects the page the model acts on.
+    """
+    cli = PlaywrightCli(config.web_session, config.web_cli_timeout)
+    return lambda: capture_page_snapshot_raw(cli)
+
+
 def make_snapshot_provider(config: Config) -> Callable[[], str]:
     """Build a per-turn page-snapshot provider bound to the run's web session.
 
