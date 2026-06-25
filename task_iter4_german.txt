@@ -42,7 +42,7 @@ The wizard may include pages covering some or all of these topics — adapt to w
 
 - **Personal data**: name, email, phone, address fields
 - **Documents / uploads**: CV, cover letter, or other file uploads
-  - FILE UPLOAD SEQUENCE: (1) click the upload trigger button to open the file chooser, THEN (2) call the upload tool with the absolute file path. Never call upload without the file chooser being open first.
+  - FILE UPLOADS: Call `upload` with the trigger ref AND the absolute file path in one step — the tool handles the click internally. Example: `upload(target="e163", file="C:\\path\\to\\file.docx")`. Do NOT click the trigger separately first.
 - **Message / cover message**: a free-text message or motivation field
 - **Source / referral**: how did you hear about the position (use "Sonstiges")
 - **Confirmation / review**: final review before submission

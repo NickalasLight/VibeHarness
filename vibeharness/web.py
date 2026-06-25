@@ -1875,48 +1875,81 @@ class DragTool(_WebTool):
 class UploadTool(_WebTool):
     name = "upload"
     description = (
-        "Upload a file to a file input. "
-        "TWO-STEP SEQUENCE REQUIRED: "
-        "(1) First CLICK the file-upload trigger element (a button or file input ref) in the "
-        "snapshot — this opens the OS file-picker dialog ('modal state'). "
-        "(2) Then immediately call `upload` with the ABSOLUTE file path. "
-        "Calling upload before clicking the trigger fails with a 'modal state' error. "
+        "Upload a file to a file-upload field in one step. "
+        "Provide the `target` ref of the upload trigger (button or file-input shown in the snapshot) "
+        "and the absolute `file` path. The tool clicks the trigger and uploads the file automatically "
+        "— do NOT click the trigger separately first. "
         "Always pass the path EXACTLY as given in the task (absolute, e.g. "
         "C:\\\\path\\\\to\\\\file.docx) — never shorten it to a relative path."
     )
-    _verb = "uploaded a file to"
-    _required = ("file",)
+    _verb = "uploaded a file via"
+    _required = ("target", "file")
+    _validate_target = True
 
     def _subject(self, args):
-        return "the file input"
+        return args.get("target", "the file input")
 
     @property
     def parameters(self):
-        return [Param("file", "string",
-                      "Absolute path of the file to upload. Must be an absolute path "
-                      "(e.g. C:\\\\Users\\\\...\\\\file.docx), exactly as provided in the task. "
-                      "Never use a relative path.")]
+        return [
+            Param("target", "string",
+                  "Ref of the upload trigger element (button or file-input) from the current page "
+                  "snapshot, e.g. 'e163'. Must be a ref from the snapshot — never a CSS selector."),
+            Param("file", "string",
+                  "Absolute path of the file to upload, e.g. C:\\\\Users\\\\...\\\\file.docx. "
+                  "Never use a relative path."),
+        ]
 
-    def _build(self, args):
+    def _build(self, args):  # pragma: no cover — run() overrides the dispatch
         return ["upload", args["file"]]
 
     def run(self, args: dict) -> ToolResult:
-        result = super().run(args)
-        # The Playwright-CLI upload tool is named 'browser_file_upload' internally.
-        # When the OS file-picker is not open it exits 0 with "modal state" in the
-        # output — which _run_impl now correctly marks ok=False via _NO_MATCH_MARKERS
-        # (issue #144). Clean up the error text so the agent sees 'upload' (the tool
-        # it called) instead of the internal 'browser_file_upload' name.
-        if not result.ok:
-            msg = (result.observation or "").replace("browser_file_upload", "upload")
-            if "modal state" in msg.lower():
-                msg = (
-                    "upload failed: the OS file-picker is not open (no 'modal state'). "
-                    "You must FIRST click the file-upload trigger button/input ref in the "
-                    "snapshot to open the picker, THEN call upload with the absolute path."
+        # Validate required params.
+        missing = [p for p in self._required if not args.get(p)]
+        if missing:
+            return ToolResult(False, f"you called `{self.name}` but did not provide: "
+                              f"{', '.join(missing)}.")
+
+        target = args["target"]
+        file_path = args["file"]
+
+        # Guard: target must be a ref present in the current snapshot.
+        guard = self._guard_target(args)
+        if guard is not None:
+            return guard
+
+        # Capture DOM before the sequence for delta detection afterward.
+        before = capture_page_snapshot_raw(self._cli) or ""
+
+        # Step 1: click the upload trigger to open the OS file picker.
+        click_ok, click_out = self._cli.run("click", target)
+        if not click_ok or output_signals_no_match(click_out):
+            return ToolResult(
+                False,
+                f"upload failed: could not click trigger '{target}': "
+                f"{self._trim(_strip_snapshot_filelink(click_out))}",
+            )
+
+        # Step 2: brief pause so the file-picker dialog has time to open.
+        time.sleep(0.5)
+
+        # Step 3: supply the file to the open picker.
+        upload_ok, upload_out = self._cli.run("upload", file_path)
+        upload_msg = self._trim(_strip_snapshot_filelink(upload_out)).replace(
+            "browser_file_upload", "upload")
+        if not upload_ok:
+            if "modal state" in upload_msg.lower():
+                upload_msg = (
+                    f"upload failed after clicking '{target}': the file picker did not open. "
+                    f"Ensure the target is the correct upload trigger button from the snapshot."
                 )
-            return ToolResult(False, msg)
-        return result
+            return ToolResult(False, upload_msg)
+
+        result = ToolResult(
+            True,
+            f"you uploaded '{file_path}' via {target}. Result:\n{upload_msg}",
+        )
+        return _check_dom_delta(self._cli, before, result)
 
 
 class ScreenshotTool(_WebTool):
@@ -2292,13 +2325,13 @@ class WebToolset(Toolset):
             "If a cookie/consent banner or modal dialog blocks what you need, clear it first: "
             "locate its Accept / Agree / Reject / Dismiss / Continue control in the snapshot and "
             "click that ref before doing anything else. "
-            "FILE UPLOADS — two-step sequence: (1) click the upload trigger button or file-input "
-            "ref in the snapshot to open the OS file-picker, then (2) immediately call `upload` "
-            "with the ABSOLUTE path exactly as given in the task. Never use a relative path. "
-            "If the upload trigger button is NOT visible in the snapshot, the upload section is "
-            "not on the current page yet — scroll or click something to reveal it first; do NOT "
-            "call click or upload with a ref that is not in the snapshot. "
-            "Calling `upload` before the picker is open fails with a 'modal state' error. "
+            "FILE UPLOADS — single step: call `upload` with BOTH the trigger ref (the upload "
+            "button or file-input shown in the snapshot) AND the absolute file path. The tool "
+            "clicks the trigger and uploads the file automatically — do NOT click the trigger "
+            "separately first. Pass the ABSOLUTE path exactly as given in the task. "
+            "If the upload trigger is NOT visible in the current snapshot, the upload section is "
+            "not on the current page yet — navigate/scroll there first. Never call `upload` with "
+            "a ref that is not in the snapshot. "
             "FORM VALIDATION ERRORS — if after clicking a 'Next'/'Weiter'/'Submit'/'Absenden' "
             "button the form still shows (page did not advance, or a field is marked [invalid] / "
             "shows 'Eingabe erforderlich'), do NOT click the button again. Instead locate the "
