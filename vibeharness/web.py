@@ -2152,6 +2152,25 @@ def capture_page_snapshot(cli: PlaywrightCli, char_limit: int) -> str:
     return text[:char_limit] + f"\n…[+{len(text) - char_limit} chars truncated]"
 
 
+def _snapshot_is_blank(text: str) -> bool:
+    """True when the snapshot captured about:blank or yielded no meaningful ARIA content.
+
+    Happens when a stale orphaned browser process makes the playwright-cli snapshot
+    subprocess attach to a blank context/tab instead of the navigated page. We detect
+    it by looking for the about:blank URL marker in the output, or for an empty YAML
+    body (the snapshot section exists but has no element lines).
+    """
+    if not text:
+        return True
+    lower = text.lower()
+    if "about:blank" in lower:
+        return True
+    # An empty snapshot has the page header but zero ref lines (no [ref=eN]).
+    if "[ref=" not in text and "- " not in text:
+        return True
+    return False
+
+
 def capture_page_snapshot_raw(cli: PlaywrightCli) -> str:
     """Capture the COMPLETE, UNTRUNCATED `snapshot` of the live page (issues #37, #43).
 
@@ -2160,14 +2179,31 @@ def capture_page_snapshot_raw(cli: PlaywrightCli) -> str:
     uses it so the per-turn injection can apply the DYNAMIC context-budget truncation
     (truncate only as much as the context window requires). Returns "" on any failure
     (no session, CLI error, timeout) so callers record nothing rather than crash.
+
+    Blank-snapshot recovery: if the first capture returns about:blank or empty ARIA
+    (stale orphaned browser attaches snapshot subprocess to wrong context), wait 1.5s
+    and retry once. Warns to stderr if still blank so the anomaly is diagnosable.
     """
-    try:
-        ok, output = _capture(cli)
-    except Exception:
-        return ""
-    if not ok:
-        return ""
-    return (output or "").strip()
+    import time as _time
+    import sys as _sys
+    for attempt in range(2):
+        try:
+            ok, output = _capture(cli)
+        except Exception:
+            return ""
+        if not ok:
+            return ""
+        text = (output or "").strip()
+        if not _snapshot_is_blank(text):
+            return text
+        if attempt == 0:
+            _sys.stderr.write(
+                "\nwarning: snapshot returned about:blank / empty — retrying in 1.5s "
+                "(possible stale browser context)\n"
+            )
+            _time.sleep(1.5)
+    _sys.stderr.write("\nwarning: snapshot still blank after retry — model will have no page context this turn\n")
+    return text
 
 
 def make_raw_snapshot_provider(config: Config) -> Callable[[], str]:
@@ -2249,6 +2285,11 @@ class WebToolset(Toolset):
             "If there is NO current page shown, or a web action reports the browser is not open / "
             "the session was closed, call `open_browser` to (re)open the session, then `goto` "
             "your target URL again before continuing — never give up because the page is missing. "
+            "SNAPSHOT IS GROUND TRUTH — the page_snapshot result is the COMPLETE current state "
+            "of the page. Only elements listed there exist right now. NEVER guess, invent, or "
+            "increment refs (e.g. trying e308 because you saw e307): if a ref is not in the "
+            "latest snapshot it does not exist. Only act on refs you can SEE in the most recent "
+            "page_snapshot observation. "
             "When a tool takes a target element you MUST pass the element's ref (e.g. 'e163') "
             "exactly as it appears in the current snapshot. NEVER guess a CSS selector, class, "
             "id or tag (e.g. '.ytd-play-button'): such targets are rejected before the browser "
@@ -2259,6 +2300,9 @@ class WebToolset(Toolset):
             "FILE UPLOADS — two-step sequence: (1) click the upload trigger button or file-input "
             "ref in the snapshot to open the OS file-picker, then (2) immediately call `upload` "
             "with the ABSOLUTE path exactly as given in the task. Never use a relative path. "
+            "If the upload trigger button is NOT visible in the snapshot, the upload section is "
+            "not on the current page yet — scroll or click something to reveal it first; do NOT "
+            "call click or upload with a ref that is not in the snapshot. "
             "Calling `upload` before the picker is open fails with a 'modal state' error. "
             "FORM VALIDATION ERRORS — if after clicking a 'Next'/'Weiter'/'Submit'/'Absenden' "
             "button the form still shows (page did not advance, or a field is marked [invalid] / "
