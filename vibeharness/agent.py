@@ -474,16 +474,27 @@ class RalphAgent:
         return provider(user) if self._provider_wants_user else provider()
 
     def _evict_old_page_snapshot(self, chat_history: list[dict]) -> None:
-        """Remove all prior page_snapshot tool observations from history.
+        """Remove the page_snapshot <tool_response> block from all prior user messages.
 
         Only the snapshot from the CURRENT turn (about to be committed) should be visible.
         Stale snapshots from earlier turns contradict the current page state and waste
-        the context window. The new snapshot will be added by _commit_turn_to_history."""
-        chat_history[:] = [
-            m for m in chat_history
-            if not (m.get("role") == "tool"
-                    and m.get("tool_name") == "page_snapshot")
-        ]
+        the context window. The new snapshot will be added by _commit_turn_to_history.
+
+        After the batched-tool-result change (#151), page_snapshot observations live inside
+        a batched role:user message as a <tool_response> block rather than as standalone
+        role:tool messages. We strip that block from older entries by regex."""
+        import re
+        snapshot_pattern = re.compile(
+            r"\n?<tool_response>\n## Latest page state.*?</tool_response>",
+            re.DOTALL
+        )
+        for m in chat_history:
+            if m.get("role") != "user":
+                continue
+            content = m.get("content") or ""
+            if "## Latest page state" not in content:
+                continue
+            m["content"] = snapshot_pattern.sub("", content).strip()
 
     def _validator_context(self, user: str) -> str:
         """The tool-less main system prompt to hand the validator (issue #57).
@@ -590,23 +601,22 @@ class RalphAgent:
           * the assistant message — carrying the STRUCTURED ``tool_calls`` when Ollama
             returned them, else the raw response content (the common case for this 3B
             model, where the call came back as text),
-          * one ``role: "tool"`` message per executed action, holding that action's
-            observation. This is exactly the shape the model's chat template feeds back
-            (the ``<tool_response>`` path), so the next turn replays a faithful history.
+          * a single batched ``role: "user"`` message containing ALL action observations,
+            each pre-wrapped in ``<tool_response>...</tool_response>`` tags (see below).
 
-        Tool messages are emitted even for error/blocked actions (their observation is
+        Tool observations are emitted even for error/blocked actions (their observation is
         the steer/error text) so the model SEES the consequence of its last move in the
         history, not just in a one-off injection.
 
-        ROLE "tool" (reconciling CORRECTIONS.md / PR #135): that audit warns the raw
-        Qwen2.5 HF ChatML has no standalone ``tool`` role and results must be a
-        ``user`` message wrapping ``<tool_response>...</tool_response>``. That is true of
-        the RAW template — but we talk to OLLAMA, whose modelfile template (ground truth,
-        captured from ``ollama show --modelfile``) explicitly handles ``role: "tool"`` and
-        DOES the ``<|im_start|>user / <tool_response>`` wrapping itself. Sending
-        ``role: "tool"`` is therefore correct here and verified end-to-end live (the model
-        read a tool result back and answered from it). Do NOT pre-wrap into a user message
-        — that would double-wrap under Ollama's template."""
+        BATCHED TOOL RESULTS (#151 — Qwen3 training format): Qwen3's HuggingFace chat
+        template batches ALL consecutive tool responses for a turn into a SINGLE
+        ``<|im_start|>user`` block, each wrapped in ``<tool_response>...</tool_response>``.
+        Ollama's modelfile template handles ``role: "tool"`` by emitting SEPARATE
+        ``<|im_start|>user`` blocks per message — one per tool result — which diverges from
+        training. To match the training format exactly we pre-wrap every observation in
+        ``<tool_response>`` tags ourselves and send a SINGLE ``role: "user"`` message.
+        Because we send ``role: "user"``, Ollama passes the content through as-is without
+        adding extra wrapping."""
         chat_history.append({"role": "user", "content": user})
         assistant: dict = {"role": "assistant"}
         if decision.tool_calls:
@@ -616,13 +626,16 @@ class RalphAgent:
         else:
             assistant["content"] = decision.action_json or ""
         chat_history.append(assistant)
-        for action in turn.actions:
-            name = action.tool or "unknown"
-            chat_history.append({
-                "role": "tool",
-                "tool_name": name,
-                "content": action.observation or "",
-            })
+        # Qwen3 training format: batch ALL tool responses into ONE user message,
+        # each wrapped in <tool_response>...</tool_response>. The HF chat template
+        # emits a single <|im_start|>user block for all consecutive tool results.
+        # We pre-wrap and send as role:user so Ollama doesn't emit separate blocks.
+        if turn.actions:
+            responses = "\n".join(
+                f"<tool_response>\n{action.observation or ''}\n</tool_response>"
+                for action in turn.actions
+            )
+            chat_history.append({"role": "user", "content": responses})
 
     def _evict_history(self, chat_history: list[dict], system: str, user: str) -> None:
         """FIFO-evict the OLDEST non-system messages until the history fits the budget.
