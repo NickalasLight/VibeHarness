@@ -158,8 +158,8 @@ class OllamaClient(LLMClient):
             payload["tools"] = tools
         if constraint.json_schema is not None:
             payload["format"] = constraint.json_schema
-        content, tool_calls = self._stream_chat(payload, on_action)
-        return Decision(reasoning="", action_json=content.strip(),
+        content, tool_calls, reasoning = self._stream_chat(payload, on_action, on_reason)
+        return Decision(reasoning=reasoning, action_json=content.strip(),
                         tool_calls=tuple(tool_calls))
 
     def generate(self, prompt: str, max_chars: int | None = None,
@@ -264,14 +264,18 @@ class OllamaClient(LLMClient):
 
     # ---- native /api/chat streaming that ALSO captures structured tool_calls ----
     def _stream_chat(self, payload: dict,
-                     on_token: TokenSink | None) -> "tuple[str, list[dict]]":
-        """Stream an /api/chat generation, returning ``(content, tool_calls)``.
+                     on_token: TokenSink | None,
+                     on_reason: TokenSink | None = None) -> "tuple[str, list[dict], str]":
+        """Stream an /api/chat generation, returning ``(content, tool_calls, thinking)``.
 
         Like :meth:`_stream` but additionally accumulates any ``message.tool_calls``
         Ollama emits (most small models emit none — the call comes through as content,
-        which the codec then parses). The runner-shape ``keep_alive``/``num_ctx``
-        invariant (#77) is preserved exactly: this stamps the same constant keep_alive
-        and the payload already carries the pinned options."""
+        which the codec then parses). Also captures ``message.thinking`` — the field
+        Ollama uses for qwen3's reasoning tokens (thinking is ON by default on this
+        branch; config.py §25 explains why think:false is intentionally avoided).
+        The runner-shape ``keep_alive``/``num_ctx`` invariant (#77) is preserved
+        exactly: this stamps the same constant keep_alive and the payload already
+        carries the pinned options."""
         body = {"keep_alive": self._cfg.ollama_keep_alive, **payload, "stream": True}
         req = urllib.request.Request(
             self._cfg.ollama_url + "/api/chat",
@@ -279,6 +283,7 @@ class OllamaClient(LLMClient):
             headers={"Content-Type": "application/json"},
         )
         parts: list[str] = []
+        thinking_parts: list[str] = []
         tool_calls: list[dict] = []
         try:
             with urllib.request.urlopen(req, timeout=self._cfg.request_timeout) as resp:
@@ -288,6 +293,11 @@ class OllamaClient(LLMClient):
                         continue
                     obj = json.loads(line)
                     msg = obj.get("message", {}) or {}
+                    thinking = msg.get("thinking") or ""
+                    if thinking:
+                        thinking_parts.append(thinking)
+                        if on_reason:
+                            on_reason(thinking)
                     chunk = msg.get("content") or ""
                     if chunk:
                         parts.append(chunk)
@@ -303,7 +313,11 @@ class OllamaClient(LLMClient):
                 f"Could not reach Ollama at {self._cfg.ollama_url}. "
                 f"Is it running? Start it with `ollama serve`. ({e.reason})"
             ) from e
-        return "".join(parts), tool_calls
+        # qwen3 emits tool calls as structured objects, not streamed content tokens —
+        # emit them to on_token so they appear in the terminal action stream.
+        if tool_calls and on_token:
+            on_token(json.dumps(tool_calls, indent=2))
+        return "".join(parts), tool_calls, "".join(thinking_parts)
 
     # ---- streaming transport ----
     def _stream(self, path: str, payload: dict, on_token: TokenSink | None) -> str:
