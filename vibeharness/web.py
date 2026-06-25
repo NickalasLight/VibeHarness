@@ -1668,6 +1668,105 @@ class SetSpinbuttonTool(_WebTool):
         return _check_dom_delta(self._cli, before, result)
 
 
+class DrawSignatureTool(_WebTool):
+    """Draw a signature stroke on a canvas drawing pad (SignaturePad component).
+
+    The Review & Submit page has a canvas element (role='img', aria-label='Signature')
+    that requires drawn pointer-event strokes — fill/click cannot activate it.
+    This tool dispatches pointerdown + pointermove + pointerup via JS evaluate to
+    simulate a drawn stroke, satisfying the 'Please provide your signature' validation.
+
+    The SignaturePad React component sets drawing.current=true and calls ctx.beginPath/
+    moveTo BEFORE setPointerCapture, so the stroke lands even if setPointerCapture
+    throws for synthetic events. We wrap that dispatchEvent in try/catch to absorb it.
+    """
+
+    name = "draw_signature"
+    description = (
+        "Draw a signature stroke on the canvas signature pad on the Review & Submit page. "
+        "Use when the form shows 'Please provide your signature'. "
+        "Pass the ref of the signature canvas (role='img', aria-label='Signature'). "
+        "Do NOT use this on the 'Type your full legal name' textbox — fill that separately first. "
+        + _REF_NOTE
+    )
+    _verb = "drew signature on"
+    _required = ("target",)
+    _validate_target = True
+
+    @property
+    def parameters(self):
+        return [
+            Param("target", "string",
+                  "Element ref of the signature canvas (role='img', aria-label='Signature') "
+                  "from the current snapshot. NOT the 'Type your full legal name' textbox."),
+        ]
+
+    def _subject(self, args):
+        return f"signature canvas '{args.get('target')}'"
+
+    def _build(self, args):  # pragma: no cover — run() is overridden
+        return ["snapshot"]
+
+    def run(self, args: dict) -> ToolResult:
+        missing = [p for p in self._required if args.get(p) in (None, "")]
+        if missing:
+            return ToolResult(False, f"you called `{self.name}` but did not provide: "
+                              f"{', '.join(missing)}.")
+        guard = self._guard_target(args)
+        if guard is not None:
+            return guard
+
+        # Dispatch pointer events on the signature canvas via JS evaluate.
+        # setPointerCapture in onPointerDown may throw for synthetic events, but
+        # drawing.current=true, ctx.beginPath, and ctx.moveTo all execute BEFORE it,
+        # so the stroke still registers. Wrap that dispatchEvent in try/catch.
+        js = (
+            "() => {"
+            "  const c = document.querySelector('canvas[aria-label=\"Signature\"]');"
+            "  if (!c) return 'ERROR: no canvas[aria-label=Signature] found';"
+            "  const r = c.getBoundingClientRect();"
+            "  const y  = r.top  + r.height * 0.5;"
+            "  const x1 = r.left + r.width  * 0.15;"
+            "  const xm = r.left + r.width  * 0.50;"
+            "  const x2 = r.left + r.width  * 0.85;"
+            "  const pe = (t, x) => new PointerEvent(t, {"
+            "    bubbles:true, cancelable:true,"
+            "    clientX:x, clientY:y,"
+            "    pointerId:1, pointerType:'mouse', isPrimary:true,"
+            "    button:0, buttons: t==='pointermove' ? 1 : 0"
+            "  });"
+            "  try { c.dispatchEvent(pe('pointerdown', x1)); } catch(e) {}"
+            "  c.dispatchEvent(pe('pointermove', xm));"
+            "  c.dispatchEvent(pe('pointermove', x2));"
+            "  c.dispatchEvent(pe('pointerup',   x2));"
+            "  return 'OK: stroke drawn across canvas (' + Math.round(r.width) + 'x' + Math.round(r.height) + ')';"
+            "}"
+        )
+
+        before = capture_page_snapshot_raw(self._cli) or ""
+        ok, output = self._cli.run("eval", js)
+        if not ok:
+            return ToolResult(
+                False,
+                f"you tried to draw a signature on canvas '{args.get('target')}' but the "
+                f"JS evaluate call failed: {self._trim(output)}. "
+                f"Make sure you are on the Review & Submit page with the signature canvas visible."
+            )
+        out_text = (output or "").strip()
+        if out_text.startswith("ERROR:"):
+            return ToolResult(
+                False,
+                f"you tried to draw a signature but: {out_text}. "
+                f"Confirm the signature canvas (role='img', aria-label='Signature') is on the page."
+            )
+        result = ToolResult(
+            True,
+            f"you drew a signature stroke on the canvas '{args.get('target')}'. "
+            f"Result: {out_text}"
+        )
+        return _check_dom_delta(self._cli, before, result)
+
+
 class CheckTool(_WebTool):
     name = "check"
     description = "Check a checkbox or radio button (no-op if already checked). " + _REF_NOTE
@@ -1973,7 +2072,7 @@ class SnapshotTool(_WebTool):
 # ``snapshot`` lets the agent explicitly request a fresh page view mid-turn.
 _WEB_TOOL_CLASSES: tuple[type[_WebTool], ...] = (
     GotoTool, ClickTool, FillTool, TypeTool, PressKeyTool, SelectOptionTool,
-    SetSpinbuttonTool,
+    SetSpinbuttonTool, DrawSignatureTool,
     CheckTool, UncheckTool, HoverTool, DragTool, UploadTool,
     ReloadTool,
     # Excluded: OpenBrowserTool (goto opens browser automatically),

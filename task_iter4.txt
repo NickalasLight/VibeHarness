@@ -39,13 +39,12 @@ fill the form. You do NOT need to read any file for the candidate's data.
 2. Software Engineer II — Brazos Software Group, Austin TX (Jun 2018–Feb 2021): ASP.NET Core Web APIs for a B2B invoicing platform (12,000 merchants); migrated a .NET Framework monolith to containerized .NET Core on Azure AKS; gRPC contracts; Azure DevOps CI/CD.
 3. Software Engineer — Trinity Web Solutions, Dallas TX (Jul 2016–May 2018): C#/ASP.NET MVC logistics apps; normalized SQL Server schemas + stored procedures; xUnit tests.
 
-**On the Experience & Skills page, fill fields IN THIS ORDER before clicking skills:**
+**On the Experience & Skills page (page 3), fill fields IN THIS ORDER:**
   1. Current title, current company (textboxes)
   2. set_spinbutton for total years (value=9) and .NET years (value=9)
-  3. Salary expectation: fill the salary textbox/spinbutton with 165000
-  4. LinkedIn profile URL: fill with https://www.linkedin.com/in/jason-statham-dotnet
-  5. Portfolio / GitHub URL: fill with https://github.com/jstatham-dev
-  THEN click skill buttons (below). Do NOT skip salary/LinkedIn/GitHub.
+  3. LinkedIn profile URL: fill with https://www.linkedin.com/in/jason-statham-dotnet
+  4. Portfolio / GitHub URL: fill with https://github.com/jstatham-dev
+  THEN click skill buttons (below). Salary is NOT on this page — it is on page 6.
 
 **Skills:** The skills step shows TOGGLE BUTTONS — use click (NOT select_option) on each
 button to select it. The per-turn action limit is 12 — split skill clicks across 2 turns.
@@ -57,28 +56,43 @@ Click ONLY these EXACT button labels (do NOT click any other skill button like "
 **Education**
 - Degree: Bachelor of Science in Computer Science (if a degree dropdown is shown, pick "Bachelor's Degree")
 - School: The University of Texas at Dallas
-- Field of study: Computer Science
+- Field of study: Computer Science  ← REQUIRED field, must be filled
 - Graduation date: use select_option with EXACT ISO value "2016-05-01" — the harness navigates the calendar for you. Do NOT pass "May 2016" — that does NOT work.
 
-**Additional questions**
+**Additional questions (page 6)**
+The salary field will be pre-filled with "150000" — this is WRONG. You MUST explicitly
+overwrite it: use fill(target=<salary_ref>, value="165000"). The pre-filled default is
+NOT accepted by form validation. Fill all three fields in this order:
+  1. Salary expectation: fill with 165000 (overwrite the pre-filled 150000)
+  2. How did you hear about us: select_option "Company Website"
+  3. Why interested: fill with the text below
 - Why interested: "FlashTec's bet on .NET, Azure, and event-driven architecture to move real money at five-nines reliability is exactly the problem space I have spent my career in. I want to bring my payments and ledger experience to a Dallas-based platform team where I can own high-throughput services end-to-end and mentor the next generation of engineers."
-- How did you hear about us: Company careers page (if a dropdown, pick "Company Website")
 
-**Voluntary self-identification**
-- Gender: Decline to self-identify
-- Ethnicity: Decline to self-identify
-- Veteran status: I am not a protected veteran
-- Disability status: Decline to answer
+**Documents to upload** (Resume & Cover Letter, page 5)
+For EACH file upload, you MUST click the upload button first to open the file chooser,
+THEN call the upload tool. Two separate buttons, two separate file chooser sessions:
+  1. Click "Upload your resume" button → file chooser opens → upload C:\git\vibethinkharnessProto1\test_assets\jason_statham_resume.docx
+  2. Click "Upload your cover letter" button → file chooser opens → upload C:\git\vibethinkharnessProto1\test_assets\jason_statham_cover_letter.docx
+Do NOT call upload without first clicking the button — it will fail with "no modal state".
 
-**Certification / signature**
-- Certify the information is true: Yes
-- Consent to data processing: Yes
-- Signature name: Jason Statham
+**Voluntary self-identification (page 7)**
+Fill ONE dropdown at a time — complete each selection before opening the next:
+  1. Gender: select_option → the options shown are "Male/Female/Non-binary/Prefer not to disclose" → click "Prefer not to disclose"
+  2. Race / Ethnicity: select_option → click "Prefer not to disclose"
+  3. Protected veteran status: select_option → click "I am not a protected veteran"
+  4. Disability status: select_option → click "Prefer not to disclose"
+  IMPORTANT: there is NO option called "Decline to self-identify" — use "Prefer not to disclose".
+  After each select_option opens the dropdown, click the matching option BEFORE calling select_option on the next field.
 
-**Documents to upload** (where the form has a file upload):
-- Resume: `C:\git\vibethinkharnessProto1\test_assets\jason_statham_resume.docx`
-- Cover letter: `C:\git\vibethinkharnessProto1\test_assets\jason_statham_cover_letter.docx`
-- Use the `upload` tool on the file input ref. Do NOT drag-drop.
+**Certification / signature (page 8 — Review & Submit)**
+On the final page, do these steps IN ORDER:
+  1. Check the "I certify that the information provided..." checkbox
+  2. Check the "I consent to FlashTec processing my personal data..." checkbox
+  3. Fill the "Type your full legal name to sign" textbox with "Jason Statham"
+  4. Draw the signature: call draw_signature(target=<ref of the img element labeled "Signature">)
+     The signature canvas has role='img' and aria-label='Signature' in the snapshot.
+     It is DIFFERENT from the "Type your full legal name" textbox — you must use BOTH.
+  5. Click "Submit Application"
 
 ## Steps
 1. Open the application form.
@@ -123,4 +137,5 @@ CRITICAL rules for getting through all 8 steps:
 - Skills are toggle buttons: click each skill button that matches the candidate's skills.
 - On each step, fill EVERY required field, then click "Continue →". On the final
   "Review & Submit" step, tick the certification/consent checkboxes, enter the signature
-  name, then click the Submit button and confirm the submission succeeded.
+  name, draw the signature with draw_signature, then click the Submit button and confirm
+  the submission succeeded.

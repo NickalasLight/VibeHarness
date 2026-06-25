@@ -1,13 +1,13 @@
 {
   "phase": "optimizing",
-  "iteration": 5,
-  "last_score": 34,
-  "best_score": 48,
+  "iteration": 6,
+  "last_score": 49,
+  "best_score": 49,
   "vibethinker_enabled": false,
   "rewrite_pr_merged": true,
   "hf_test_pr_merged": true,
   "finished": false,
-  "notes": "Iter 4 COMPLETE: score=34 (14/26 fields + 2 page advances + 0 submit) — best RECOVERY since iter-1=48 (iter-2=22, iter-3=8). Pages 1-2 completed cleanly in 5 turns: all three iter-3 fixes worked perfectly (TX auto-selected, United States auto-selected, FORM NOT ADVANCED steer worked, U.S. Citizen + No + Hybrid + 2026-07-21 all set in turn 5). Turn 6: title + company filled. Page 3 STALLED on the spinbutton: totalExperienceYears reached only 2 (needed 9) because qwen3:4b makes EXACTLY ONE LLM tool call per spinbutton click — turns 7-8 each clicked Increase once -> value=2 -> run killed at turn 9. With 9 clicks x 2 spinbuttons = 18 LLM roundtrips (4-8 min each), the run cannot finish all 8 pages this way. ITER-5 FIX: new SetSpinbuttonTool — set_spinbutton(target, value) reads the spinbutton's current value from the snapshot, finds its Increase/Decrease sibling button, and clicks the right one |target-current| times INSIDE Python, so the model sets the value in ONE LLM roundtrip instead of N. task_iter4.txt spinbutton instructions rewritten to use set_spinbutton; tool registered in _WEB_TOOL_CLASSES. Tests: added SetSpinbuttonTest. See issue #142.",
+  "notes": "Iter 5 COMPLETE: score=49 (19/26 fields + 3 pages) — new best. Pages 1-3 passed cleanly. SetSpinbuttonTool confirmed working (both spinbuttons set to 9 in ONE LLM turn). Stalled at page 4 graduation date: 'May 2016' not ISO format -> _select_calendar_date couldn't navigate -> 'Please choose a valid date' loop. Also: salary/LinkedIn never filled (agent jumped spinbuttons->skills), phone missing +1 prefix, Blazor wrongly clicked, DDD missed. ITER-6 FIXES in task_iter4.txt: (1) graduation date ISO '2016-05-01', (2) salary/LinkedIn explicit ordering before skills, (3) phone +1 must-include note, (4) Blazor warning + DDD explicit, (5) per-turn limit 12 note for skills.",
   "ground_truth": {
     "tool_schema_format": "bare {name,description,parameters} for hand-crafted <tools>; ENVELOPED {type:function,function:{...}} for Ollama native tools: API field",
     "tool_result_role": "role:tool works via Ollama native API (Ollama handles it internally)",
@@ -15,14 +15,15 @@
     "qwen3_behavior": "qwen3:4b on Ollama returns STRUCTURED message.tool_calls (qwen2.5-coder returned null+text). Thinking routes to message.thinking; content is clean. HermesCodec is zero-changes compatible.",
     "form_widgets": "job form: 12 custom <button role=combobox> dropdowns (use select_option, NOT fill); a custom calendar DatePicker (navigate year/month then click ISO-labeled day cell); MultiSelect skills; NumberStepper (spinbutton, click +N times); Checkbox certify; SignaturePad; FileUpload; ~26 fields across 8 pages",
     "advisor_decision": "DISABLED. Run command must NOT pass --advisor.",
-    "context_window": "num_ctx=32768 required (OLLAMA_FLASH_ATTENTION=1 makes it safe at ~4500 MiB). 16384 gives only 7168 token input budget — too small for 8-page form. Restore to 32768.",
+    "context_window": "num_ctx=32768 required (OLLAMA_FLASH_ATTENTION=1 makes it safe at ~4500 MiB). 16384 gives only 7168 token input budget -- too small for 8-page form. Restore to 32768.",
     "scoring_system": "GET http://localhost:3000/api/score/session-end at end of each run. Writes .vibe/last_benchmark_score.json with commitMessageStart.",
     "loop_issue": "Full loop architecture documented in GitHub issue #142 on VibeHarness repo.",
-    "iter3_fixes": "Escape in _select_via_combobox; work arrangement='Hybrid'; ONE-DROPDOWN-AT-A-TIME warning; calendar select_option is atomic in tool (no manual nav needed); _check_dom_delta surfaces validation alerts on rejected Continue (FORM NOT ADVANCED steer) to break blind Continue loops",
-    "iter4_fixes": "_check_dom_delta re-surfaces ALL visible alerts after Continue (not just NEW ones) + no early-return on empty new_refs -> steer re-fires on every blind Continue while errors remain (root cause 1); _select_via_combobox detects target that is an already-OPEN listbox/option (target_is_open_listbox) and clicks the option directly instead of Escape+re-click which would close the list unselected (root cause 2); task_iter4.txt State='TX (TWO-LETTER abbreviation, NOT Texas)' (root cause 3)",
-    "iter5_fixes": "NEW SetSpinbuttonTool (set_spinbutton(target,value)): reads the spinbutton's current value from the snapshot (aria-valuenow or '<n> yrs' display), finds its Increase/Decrease sibling button, and clicks the right one |target-current| times INSIDE Python -> the model sets a stepper in ONE LLM roundtrip instead of N (root cause: qwen3:4b makes exactly 1 tool call per spinbutton click; 9x2=18 turns killed the run on page 3). Guard: refuses >50 clicks; refuses non-spinbutton targets (steers to fill/select_option/click). Registered in _WEB_TOOL_CLASSES. task_iter4.txt spinbutton instructions rewritten to call set_spinbutton."
+    "iter5_fixes": "NEW SetSpinbuttonTool (set_spinbutton(target,value)): reads the spinbutton current value, finds Increase/Decrease sibling, clicks |delta| times in Python -> ONE LLM roundtrip. Registered in _WEB_TOOL_CLASSES. task_iter4.txt spinbutton instructions rewritten.",
+    "iter6_fixes": "task_iter4.txt: (1) graduation date ISO '2016-05-01' (not 'May 2016'); (2) explicit ordering instruction for page 3 (salary+LinkedIn BEFORE skills); (3) phone +1 must-include note; (4) Blazor warning + skills 'ONLY these labels'; (5) per-turn limit 12 note, split skills across 2 turns.",
+    "calendar_behavior": "_select_calendar_date only handles ISO YYYY-MM-DD format. 'May 2016' is NOT recognized -> calendar opens but does NOT navigate. Use ISO dates for all date pickers.",
+    "score_breakdown": "iter-5: phone missing +1 (-1), graduation date missing (-1), salary missing (-1), resume missing (-1), whyInterested missing (-1), signatureName missing (-1), certifyTrue missing (-1) = 7 fields wrong. Pages 4-8 not advanced = -50 pts. No submit = -20."
   },
-  "run_pid": 15376,
-  "run_log": "C:\\git\\vibethinkharnessProto1\\vibe_run_iter5.log",
+  "run_pid": 2108,
+  "run_log": "C:\\git\\vibethinkharnessProto1\\vibe_run_iter6.log",
   "task_id": "1"
 }
