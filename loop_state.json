@@ -7,7 +7,7 @@
   "rewrite_pr_merged": true,
   "hf_test_pr_merged": true,
   "finished": true,
-  "notes": "Iter 7 COMPLETE: score=106 (26/26 fields PERFECT + 8/8 pages). SUCCESS: ≥100pt target reached. Confirmation page FT-APP-20260625-HRWZEJ. DrawSignatureTool (JS pointer events on canvas) worked first try. All 8 pages advanced. Final blockers resolved: salary overwrite, field-of-study recovery, correct self-ID option names, canvas signature.",
+  "notes": "Iter 7 COMPLETE: score=106 (26/26 fields PERFECT + 8/8 pages). SUCCESS: >=100pt target reached. Confirmation page FT-APP-20260625-HRWZEJ. DrawSignatureTool (JS pointer events on canvas) worked first try. All 8 pages advanced. Final blockers resolved: salary overwrite, field-of-study recovery, correct self-ID option names, canvas signature.",
   "ground_truth": {
     "tool_schema_format": "bare {name,description,parameters} for hand-crafted <tools>; ENVELOPED {type:function,function:{...}} for Ollama native tools: API field",
     "tool_result_role": "role:tool works via Ollama native API (Ollama handles it internally)",
@@ -26,7 +26,7 @@
     "self_id_options": "Page 7 Voluntary Self-ID options: 'Prefer not to disclose' (NOT 'Decline to self-identify'). Veteran: 'I am not a protected veteran'. Must use ONE dropdown at a time.",
     "score_breakdown": "iter-6: 26/26 fields + 7/8 pages = 96pts. Blocked only on signature canvas. iter-7 expected: 26/26 + 8/8 pages + submit = 126pts."
   },
-  "run_pid": 26620,
-  "run_log": "C:\\git\\vibethinkharnessProto1\\vibe_run_iter7.log",
+  "run_pid": null,
+  "run_log": null,
   "task_id": "1"
 }
