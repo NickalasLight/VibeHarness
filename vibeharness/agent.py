@@ -405,13 +405,15 @@ class RalphAgent:
                 if self._raw_snapshot_provider is not None and not result.finished:
                     time.sleep(1)
                     snap = self._raw_snapshot_provider()
-                    if snap:
-                        self._record(turn, Action(
-                            "page_snapshot", {},
-                            "## Latest page state — this is what the page looks like NOW "
-                            "after all your actions this turn\n\n" + snap,
-                            ok=True,
-                        ), memory)
+                    obs = (
+                        "## Latest page state — this is what the page looks like NOW "
+                        "after all your actions this turn\n\n" + snap
+                        if snap else
+                        "## Latest page state — the page is currently blank or still loading. "
+                        "There are NO interactive elements available right now. "
+                        "Try navigating to the target URL again or wait and retry."
+                    )
+                    self._record(turn, Action("page_snapshot", {}, obs, ok=True), memory)
 
                 # NATIVE stateful history (issue #129/#130/#131): commit THIS turn to the
                 # real message history so the next turn's request replays it verbatim.

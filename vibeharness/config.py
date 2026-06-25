@@ -22,18 +22,17 @@ class Config:
     #     ZERO codec changes). Ollama now returns STRUCTURED message.tool_calls for
     #     Qwen3 (qwen2.5-coder returned null+text), so the native_tools path (PR #136)
     #     becomes the primary, more-robust route.
-    #   - Thinking is ON by default and Ollama routes it to message.thinking, leaving
-    #     content clean. Do NOT disable thinking (think:false leaks reasoning into
-    #     content and breaks the content-only parse fallback).
-    # Sampling is tuned to the Qwen3 model card (see action_temperature / top_k below).
+    #   - Thinking is DISABLED (think:false in payload + /no_think in system prompt).
+    #     Research (arXiv:2505.09388, arXiv:2512.19585) shows thinking provides no
+    #     accuracy benefit for structured tool-calling while consuming 1000-5000+ tokens
+    #     per turn. Sampling tuned to Qwen3 NON-thinking mode (temp=0.7, top_p=0.8).
     model: str = "qwen3:4b"
     temperature: float = 0.3          # phase-1 reasoning temperature (some diversity helps)
-    # ISSUE #140: Qwen3 explicitly FORBIDS greedy decoding (its model card warns greedy
-    # causes endless repetition / degraded output). The previous 0.0 (greedy, chosen for
-    # verbatim string fidelity on the non-thinking qwen2.5-coder) is off-policy for Qwen3.
-    # 0.6 is Qwen3's baked thinking-mode default — the recommended action temperature.
-    action_temperature: float = 0.6   # phase-2 action: Qwen3 forbids greedy (was 0.0) — #140
-    top_p: float = 0.95               # matches Qwen3 baked default
+    # Qwen3 NON-thinking mode sampling (research: arXiv:2505.09388, Qwen3 model card):
+    # temp=0.7, top_p=0.8 are the official non-thinking recommendations.
+    # (Thinking mode uses 0.6/0.95; we disabled thinking — use non-thinking values.)
+    action_temperature: float = 0.7   # Qwen3 non-thinking mode (was 0.6 for thinking)
+    top_p: float = 0.8                # Qwen3 non-thinking mode (was 0.95 for thinking)
     # ISSUE #140: Qwen3 recommends top_k=20 (its baked default); 0 (disabled) is
     # off-distribution for Qwen3 and was only inherited from the qwen2.5-coder setup.
     top_k: int = 20                   # Qwen3 recommendation (was 0) — #140

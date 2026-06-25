@@ -1908,7 +1908,7 @@ class UploadTool(_WebTool):
         # (issue #144). Clean up the error text so the agent sees 'upload' (the tool
         # it called) instead of the internal 'browser_file_upload' name.
         if not result.ok:
-            msg = result.message.replace("browser_file_upload", "upload")
+            msg = (result.observation or "").replace("browser_file_upload", "upload")
             if "modal state" in msg.lower():
                 msg = (
                     "upload failed: the OS file-picker is not open (no 'modal state'). "

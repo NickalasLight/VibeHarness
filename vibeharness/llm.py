@@ -149,6 +149,12 @@ class OllamaClient(LLMClient):
         payload: dict = {
             "model": self._cfg.model,
             "messages": messages,
+            # Disable Qwen3 thinking on the native tool-call path. Research (arXiv:2505.09388,
+            # arXiv:2512.19585) shows thinking provides no accuracy benefit for structured
+            # tool-calling tasks while consuming 1000-5000+ tokens per turn of context window.
+            # "think" must be top-level (NOT inside "options") per Ollama docs; the belt-and-
+            # suspenders "/no_think" in the system prompt covers Ollama versions that ignore it.
+            "think": False,
             "options": {**self._options(),
                         "temperature": self._cfg.action_temperature,
                         "num_predict": self._cfg.reason_tokens + self._cfg.action_tokens,
@@ -194,6 +200,7 @@ class OllamaClient(LLMClient):
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ],
+            "think": False,  # disable Qwen3 thinking (see decide_chat for rationale)
             "options": {**self._options(),
                         "temperature": self._cfg.action_temperature,
                         "num_predict": self._cfg.reason_tokens + self._cfg.action_tokens,
