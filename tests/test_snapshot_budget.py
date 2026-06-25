@@ -259,59 +259,88 @@ class LongRunShrinkingBudgetTest(unittest.TestCase):
 
 
 class EndToEndProviderTest(unittest.TestCase):
-    """Drive the actual cli.make_system_prompt_provider with a fake raw-snapshot source
-    (no browser, no model). Proves the FULL message is what gets budgeted and that the
-    truncation now happens at prompt-build time inside the provider."""
+    """Drive the actual cli budgeting providers with a fake raw-snapshot source (no
+    browser, no model). Proves the FULL message is what gets budgeted and the snapshot is
+    trimmed at provider time. Issue #146: the budgeted snapshot now rides the USER turn
+    (``make_user_snapshot_provider``) for the agent, while the validator's TOOL-LESS
+    system-prompt provider still renders it as a `# Current page` section — both share the
+    same #43 budgeting, so the budget is asserted through whichever surface carries it."""
 
-    def _provider(self, cfg, raw_text, task="DO THE THING", workspace="ws-tree"):
+    def _snapshot(self, cfg, raw_text, task="DO THE THING", workspace="ws-tree"):
+        # The agent-facing path: the budgeted snapshot appended to the user turn.
+        from vibeharness.cli import make_user_snapshot_provider
+        builder = SystemPromptBuilder(_registry(["web"]))
+        return make_user_snapshot_provider(
+            builder, cfg, task, lambda: workspace, (lambda: raw_text))
+
+    def _validator_prompt(self, cfg, raw_text, task="DO THE THING", workspace="ws-tree"):
+        # The validator path: the tool-less system prompt WITH the page section appended.
         from vibeharness.cli import make_system_prompt_provider
         builder = SystemPromptBuilder(_registry(["web"]))
         return make_system_prompt_provider(
-            builder, cfg, task, lambda: workspace, (lambda: raw_text))
+            builder, cfg, task, lambda: workspace, (lambda: raw_text),
+            include_tool_guidance=False)
+
+    def test_system_prompt_has_no_page_section(self):
+        # Issue #146: the FULL-tool system prompt no longer carries the page section.
+        from vibeharness.cli import make_system_prompt_provider
+        cfg = _cfg()
+        builder = SystemPromptBuilder(_registry(["web"]))
+        p = make_system_prompt_provider(
+            builder, cfg, "DO THE THING", lambda: "ws", (lambda: "### Page\nUNIQUESNAP-XYZ"))
+        sp = p(user="short user message")
+        self.assertNotIn("# Current page (live snapshot", sp)
+        self.assertNotIn("UNIQUESNAP-XYZ", sp)
 
     def test_small_snapshot_injected_whole(self):
         cfg = _cfg()
         raw = "### Page\nCONSENT BANNER e6"
-        sp = self._provider(cfg, raw)(user="short user message")
-        self.assertIn("# Current page (live snapshot", sp)
-        self.assertIn("CONSENT BANNER e6", sp)
-        self.assertNotIn("truncated", sp)
+        snap = self._snapshot(cfg, raw)(user="short user message")
+        self.assertIn("CONSENT BANNER e6", snap)
+        self.assertNotIn("truncated", snap)
+        # And the validator section carries the same snapshot under its heading.
+        vp = self._validator_prompt(cfg, raw)(user="short user message")
+        self.assertIn("# Current page (live snapshot", vp)
+        self.assertIn("CONSENT BANNER e6", vp)
 
     def test_large_snapshot_truncated_against_full_message(self):
         # Small window so even a modest snapshot must truncate; the user message is part
-        # of 'rest', so a bigger user message yields a smaller injected snapshot. The
-        # web system prompt now documents 16 discrete subtools (#51), so this window is
-        # sized to leave room for that larger 'rest' PLUS a truncatable snapshot.
+        # of 'rest', so a bigger user message yields a smaller injected snapshot.
         cfg = _cfg(num_ctx=8_000, reason_tokens=500, action_tokens=1_500,
                    snapshot_safety_margin_tokens=0)
         raw = "z" * 100_000
-        small_user = self._provider(cfg, raw)(user="u" * 100)
-        big_user = self._provider(cfg, raw)(user="u" * 4_000)
+        small_user = self._snapshot(cfg, raw)(user="u" * 100)
+        big_user = self._snapshot(cfg, raw)(user="u" * 4_000)
         self.assertIn("truncated", small_user)
         self.assertIn("truncated", big_user)
         # Bigger user message -> 'rest' bigger -> fewer snapshot chars survive.
         self.assertGreater(len(small_user), len(big_user))
 
-    def test_overflow_injects_no_page_and_does_not_raise(self):
-        # 'rest' alone already exceeds the window: provider must inject NO page section.
+    def test_overflow_injects_no_snapshot_and_does_not_raise(self):
+        # 'rest' alone already exceeds the window: provider must inject NO snapshot.
         cfg = _cfg(num_ctx=600, reason_tokens=200, action_tokens=300,
                    snapshot_safety_margin_tokens=0)
-        sp = self._provider(cfg, "z" * 100_000)(user="u" * 8_000)
-        self.assertNotIn("# Current page (live snapshot", sp)
+        snap = self._snapshot(cfg, "z" * 100_000)(user="u" * 8_000)
+        self.assertEqual(snap, "")
+        vp = self._validator_prompt(cfg, "z" * 100_000)(user="u" * 8_000)
+        self.assertNotIn("# Current page (live snapshot", vp)
 
-    def test_no_snapshot_renders_no_page_section(self):
+    def test_no_snapshot_renders_nothing(self):
         cfg = _cfg()
-        sp = self._provider(cfg, "")(user="hi")
-        self.assertNotIn("# Current page (live snapshot", sp)
+        self.assertEqual(self._snapshot(cfg, "")(user="hi"), "")
+        vp = self._validator_prompt(cfg, "")(user="hi")
+        self.assertNotIn("# Current page (live snapshot", vp)
 
     def test_provider_accepts_user_message(self):
-        # The provider must accept the per-turn user message (arity contract for #43).
+        # The providers must accept the per-turn user message (arity contract for #43).
         import inspect
-        from vibeharness.cli import make_system_prompt_provider
+        from vibeharness.cli import (make_system_prompt_provider,
+                                     make_user_snapshot_provider)
         builder = SystemPromptBuilder(_registry(["web"]))
         p = make_system_prompt_provider(builder, _cfg(), "t", lambda: "ws", (lambda: "snap"))
-        sig = inspect.signature(p)
-        self.assertEqual(len(sig.parameters), 1)
+        self.assertEqual(len(inspect.signature(p).parameters), 1)
+        s = make_user_snapshot_provider(builder, _cfg(), "t", lambda: "ws", (lambda: "snap"))
+        self.assertEqual(len(inspect.signature(s).parameters), 1)
 
 
 class PinnedNumCtxFitsHeavyPageTest(unittest.TestCase):

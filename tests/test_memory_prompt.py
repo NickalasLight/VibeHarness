@@ -85,8 +85,10 @@ class PromptTest(unittest.TestCase):
 
 
 class ToollessPromptTest(unittest.TestCase):
-    """Issue #57: SystemPromptBuilder.build(include_tool_guidance=False) renders the
-    validator's view — task + workspace + page snapshot, but NO tool sections."""
+    """Issue #57 + #146: SystemPromptBuilder.build(include_tool_guidance=False) renders
+    the validator's view — task + workspace, NO tool sections. Issue #146 moved the page
+    snapshot OUT of build(); the validator's page section is now appended separately via
+    render_page_section."""
 
     def setUp(self):
         catalog = default_catalog()
@@ -96,6 +98,7 @@ class ToollessPromptTest(unittest.TestCase):
         self.builder = SystemPromptBuilder(self.registry, guidance=self.guidance)
 
     def test_keeps_task_workspace_and_page_snapshot(self):
+        from vibeharness.prompt import render_page_section
         sp = self.builder.build("DO THE THING", workspace="WS-TEXT",
                                 page="button \"Submit\" [ref=e7]",
                                 include_tool_guidance=False)
@@ -103,8 +106,12 @@ class ToollessPromptTest(unittest.TestCase):
         self.assertIn("DO THE THING", sp)
         self.assertIn("# Workspace", sp)
         self.assertIn("WS-TEXT", sp)
-        self.assertIn("# Current page (live snapshot", sp)
-        self.assertIn("[ref=e7]", sp)
+        # Issue #146: build() no longer renders the page; the section is appended by
+        # render_page_section (this is what the validator-context provider concatenates).
+        self.assertNotIn("# Current page (live snapshot", sp)
+        section = render_page_section("button \"Submit\" [ref=e7]")
+        self.assertIn("# Current page (live snapshot", section)
+        self.assertIn("[ref=e7]", section)
 
     def test_strips_all_tool_sections(self):
         sp = self.builder.build("DO THE THING", workspace="WS-TEXT",
