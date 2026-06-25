@@ -1492,6 +1492,182 @@ class SelectOptionTool(_WebTool):
                           f"navigated to {iso_date[:7]}, and clicked day {day_ref}).")
 
 
+# A spinbutton's adjacent display generic shows its current value as "<number> yrs"
+# (e.g. "0 yrs", "9 yrs"). Used to read the current value when no aria-valuenow is
+# captured in the snapshot. Captures the first integer on/near the spinbutton line.
+_SPINBUTTON_YRS_RE = re.compile(r"(\d+)\s*yrs?\b", re.IGNORECASE)
+# aria-valuenow is the authoritative current value when the snapshot exposes it on the
+# spinbutton line (e.g. "spinbutton ... [valuenow=2]" / "aria-valuenow=\"2\"").
+_VALUENOW_RE = re.compile(r'(?:aria-)?valuenow[=:]\s*"?(\d+)"?', re.IGNORECASE)
+
+
+def spinbutton_current_value(snapshot: str, ref: str) -> int | None:
+    """Best-effort current integer value of the spinbutton ``ref`` from ``snapshot``.
+
+    Reads, in priority order: an ``aria-valuenow``/``valuenow`` on the spinbutton's own
+    line, then a ``<number> yrs`` display on the spinbutton line or the line immediately
+    after it (the adjacent display generic, e.g. ``generic [ref=eN]: "0 yrs"``). Returns
+    ``None`` when the ref isn't present or no value can be read (the caller then refuses
+    to act rather than guess)."""
+    if not ref:
+        return None
+    lines = (snapshot or "").splitlines()
+    for i, line in enumerate(lines):
+        if f"[ref={ref}]" not in line:
+            continue
+        m = _VALUENOW_RE.search(line)
+        if m:
+            return int(m.group(1))
+        m = _SPINBUTTON_YRS_RE.search(line)
+        if m:
+            return int(m.group(1))
+        # Fall back to the adjacent display generic on the next couple of lines.
+        for j in range(i + 1, min(i + 3, len(lines))):
+            m = _SPINBUTTON_YRS_RE.search(lines[j])
+            if m:
+                return int(m.group(1))
+        return None
+    return None
+
+
+def find_stepper_button_ref(snapshot: str, ref: str, direction: str) -> str | None:
+    """Ref of the Increase/Decrease button adjacent to spinbutton ``ref`` in ``snapshot``.
+
+    ``direction`` is 'increase' or 'decrease'. Searches the lines following the
+    spinbutton (its sibling stepper buttons, e.g. ``button "Increase Total years…"``)
+    for a button whose accessible name starts with the direction word, returning its
+    ref. Returns ``None`` when no such sibling button is found."""
+    want = direction.lower()
+    lines = (snapshot or "").splitlines()
+    for i, line in enumerate(lines):
+        if f"[ref={ref}]" not in line:
+            continue
+        for j in range(i + 1, min(i + 10, len(lines))):
+            sib = lines[j]
+            low = sib.lower()
+            if want in low and "button" in low:
+                m = re.search(r"\[ref=(e\d+)\]", sib)
+                if m:
+                    return m.group(1)
+        return None
+    return None
+
+
+class SetSpinbuttonTool(_WebTool):
+    """Set a number stepper (role="spinbutton") to a target value in ONE tool call.
+
+    qwen3:4b makes exactly one LLM tool call per spinbutton click, so reaching "9 years"
+    used to cost nine LLM roundtrips per field (iter-4: stalled on page 3 with
+    totalExperienceYears stuck at 2). This tool reads the spinbutton's current value from
+    the snapshot, finds its adjacent Increase/Decrease sibling buttons, and clicks the
+    right one ``|target - current|`` times INSIDE Python — so the model sets the value in
+    a single roundtrip instead of N."""
+
+    name = "set_spinbutton"
+    description = (
+        "Set a spinbutton (numeric stepper) to a specific integer value by clicking its "
+        "Increase/Decrease buttons. Use this instead of clicking the Increase button many "
+        "times. Target the element whose role is 'spinbutton' (NOT the Increase/Decrease "
+        "buttons). " + _REF_NOTE
+    )
+    _verb = "set the spinbutton"
+    _required = ("target", "value")
+    _validate_target = True
+
+    # Refuse to click a stepper more than this many times in one call — a runaway delta
+    # almost certainly means a misread current value, and 50+ clicks would wedge the turn.
+    _MAX_CLICKS = 50
+
+    @property
+    def parameters(self):
+        return [
+            Param("target", "string", "Element ref (e.g. 'e730') of the spinbutton (the numeric "
+                  "stepper container, role='spinbutton') — never the Increase/Decrease button, and "
+                  "never a guessed CSS selector/class/id."),
+            Param("value", "integer", "The integer value to set the spinbutton to (e.g. 9)."),
+        ]
+
+    def _subject(self, args):
+        return f"spinbutton '{args.get('target')}'"
+
+    def _build(self, args):  # pragma: no cover - run() is overridden, never reached
+        return ["snapshot"]
+
+    def run(self, args: dict) -> ToolResult:
+        # Standard missing-param + ref-on-page guards (issues #51/#73).
+        missing = [p for p in self._required if args.get(p) in (None, "")]
+        if missing:
+            return ToolResult(False, f"you called `{self.name}` but did not provide: "
+                              f"{', '.join(missing)}.")
+        guard = self._guard_target(args)
+        if guard is not None:
+            return guard
+        target = normalize_ref(args.get("target", "") or "")
+        try:
+            value = int(args["value"])
+        except (TypeError, ValueError):
+            return ToolResult(False, f"you called `{self.name}` with a non-integer value "
+                              f"'{args.get('value')}'. Pass an integer, e.g. value=9.")
+
+        snapshot = capture_page_snapshot_raw(self._cli) or ""
+        # Confirm the target really is a spinbutton; if not, steer to the right tool so a
+        # mistargeted call doesn't blindly click a sibling button N times.
+        sb_line = _snapshot_line_for_ref(snapshot, target)
+        if sb_line is not None and "spinbutton" not in sb_line.lower():
+            return ToolResult(
+                False,
+                f"'{args.get('target')}' is not a spinbutton (its snapshot line is: {sb_line[:90]}). "
+                f"set_spinbutton only applies to a numeric stepper (role='spinbutton'). Use fill "
+                f"for text inputs, select_option for dropdowns, or click for buttons.")
+
+        current = spinbutton_current_value(snapshot, target)
+        if current is None:
+            current = 0  # display not parseable -> assume the stepper starts at 0
+        delta = value - current
+        if delta == 0:
+            return ToolResult(True, f"spinbutton '{args.get('target')}' is already {value} — "
+                              f"no clicks needed.")
+        direction = "increase" if delta > 0 else "decrease"
+        clicks = abs(delta)
+        if clicks > self._MAX_CLICKS:
+            return ToolResult(
+                False,
+                f"refusing to click the stepper {clicks} times to go from {current} to {value} "
+                f"(over the {self._MAX_CLICKS}-click safety limit). Re-check the target value; "
+                f"if it really needs that many steps, set it in smaller increments.")
+
+        button_ref = find_stepper_button_ref(snapshot, target, direction)
+        if button_ref is None:
+            return ToolResult(
+                False,
+                f"could not find the '{direction.capitalize()}' button next to spinbutton "
+                f"'{args.get('target')}' in the snapshot. The stepper's Increase/Decrease buttons "
+                f"are siblings of the spinbutton — re-read the live page snapshot and use the "
+                f"button whose label starts with '{direction.capitalize()}'.")
+
+        before = capture_page_snapshot_raw(self._cli) or ""
+        for n in range(clicks):
+            ok, out = self._cli.run("click", button_ref)
+            if ok and output_signals_no_match(out):
+                ok = False
+            if not ok:
+                if output_signals_session_closed(out):
+                    return ToolResult(
+                        False,
+                        f"you tried to set spinbutton '{args.get('target')}' but the browser "
+                        f"session is closed and could not be restored. Call `open_browser`, then "
+                        f"`goto` your URL and continue.")
+                return ToolResult(
+                    False,
+                    f"set spinbutton '{args.get('target')}' partway: clicked {direction.capitalize()} "
+                    f"({button_ref}) {n} of {clicks} times before a click failed: {self._trim(out)}")
+        result = ToolResult(
+            True,
+            f"you set spinbutton '{args.get('target')}' to {value} (clicked {direction.capitalize()} "
+            f"button {button_ref} {clicks} time(s), from {current}).")
+        return _check_dom_delta(self._cli, before, result)
+
+
 class CheckTool(_WebTool):
     name = "check"
     description = "Check a checkbox or radio button (no-op if already checked). " + _REF_NOTE
@@ -1797,6 +1973,7 @@ class SnapshotTool(_WebTool):
 # ``snapshot`` lets the agent explicitly request a fresh page view mid-turn.
 _WEB_TOOL_CLASSES: tuple[type[_WebTool], ...] = (
     GotoTool, ClickTool, FillTool, TypeTool, PressKeyTool, SelectOptionTool,
+    SetSpinbuttonTool,
     CheckTool, UncheckTool, HoverTool, DragTool, UploadTool,
     ReloadTool,
     # Excluded: OpenBrowserTool (goto opens browser automatically),

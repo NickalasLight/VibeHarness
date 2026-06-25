@@ -107,12 +107,10 @@ CRITICAL rules for getting through all 8 steps:
   select_option(target=<ref>, value="2026-07-21") — the harness navigates the calendar
   for you. Confirm the date is set before clicking Continue (the step will not advance
   while a required field is empty).
-- Years-of-experience are number STEPPERS (spinbutton). NEVER use fill or select_option
-  on the spinbutton ref — that does nothing. Instead click the INCREASE BUTTON that is
-  shown as a sibling in the snapshot with aria-label "Increase Total years of professional
-  experience" (or "Increase Years of C# / .NET experience"). Click it NINE times for each
-  field. You can batch all 9 clicks in a single turn. Do NOT click the spinbutton container
-  itself (that only focuses it without changing the value).
+- Years-of-experience are number STEPPERS (spinbutton). Use the set_spinbutton tool:
+  set_spinbutton(target=<spinbutton_ref>, value=9) — this sets the value in one call.
+  The spinbutton ref is the element with role="spinbutton" (NOT the Increase/Decrease buttons).
+  Do NOT use fill, select_option, or click on the spinbutton container.
 - Skills are toggle buttons: click each skill button that matches the candidate's skills.
 - On each step, fill EVERY required field, then click "Continue →". On the final
   "Review & Submit" step, tick the certification/consent checkboxes, enter the signature

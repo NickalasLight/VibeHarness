@@ -20,6 +20,7 @@ from vibeharness.config import Config
 from vibeharness.web import (
     PlaywrightCli, WebToolset,
     GotoTool, ClickTool, FillTool, TypeTool, PressKeyTool, SelectOptionTool,
+    SetSpinbuttonTool,
     CheckTool, UncheckTool, HoverTool, DragTool, UploadTool,
     ScreenshotTool, NavigateBackTool, NavigateForwardTool, ReloadTool,
     _WEB_TOOL_CLASSES,
@@ -387,6 +388,108 @@ class OpenListboxTargetTest(unittest.TestCase):
         from vibeharness.web import target_is_open_listbox
         self.assertFalse(target_is_open_listbox(self.LISTBOX_SNAP, "e999"))
         self.assertFalse(target_is_open_listbox("", "e1"))
+
+
+class SetSpinbuttonTest(unittest.TestCase):
+    """iter-5: SetSpinbuttonTool sets a numeric stepper to a target value in ONE call by
+    clicking its Increase/Decrease sibling button (current->target) times in Python, so the
+    model no longer needs N LLM roundtrips (one per click) to reach e.g. 9 years."""
+
+    # A spinbutton at value 0 ("0 yrs") with adjacent Increase/Decrease buttons.
+    SNAP = (
+        '- spinbutton "Total years of professional experience" [ref=e730]: "0 yrs"\n'
+        '- button "Increase Total years of professional experience" [ref=e731] [cursor=pointer]\n'
+        '- button "Decrease Total years of professional experience" [ref=e732] [cursor=pointer]\n'
+    )
+    # A spinbutton already at value 2 (the iter-4 stall state).
+    SNAP_AT_2 = (
+        '- spinbutton "Total years of professional experience" [ref=e730]: "2 yrs"\n'
+        '- button "Increase Total years of professional experience" [ref=e731] [cursor=pointer]\n'
+        '- button "Decrease Total years of professional experience" [ref=e732] [cursor=pointer]\n'
+    )
+
+    class _SpinCli:
+        """Answers `snapshot` with a canned page; records every other call."""
+
+        def __init__(self, snapshot):
+            self._snapshot = snapshot
+            self.calls = []
+
+        def run(self, *args):
+            self.calls.append(list(args))
+            if args and args[0] == "snapshot":
+                return (True, self._snapshot)
+            return (True, "### Page\nok")
+
+    def _make(self, snapshot):
+        cli = self._SpinCli(snapshot)
+        return SetSpinbuttonTool(cli, observation_limit=1000), cli
+
+    def test_value_helper_reads_yrs_display(self):
+        from vibeharness.web import spinbutton_current_value
+        self.assertEqual(spinbutton_current_value(self.SNAP, "e730"), 0)
+        self.assertEqual(spinbutton_current_value(self.SNAP_AT_2, "e730"), 2)
+        self.assertIsNone(spinbutton_current_value(self.SNAP, "e999"))
+
+    def test_value_helper_reads_aria_valuenow(self):
+        from vibeharness.web import spinbutton_current_value
+        snap = '- spinbutton "Years" [ref=e5] [valuenow="7"]\n'
+        self.assertEqual(spinbutton_current_value(snap, "e5"), 7)
+
+    def test_find_increase_button(self):
+        from vibeharness.web import find_stepper_button_ref
+        self.assertEqual(find_stepper_button_ref(self.SNAP, "e730", "increase"), "e731")
+        self.assertEqual(find_stepper_button_ref(self.SNAP, "e730", "decrease"), "e732")
+
+    def test_sets_from_zero_clicks_increase_n_times(self):
+        tool, cli = self._make(self.SNAP)
+        res = tool.run({"target": "e730", "value": 9})
+        self.assertTrue(res.ok)
+        clicks = [c for c in cli.calls if c[:1] == ["click"]]
+        self.assertEqual(clicks, [["click", "e731"]] * 9)
+        self.assertIn("9", res.observation)
+
+    def test_sets_from_current_value_clicks_delta_only(self):
+        # Already at 2 -> needs only 7 more Increase clicks to reach 9 (iter-4 recovery).
+        tool, cli = self._make(self.SNAP_AT_2)
+        res = tool.run({"target": "e730", "value": 9})
+        self.assertTrue(res.ok)
+        clicks = [c for c in cli.calls if c[:1] == ["click"]]
+        self.assertEqual(clicks, [["click", "e731"]] * 7)
+
+    def test_decrease_when_target_below_current(self):
+        tool, cli = self._make(self.SNAP_AT_2)
+        res = tool.run({"target": "e730", "value": 0})
+        self.assertTrue(res.ok)
+        clicks = [c for c in cli.calls if c[:1] == ["click"]]
+        self.assertEqual(clicks, [["click", "e732"]] * 2)
+
+    def test_no_clicks_when_already_at_target(self):
+        tool, cli = self._make(self.SNAP_AT_2)
+        res = tool.run({"target": "e730", "value": 2})
+        self.assertTrue(res.ok)
+        self.assertEqual([c for c in cli.calls if c[:1] == ["click"]], [])
+
+    def test_rejects_runaway_delta(self):
+        tool, cli = self._make(self.SNAP)
+        res = tool.run({"target": "e730", "value": 999})
+        self.assertFalse(res.ok)
+        self.assertEqual([c for c in cli.calls if c[:1] == ["click"]], [])
+
+    def test_rejects_missing_ref_on_page(self):
+        tool, cli = self._make(self.SNAP)
+        res = tool.run({"target": "e999", "value": 9})
+        self.assertFalse(res.ok)
+        self.assertEqual([c for c in cli.calls if c[:1] == ["click"]], [])
+
+    def test_missing_value_param_guarded(self):
+        tool, cli = self._make(self.SNAP)
+        res = tool.run({"target": "e730"})
+        self.assertFalse(res.ok)
+        self.assertIn("value", res.observation)
+
+    def test_registered_in_toolset(self):
+        self.assertIn(SetSpinbuttonTool, _WEB_TOOL_CLASSES)
 
 
 class CalendarNavigationTest(unittest.TestCase):
