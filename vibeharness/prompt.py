@@ -120,16 +120,13 @@ class SystemPromptBuilder:
               include_tool_guidance: bool = True, native_tools: bool = False) -> str:
         """Render the system prompt: header (task + workspace) + body.
 
-        Issue #146: the live page snapshot is NO LONGER part of the system prompt.
-        Every major web-agent benchmark (WebArena, VisualWebArena, SeeAct, AgentBench,
-        WorkArena, browser-use) places the live page observation in a USER turn, never
-        the system prompt; "Lost in the Middle" (arXiv:2307.03172) shows LLMs attend
-        best to the START and END of the input, so the fast-changing snapshot is moved
-        to the very END of the user turn (the recency slot — see ``RalphAgent.run``).
-        The ``page`` parameter is KEPT for backwards compatibility but is now IGNORED:
-        no ``# Current page`` section is added here. Callers that still need the
-        snapshot rendered as a section (the validator context — issue #57) append it
-        themselves around this builder (see ``cli.render_page_section``).
+        The live page snapshot is NOT rendered in the system prompt. It is captured
+        once after all tool calls execute and appended as a role:tool "page_snapshot"
+        observation (see ``RalphAgent.run``). Only the most recent snapshot is kept in
+        the stateful chat history (older ones are evicted). The ``page`` parameter is
+        kept for backwards compatibility (the validator context path appends it as a
+        ``# Current page`` section — see ``cli.render_page_section``) but has no effect
+        on the main agent's system prompt.
 
         When ``include_tool_guidance`` is False, the body — the `# How the loop works`
         / codec format-instruction block, the `# Tools` docs, AND the
@@ -189,38 +186,12 @@ class SystemPromptBuilder:
             # A snapshot of the working directory, refreshed every turn so newly
             # created files show up next turn. Sits right after the task block.
             header += f"# Workspace\n{workspace}\n\n---\n\n"
-        # Issue #146: the live page snapshot is intentionally NOT rendered here anymore.
-        # It now lives at the END of the user turn (the high-attention recency slot — see
-        # ``RalphAgent.run`` and ``cli.render_page_section``). ``page`` is accepted for
-        # backwards compatibility but ignored; passing it has no effect on the prompt.
+        # The live page snapshot is NOT rendered in the system prompt. It is captured
+        # once after all tool calls execute (1 s wait) and appended as a role:tool
+        # "page_snapshot" observation — see RalphAgent._evict_old_page_snapshot and
+        # the post-turn capture in RalphAgent.run(). The ``page`` parameter is kept for
+        # backwards compatibility (validator context path) but is NOT used here.
         return header + body if header else body
-
-
-# Issue #146: the marker that identifies a live-snapshot block appended to a USER turn.
-# History pruning scans for this exact substring to strip stale snapshots, and the user-
-# turn appender / validator section renderer build their headings from it, so the three
-# stay in lock-step. Changing the wording here updates all three at once.
-SNAPSHOT_USER_MARKER = "## Current page (live snapshot"
-
-# The placeholder that replaces a pruned snapshot block in older user turns, so old
-# observations (tool results) survive in history while only the LATEST snapshot is shown.
-SNAPSHOT_PRUNED_PLACEHOLDER = (
-    "[page snapshot removed — only the latest snapshot is shown in the current turn]")
-
-
-def append_snapshot_to_user(user: str, snapshot: str) -> str:
-    """Append the live page snapshot to the END of a user-turn message (issue #146).
-
-    Placed at the very end so it occupies the high-attention recency slot ("Lost in the
-    Middle", arXiv:2307.03172) — the model attends most strongly to the most recent
-    content, which is exactly where the fast-changing page state belongs. Returns ``user``
-    unchanged when there is no snapshot this turn (web inactive, or the budget left no
-    room — issue #43), so non-web runs and overflow turns are unaffected."""
-    if not snapshot:
-        return user
-    return (f"{user}\n\n---\n"
-            f"{SNAPSHOT_USER_MARKER} — what the page looks like RIGHT NOW after your "
-            f"last actions)\n{snapshot}")
 
 
 def render_page_section(page: str) -> str:

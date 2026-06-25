@@ -467,7 +467,7 @@ def make_system_prompt_provider(builder, config, task, render_workspace,
 
     Issue #146: the budgeted snapshot is NO LONGER injected into the system prompt for
     the MAIN agent — it is appended to the END of the user turn instead (see
-    ``RalphAgent.run`` / ``make_user_snapshot_provider``). To preserve the validator
+    ``RalphAgent.run``). To preserve the validator
     path (issue #57), the TOOL-LESS variant (``include_tool_guidance=False``) STILL
     renders the page as a `# Current page` section appended to the returned context, so
     the validator sees the same budgeted snapshot the agent saw. The full-tool variant
@@ -508,28 +508,6 @@ def make_system_prompt_provider(builder, config, task, render_workspace,
     return provider
 
 
-def make_user_snapshot_provider(builder, config, task, render_workspace,
-                                raw_snapshot_provider, native_tools=False, cache=None):
-    """Build the per-turn provider of the budgeted snapshot to append to the USER turn.
-
-    Issue #146: the live snapshot now lives at the END of the user turn (the recency
-    slot), not the system prompt. RalphAgent calls this with the per-turn ``user``
-    message; it returns the SAME dynamically-budgeted snapshot text (#43) that the
-    system-prompt provider sizes against the rest of the message, computed via the
-    shared ``_budget_snapshot_for_turn`` core so the two never disagree. Returns "" when
-    there is no live page this turn (web inactive) or the budget left no room.
-
-    ``cache`` is the SAME one-entry memo passed to the matching system-prompt provider,
-    so the snapshot is captured ONCE per turn and both providers see identical bytes.
-
-    Built with ``include_tool_guidance=True`` so the budget is sized against the FULL
-    (tooled) system prompt — exactly what the model receives at request time."""
-    def provider(user: str = "") -> str:
-        _rest_system, page, _raw = _budget_snapshot_for_turn(
-            builder, config, task, render_workspace, raw_snapshot_provider, user,
-            include_tool_guidance=True, native_tools=native_tools, cache=cache)
-        return page
-    return provider
 
 
 def _run_locked(args, task, config, registry, codec, names, workdir, logger,
@@ -608,36 +586,28 @@ def _run_locked(args, task, config, registry, codec, names, workdir, logger,
         and codec.tools(registry) is not None
     )
 
-    # Issue #146: the live snapshot now rides the END of the USER turn (the recency
-    # slot), not the system prompt. The system-prompt provider and the user-turn
-    # snapshot provider share a one-entry per-turn cache so the page is captured ONCE
-    # per turn and both see identical bytes (a live capture is costly and could drift).
+    # Per-turn snapshot budget cache: shared by the system-prompt provider (diagnostics +
+    # workspace) and the validator context provider. The post-turn snapshot (appended as
+    # a role:tool observation by the agent after tools execute) is a SEPARATE capture
+    # with its own timing, so it does not share this cache.
     _turn_snapshot_cache: dict = {}
-    # The per-turn provider applies #43's dynamic snapshot budget AND, given the
-    # logger, performs #37's per-turn diagnostic dump (raw snapshot + injected prompt).
-    # It NO LONGER injects the page into the (tooled) system prompt — that is appended to
-    # the user turn by the snapshot provider below.
+    # The per-turn provider rebuilds the system prompt each turn (workspace tree refresh)
+    # and runs #37 diagnostics. It does NOT inject the page snapshot into the system
+    # prompt — the snapshot now rides the final tool observation instead (see agent.py).
     system_prompt_provider = make_system_prompt_provider(
         builder, config, task, render_workspace, raw_snapshot_provider, logger,
         native_tools=native_tools, cache=_turn_snapshot_cache)
-    # Issue #146: the budgeted snapshot to append to the END of each user turn.
-    user_snapshot_provider = make_user_snapshot_provider(
-        builder, config, task, render_workspace, raw_snapshot_provider,
-        native_tools=native_tools, cache=_turn_snapshot_cache)
     # Issue #57: a TOOL-LESS twin of the same per-turn prompt to feed the validator —
     # task + workspace + the same #43-budgeted page snapshot (appended as a `# Current
-    # page` section, since #146 took it out of the system prompt), with the tool
-    # descriptions / format-instruction block stripped, so the validator sees the real
-    # context the agent had (no self-claim). A SEPARATE cache (its capture happens at a
-    # different point — validate-time — so it should re-read the page). No logger here so
-    # it never double-dumps a turn's diagnostics.
+    # page` section), with the tool descriptions / format-instruction block stripped.
+    # A SEPARATE cache so its capture happens fresh at validate-time.
     validator_context_provider = make_system_prompt_provider(
         builder, config, task, render_workspace, raw_snapshot_provider,
         logger=None, include_tool_guidance=False, cache={})
     agent = RalphAgent(client, registry, system_prompt, config, validator,
                        reporter=reporter, system_prompt_provider=system_prompt_provider,
                        codec=codec, validator_context_provider=validator_context_provider,
-                       snapshot_provider=user_snapshot_provider)
+                       raw_snapshot_provider=raw_snapshot_provider)
 
     # Advisor advice buffer: the checkpoint populates it after N accumulated tool calls;
     # advice_provider drains it once at the start of the next turn.
@@ -692,6 +662,7 @@ def _run_locked(args, task, config, registry, codec, names, workdir, logger,
                            advice_provider=advice_provider if advisor else None)
     except OllamaUnavailable as e:
         print(f"\nerror: {e}", file=sys.stderr)
+        _save_run_score(logger, task, config, result)
         return 1   # the start/streamed log on disk already holds the last known state
     finally:
         # Reap every toolset, swallowing per-toolset errors, so one failing teardown
@@ -704,7 +675,7 @@ def _run_locked(args, task, config, registry, codec, names, workdir, logger,
 
     reporter.run_end(result)
     _safe_log(logger, task, config, result)   # final write
-    _save_run_score(logger, task, config, result)
+    _save_run_score(logger, task, config, result)  # always write score row
     return 0 if result.finished else 2
 
 
