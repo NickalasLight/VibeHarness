@@ -40,7 +40,10 @@ class Config:
 
     # loop
     max_steps: int = 15               # <= 0 means unlimited
-    max_actions_per_turn: int = 5     # cap tool calls per turn; 0 = unlimited
+    # arXiv:2602.07359 (W&D): 3 calls/turn is the empirical accuracy peak for web agents
+    # (68% vs 60% at 5, despite 5 needing fewer turns). For sub-7B models (qwen3:4b),
+    # parallel-call reliability is weaker than frontier models — 3 is the safer ceiling.
+    max_actions_per_turn: int = 3     # cap tool calls per turn; 0 = unlimited
 
     # Per-turn wall-clock budget (seconds). 0 (default) disables the guard,
     # preserving the original behaviour exactly: decide() is called inline with no
