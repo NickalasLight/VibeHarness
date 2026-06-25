@@ -13,7 +13,7 @@ fill the form. You do NOT need to read any file for the candidate's data.
 - First name: Jason
 - Last name: Statham
 - Email: jason.statham.dev@example.com
-- Phone: +1 (214) 555-0199
+- Phone: +1 (214) 555-0199  ← type EXACTLY this string including the "+1" prefix
 - Address: 1820 McKinney Avenue, Apt 14C
 - City: Dallas — State: TX (use TWO-LETTER abbreviation 'TX', NOT 'Texas') — ZIP/postal code: 75201 — Country: United States
 - LinkedIn: https://www.linkedin.com/in/jason-statham-dotnet
@@ -39,8 +39,17 @@ fill the form. You do NOT need to read any file for the candidate's data.
 2. Software Engineer II — Brazos Software Group, Austin TX (Jun 2018–Feb 2021): ASP.NET Core Web APIs for a B2B invoicing platform (12,000 merchants); migrated a .NET Framework monolith to containerized .NET Core on Azure AKS; gRPC contracts; Azure DevOps CI/CD.
 3. Software Engineer — Trinity Web Solutions, Dallas TX (Jul 2016–May 2018): C#/ASP.NET MVC logistics apps; normalized SQL Server schemas + stored procedures; xUnit tests.
 
+**On the Experience & Skills page, fill fields IN THIS ORDER before clicking skills:**
+  1. Current title, current company (textboxes)
+  2. set_spinbutton for total years (value=9) and .NET years (value=9)
+  3. Salary expectation: fill the salary textbox/spinbutton with 165000
+  4. LinkedIn profile URL: fill with https://www.linkedin.com/in/jason-statham-dotnet
+  5. Portfolio / GitHub URL: fill with https://github.com/jstatham-dev
+  THEN click skill buttons (below). Do NOT skip salary/LinkedIn/GitHub.
+
 **Skills:** The skills step shows TOGGLE BUTTONS — use click (NOT select_option) on each
-button to select it. Click each of these EXACT button labels (copy text exactly):
+button to select it. The per-turn action limit is 12 — split skill clicks across 2 turns.
+Click ONLY these EXACT button labels (do NOT click any other skill button like "Blazor"):
   "C#", ".NET / .NET Core", "ASP.NET Core", "Web API", "Entity Framework Core",
   "SQL Server", "Azure", "Microservices", "Docker / Kubernetes", "CI/CD", "gRPC",
   "RabbitMQ / Kafka", "Unit Testing (xUnit/NUnit)", "Domain-Driven Design"
@@ -49,7 +58,7 @@ button to select it. Click each of these EXACT button labels (copy text exactly)
 - Degree: Bachelor of Science in Computer Science (if a degree dropdown is shown, pick "Bachelor's Degree")
 - School: The University of Texas at Dallas
 - Field of study: Computer Science
-- Graduation: May 2016
+- Graduation date: use select_option with EXACT ISO value "2016-05-01" — the harness navigates the calendar for you. Do NOT pass "May 2016" — that does NOT work.
 
 **Additional questions**
 - Why interested: "FlashTec's bet on .NET, Azure, and event-driven architecture to move real money at five-nines reliability is exactly the problem space I have spent my career in. I want to bring my payments and ledger experience to a Dallas-based platform team where I can own high-throughput services end-to-end and mentor the next generation of engineers."
