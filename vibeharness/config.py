@@ -41,7 +41,7 @@ class Config:
 
     # loop
     max_steps: int = 15               # <= 0 means unlimited
-    max_actions_per_turn: int = 0     # 0 = unlimited tool calls per turn; set > 0 to cap
+    max_actions_per_turn: int = 5     # cap tool calls per turn; 0 = unlimited
 
     # Per-turn wall-clock budget (seconds). 0 (default) disables the guard,
     # preserving the original behaviour exactly: decide() is called inline with no
