@@ -18,6 +18,7 @@ import itertools
 import json
 import re
 import threading
+import time
 from dataclasses import asdict, dataclass, field
 
 from typing import Callable
@@ -296,7 +297,9 @@ class RalphAgent:
                             f"action(s) were NOT executed — re-issue them on your NEXT turn "
                             f"with the SAME tools and exact values: {dropped_desc}"
                         ), ok=False), memory)
-                    for tool_name, args in actions:
+                    for _ti, (tool_name, args) in enumerate(actions):
+                        if _ti > 0:
+                            time.sleep(1)  # 1-second safety gap between batched calls
                         if tool_name == "validate":
                             self._validate(args, turn, memory, result, user)
                             if result.finished:

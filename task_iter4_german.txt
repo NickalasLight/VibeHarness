@@ -2,11 +2,12 @@
 
 Apply for the following job on behalf of the candidate below.
 
-**Job URL:** http://localhost:3000/careers/senior-csharp-developer-wien-FILL-2024-0001
+**Job URL:** https://www.fill.co.at/de/karriere/entdecke-deinen-job-bei-fill/senior-softwareentwickler-in-c-net
 
 ## Candidate Information
 
 - Name: Jakob Steinberg
+- Gender: Male (Männlich)
 - Date of Birth: 1990-03-15
 - Nationality: German (Deutschland)
 - Address: Mariahilfer Straße 45, 1060 Wien, Austria
@@ -24,4 +25,33 @@ Apply for the following job on behalf of the candidate below.
 
 Complete the full application form and submit it. Use only the candidate information provided above — do not invent any details. If a required field has no value listed here, leave it blank rather than making something up.
 
-You are done when the application has been submitted and the page confirms it was received.
+You are done when the application has been submitted and the page confirms it was received (look for "Vielen Dank" or a confirmation/thank-you message).
+
+## How this form works
+
+The application is a **multi-step modal wizard** that opens after clicking "Bewirb dich" on the job page. The form has multiple steps that you navigate through using "Weiter" (Continue) or "Absenden" (Submit) buttons.
+
+**IMPORTANT — page order is NOT fixed and may vary.** Do NOT assume a specific page sequence. Instead, READ the current snapshot carefully each turn to identify:
+- What fields are visible RIGHT NOW on the current page
+- What the current step/page title says
+- What button advances you (typically "Weiter" or "Absenden")
+
+## Possible page types you may encounter (in any order)
+
+The wizard may include pages covering some or all of these topics — adapt to whatever the snapshot shows:
+
+- **Personal data**: name, email, phone, address fields
+- **Documents / uploads**: CV, cover letter, or other file uploads
+  - FILE UPLOAD SEQUENCE: (1) click the upload trigger button to open the file chooser, THEN (2) call the upload tool with the absolute file path. Never call upload without the file chooser being open first.
+- **Message / cover message**: a free-text message or motivation field
+- **Source / referral**: how did you hear about the position (use "Sonstiges")
+- **Confirmation / review**: final review before submission
+
+## Key rules
+
+- Read the CURRENT snapshot before every action — refs change completely between steps.
+- NEVER guess or increment a ref (e.g. do NOT try e208 because you used e207).
+- If a cookie/consent banner appears, dismiss it first before interacting with the form.
+- After clicking "Weiter" or "Absenden", the page refreshes with entirely new refs — re-read the snapshot.
+- If a page shows a field you have no data for, leave it empty rather than inventing a value.
+- On the final page, click "Absenden" to submit. Confirm the submission succeeded (thank-you message or URL change).

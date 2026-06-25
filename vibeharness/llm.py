@@ -122,8 +122,8 @@ class OllamaClient(LLMClient):
         # reasoning pass only produces a discarded duplicate call. The codec parses the
         # call from the full output; there is no separate reasoning to stream/keep.
         if not self._cfg.two_phase:
-            action = self._chat(system, user, constraint, on_action)
-            return Decision(reasoning="", action_json=action)
+            action, thinking = self._chat(system, user, constraint, on_action, on_reason)
+            return Decision(reasoning=thinking, action_json=action)
         reasoning = self._reason(system, user, on_reason)
         action = self._act(system, user, reasoning, constraint, on_action)
         return Decision(reasoning=reasoning, action_json=action)
@@ -180,13 +180,14 @@ class OllamaClient(LLMClient):
 
     # ---- single-phase: one native chat generation (#125, two_phase=False) ----
     def _chat(self, system: str, user: str, constraint: DecodeConstraint,
-              on_token: TokenSink | None) -> str:
+              on_token: TokenSink | None,
+              on_reason: TokenSink | None = None) -> "tuple[str, str]":
         """One /api/chat generation that yields the tool call directly.
 
-        Uses the model's native chat template (system + user -> assistant), greedy for
-        verbatim string fidelity, with a generous budget so any short preamble plus the
-        tool-call JSON fit. The codec's tolerant parse() extracts the call from the
-        output (``<tool_call>`` block, ```json fence, or bare/array JSON)."""
+        Returns ``(content, thinking)`` so callers get the thinking trace too.
+        Routes through :meth:`_stream_chat` so ``message.thinking`` (qwen3 reasoning
+        tokens) is captured and forwarded to ``on_reason`` instead of being silently
+        discarded. The codec's tolerant parse() extracts the call from the content."""
         payload = {
             "model": self._cfg.model,
             "messages": [
@@ -201,7 +202,8 @@ class OllamaClient(LLMClient):
         # Honour a JSON-schema constraint if a codec supplies one (hermes does not).
         if constraint.json_schema is not None:
             payload["format"] = constraint.json_schema
-        return self._stream("/api/chat", payload, on_token).strip()
+        content, _, thinking = self._stream_chat(payload, on_token, on_reason)
+        return content.strip(), thinking
 
     # ---- phase 1: free reasoning, stop at </think> ----
     def _reason(self, system: str, user: str, on_token: TokenSink | None) -> str:

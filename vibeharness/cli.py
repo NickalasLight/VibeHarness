@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import argparse
 import itertools
+import json
 import os
+import re
 import sys
 from dataclasses import replace
 from datetime import datetime
@@ -638,7 +640,69 @@ def _run_locked(args, task, config, registry, codec, names, workdir, logger,
 
     reporter.run_end(result)
     _safe_log(logger, task, config, result)   # final write
+    _save_run_score(logger, task, config, result)
     return 0 if result.finished else 2
+
+
+def _save_run_score(logger: RunLogger, task: str, config: Config, result) -> None:
+    """Compute and append a score entry to .vibe/scores.jsonl after every run."""
+    try:
+        fields_set: dict = {}
+        page_advances = 0
+        ok_count = 0
+        fail_count = 0
+        steps_seen: set = set()
+        for t in result.turns:
+            for a in t.actions:
+                if a.ok:
+                    ok_count += 1
+                else:
+                    fail_count += 1
+                obs = a.observation or ""
+                for m in re.finditer(r"Step (\d+) of 8", obs):
+                    steps_seen.add(int(m.group(1)))
+                if not a.ok:
+                    continue
+                args = a.args or {}
+                tgt = args.get("target", "")
+                if a.tool in ("fill", "type"):
+                    val = args.get("text") or args.get("value") or ""
+                    if val:
+                        fields_set[(tgt, val)] = val
+                elif a.tool == "select_option":
+                    val = args.get("value", "")
+                    if "selected" in obs and "combobox" in obs and val:
+                        fields_set[(tgt, val)] = val
+                elif a.tool == "check":
+                    fields_set[(tgt, "checked")] = "checked"
+                elif a.tool == "click":
+                    if any(kw in obs for kw in ("PAGE CHANGED", "Continue", "Next", "Submit", "Review")):
+                        page_advances += 1
+        max_step = max(steps_seen) if steps_seen else 1
+        page_advances = max(page_advances, max_step - 1)
+        unique_fields = len(fields_set)
+        score = unique_fields + 10 * page_advances
+        entry = {
+            "stamp": logger.stamp,
+            "log": str(logger.json_path),
+            "finished": result.finished,
+            "turns": len(result.turns),
+            "ok_actions": ok_count,
+            "fail_actions": fail_count,
+            "unique_fields": unique_fields,
+            "page_advances": page_advances,
+            "max_step": max_step,
+            "score": score,
+            "model": config.model,
+        }
+        scores_path = logger.dir / "scores.jsonl"
+        scores_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(scores_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry) + "\n")
+        print(f"\nscore: {unique_fields} fields + {10*page_advances} page-bonus = {score}"
+              f"  (step {max_step}/8, {'FINISHED' if result.finished else 'incomplete'})")
+    except Exception as e:
+        print(f"\nwarning: could not save run score ({type(e).__name__}: {e})", file=sys.stderr)
 
 
 def _safe_log(logger: RunLogger, task: str, config: Config, result) -> None:

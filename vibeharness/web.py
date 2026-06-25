@@ -290,6 +290,20 @@ def calendar_view_month(snapshot: str) -> tuple[int, int] | None:
     return int(m.group(2)), month
 
 
+_SNAPSHOT_FILELINK_RE = re.compile(
+    r"\n?###\s+Snapshot\s*\n\s*-\s*\[Snapshot\]\([^)]+\.yml\)\s*\n?",
+    re.IGNORECASE,
+)
+
+def _strip_snapshot_filelink(text: str) -> str:
+    """Remove the '### Snapshot\\n- [Snapshot](.playwright-cli/page-*.yml)' block
+    that playwright-cli emits in action stdout. The file-path link is useless to
+    the model — the real ARIA content is delivered through the auto-injected per-turn
+    '# Current page' snapshot and DOM-delta blocks; passing a dangling .yml path only
+    confuses the model into thinking the snapshot IS the file reference."""
+    return _SNAPSHOT_FILELINK_RE.sub("\n", text).strip()
+
+
 def output_signals_no_match(output: str) -> bool:
     """True when playwright-cli's (exit-0) output text indicates the action hit no
     element — a ref/selector that resolved to nothing. The CLI reports these as an
@@ -878,8 +892,8 @@ class _WebTool(Tool):
             ok = False
         if not ok:
             return ToolResult(False, f"you tried to {self._verb} {subject} but it failed: "
-                              f"{self._trim(output)}")
-        return ToolResult(True, f"you {self._verb} {subject}. Result:\n{self._trim(output)}")
+                              f"{self._trim(_strip_snapshot_filelink(output))}")
+        return ToolResult(True, f"you {self._verb} {subject}. Result:\n{self._trim(_strip_snapshot_filelink(output))}")
 
     def run(self, args: dict) -> ToolResult:
         """Public entry point. Wraps ``_run_impl`` with optional DOM-change detection.
