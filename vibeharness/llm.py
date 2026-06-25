@@ -132,24 +132,46 @@ class OllamaClient(LLMClient):
                     constraint: DecodeConstraint,
                     on_reason: TokenSink | None = None,
                     on_action: TokenSink | None = None) -> Decision:
-        """Two-phase native /api/chat: cap Qwen3 thinking, then get the tool call.
+        """Native /api/chat with optional thinking cap.
 
-        Phase 1 — thinking cap: sends ``messages`` WITHOUT tools, stops at ``</think>``
-        OR ``thinking_budget`` tokens (whichever comes first). Thinking tokens come
-        through ``message.thinking`` and are forwarded to ``on_reason``. This is the
-        reliable alternative to ``think:False`` (which qwen3:4b ignores in some Ollama
-        versions; see Ollama issue #12917 and arXiv:2505.09388 §4.2).
+        When ``config.two_phase`` is False (the default on ``beta_qwen3coder``): sends a
+        single /api/chat request with ``tools:`` and ``think:False``. The model's thinking
+        — if any, since qwen3:4b ignores ``think:False`` in some Ollama versions (issue
+        #12917) — flows through ``message.thinking`` to ``on_reason`` and is stored in
+        ``Decision.reasoning`` for display, but is never replayed as a prefill. This is
+        the reliable path: no assistant-prefill bug (Ollama #14493), no truncated-thinking
+        confusion, turn-1 always produces tool calls.
 
-        Phase 2 — tool call: appends the capped thinking as ``{"role":"assistant",
-        "content":"<think>…</think>"}`` so the model "sees" its thinking is complete,
-        then calls /api/chat WITH the enveloped ``tools`` schema and streams the tool
-        call to ``on_action``.  The ``two_phase`` flag (VibeThinker) is intentionally
-        NOT used here — VibeThinker gets confused by enveloped tool schemas and keeps the
-        legacy :meth:`decide` path. This method is ONLY for the native-tools base agent."""
-        # Phase 1: cap thinking.
-        # _stream_chat reads message.thinking -> thinking_parts and fires on_reason.
-        # stop=["</think>"] fires at the raw token level even when thinking is routed to
-        # message.thinking (not message.content), so the generation halts correctly.
+        When ``config.two_phase`` is True (VibeThinker / future use): two-phase thinking
+        cap. Phase 1 caps thinking at ``thinking_budget`` tokens; Phase 2 replays the
+        capped thinking as ``{"role":"assistant","content":"<think>…</think>"}`` so the
+        model sees its reasoning complete and proceeds to the tool call. Only use for
+        models whose thinking MUST be bounded before the tool call, AND where Ollama's
+        assistant-prefill rendering does not close the turn prematurely. NOT used by
+        default on this branch because: (a) ``Config.two_phase = False`` and (b) the
+        prefill approach produced empty Phase 2 output on the first turn when thinking
+        was truncated mid-sentence at the budget (Ollama #14493-class bug)."""
+        if not self._cfg.two_phase:
+            # Single-phase: one native /api/chat call with tools. Thinking tokens from
+            # message.thinking are forwarded to on_reason for display.
+            payload: dict = {
+                "model": self._cfg.model,
+                "messages": messages,
+                "think": False,
+                "options": {**self._options(),
+                            "temperature": self._cfg.action_temperature,
+                            "num_predict": self._cfg.action_tokens,
+                            "stop": list(constraint.stop)},
+            }
+            if tools:
+                payload["tools"] = tools
+            if constraint.json_schema is not None:
+                payload["format"] = constraint.json_schema
+            content, tool_calls, thinking = self._stream_chat(payload, on_action, on_reason)
+            return Decision(reasoning=thinking, action_json=content.strip(),
+                            tool_calls=tuple(tool_calls))
+
+        # Two-phase: cap thinking then replay as prefill (two_phase=True only).
         _, _, thinking = self._stream_chat({
             "model": self._cfg.model,
             "messages": messages,
@@ -158,9 +180,6 @@ class OllamaClient(LLMClient):
                         "stop": ["</think>"]},
         }, on_token=None, on_reason=on_reason)
 
-        # Phase 2: tool call with capped thinking replayed as assistant prefix.
-        # Wrapping in <think>…</think> signals to the model that reasoning is complete
-        # and it should proceed directly to the tool call.
         prefill = f"<think>\n{thinking}\n</think>" if thinking.strip() else ""
         convo = list(messages) + [{"role": "assistant", "content": prefill}] if prefill else list(messages)
         phase2: dict = {
