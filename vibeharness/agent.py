@@ -359,13 +359,20 @@ class RalphAgent:
                             target = args.get("target", "")
                             value = args.get("text") or args.get("value") or ""
                             if attempted[sig]:
-                                obs = (f"WARNING: '{target}' was already successfully set to "
-                                       f"'{value}' earlier this run. You are now trying to set "
-                                       f"it to '{value}' again — the same value. This is a "
-                                       f"no-op: the field already holds that value. If you "
-                                       f"intended a different value, call {tool_name} with the "
-                                       f"corrected value instead. Otherwise move to the NEXT "
-                                       f"unfilled field or click Next/Continue/Submit.")
+                                if tool_name in ("goto", "reload", "open_browser"):
+                                    url = args.get("url", "")
+                                    obs = (f"WARNING: you already navigated to '{url}' "
+                                           f"successfully. The page is already loaded — "
+                                           f"READ the current page snapshot and interact with "
+                                           f"the elements shown there. Do NOT navigate again.")
+                                else:
+                                    obs = (f"WARNING: '{target}' was already successfully set to "
+                                           f"'{value}' earlier this run. You are now trying to set "
+                                           f"it to '{value}' again — the same value. This is a "
+                                           f"no-op: the field already holds that value. If you "
+                                           f"intended a different value, call {tool_name} with the "
+                                           f"corrected value instead. Otherwise move to the NEXT "
+                                           f"unfilled field or click Next/Continue/Submit.")
                             else:
                                 # Escalating pressure for failure loops on the same target.
                                 count = target_block_counts.get(target, 0) + 1
@@ -712,24 +719,16 @@ class RalphAgent:
             self._record(turn, Action("validate", args, obs, ok=False), memory)
 
     # Only tools whose identical repeat ADVANCES state (each call goes one step further)
-    # are EXEMPT from the anti-loop guard. open_browser / goto(same URL) / reload do NOT
-    # advance on repeat — they RESET (a fresh blank page, or a reload that wipes a
-    # half-filled form), so an identical repeat is a destructive loop and MUST be steered.
-    # (#125 iter 9: the model called open_browser 63x because it was exempt; each call
-    # reset the page to blank and never reached `goto`.)
+    # are EXEMPT from the anti-loop guard.
     _LOOP_EXEMPT_TOOLS = frozenset({"navigate_back", "navigate_forward"})
 
     # Tools whose repetition is NOT a value-set no-op and must NOT be hard-blocked on the
-    # second attempt (iter-1 fix). A CLICK is not a "set field to value" op: re-clicking the
-    # SAME "Continue →"/"Next"/"Submit" button is the CORRECT recovery after the first click
-    # was rejected by client-side validation (e.g. State/Country still empty), and re-clicking
-    # a combobox trigger legitimately re-opens it. In iter-1 the duplicate guard treated the
-    # Continue button (e81) as "already set to ''" and permanently BLOCKED every re-click, so
-    # the run got stuck on page 1 forever once it had fixed the earlier errors. `upload` has
-    # no value to compare and was false-blocked too. For these we still TRACK attempts (so the
-    # escalating failure-loop pressure below can fire after 3 genuine repeats) but we do NOT
-    # block the FIRST repeat: the page may have changed and the action may now succeed.
-    _SOFT_REPEAT_TOOLS = frozenset({"click", "upload"})
+    # second attempt. Includes navigation tools (goto, reload, open_browser): after a page
+    # goes blank or a session dies the model MUST be allowed to re-navigate. We allow up to
+    # _SOFT_REPEAT_LIMIT repeats before steering — enough to recover without infinite loops.
+    # Also includes click/upload as before (re-clicking Continue after validation failure is
+    # the correct recovery; upload has no value to compare).
+    _SOFT_REPEAT_TOOLS = frozenset({"click", "upload", "goto", "reload", "open_browser"})
     # Max identical re-runs allowed for a soft-repeat tool before it is steered. Raised
     # 2 -> 12 (iter-2): a NUMBER-STEPPER (the spinbutton +/- buttons on the Experience step)
     # CANNOT be filled (Playwright: "Element is not an <input>") — the ONLY way to set
