@@ -2,31 +2,31 @@
   "phase": "large_scale_iter_1",
   "issue_number": 158,
   "candidate": "jakob_steinberg",
-  "current_job_index": 1,
-  "current_pid": 29972,
+  "current_job_index": 2,
+  "current_pid": 29660,
   "finished": false,
   "jobs": [
     {
       "id": 1,
       "url": "https://www.karriere.at/jobs/10019804",
+      "status": "failed",
+      "iterations": 1,
+      "escalations": 0,
+      "validator_saves": 0,
+      "estimated_cost_usd": 0.0,
+      "current_log": "C:\\git\\vibethinkharnessProto1\\vibe_karriere_job1.log",
+      "completed_at": "2026-06-25T20:50:02",
+      "notes": "Failed: Jetzt bewerben opened new tab (softgarden.io) but agent stayed on karriere.at, got stuck on karriere.at login modal. Fix: tab-switching instruction added to task file."
+    },
+    {
+      "id": 2,
+      "url": "https://www.karriere.at/jobs/10017465",
       "status": "running",
       "iterations": 0,
       "escalations": 0,
       "validator_saves": 0,
       "estimated_cost_usd": 0.0,
-      "current_log": "C:\\git\\vibethinkharnessProto1\\vibe_karriere_job1.log",
-      "completed_at": null,
-      "notes": ""
-    },
-    {
-      "id": 2,
-      "url": "https://www.karriere.at/jobs/10017465",
-      "status": "pending",
-      "iterations": 0,
-      "escalations": 0,
-      "validator_saves": 0,
-      "estimated_cost_usd": 0.0,
-      "current_log": null,
+      "current_log": "C:\\git\\vibethinkharnessProto1\\vibe_karriere_job2.log",
       "completed_at": null,
       "notes": ""
     },
@@ -116,8 +116,8 @@
     }
   ],
   "metrics_summary": {
-    "total_escalations": 0,
-    "total_validator_saves": 0,
+    "total_escalations": 0.0,
+    "total_validator_saves": 0.0,
     "total_estimated_cost_usd": 0.0,
     "jobs_completed": 0,
     "jobs_total": 9
