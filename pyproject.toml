@@ -17,10 +17,12 @@ classifiers = [
     "Operating System :: OS Independent",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
-dependencies = []  # standard library only
+dependencies = []  # standard library only (the local Ollama path needs nothing)
 
 [project.optional-dependencies]
 dev = ["pytest>=7"]
+# API LLM escalation/validation plugin (z.ai GLM and other OpenAI-compatible APIs)
+api = ["openai>=1.0.0"]
 
 [project.urls]
 Homepage = "https://github.com/NickalasLight/VibeHarness"

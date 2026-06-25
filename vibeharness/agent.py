@@ -20,6 +20,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Callable
 
 from .config import Config
+from .escalation import StuckDetector
 from .llm import LLMClient
 from .memory import NarrativeMemory
 from .prompt import build_turn_prompt
@@ -94,6 +95,7 @@ class RalphAgent:
         memory = NarrativeMemory()
         result = RunResult(task=task)
         schema = self._registry.action_schema()
+        detector = StuckDetector(self._cfg.escalation_stuck_threshold)
 
         # max_steps <= 0 means run until validation passes.
         turns = (itertools.count(1) if self._cfg.max_steps <= 0
@@ -116,11 +118,17 @@ class RalphAgent:
             else:
                 for tool_name, args in actions:
                     if tool_name == "validate":
-                        self._validate(task, args, turn, memory, result)
+                        self._validate(task, args, turn, memory, result, detector)
                         if result.finished:
                             break
                         continue
                     self._record(turn, self._execute(tool_name, args), memory)
+                    # Stuck detection: identical tool call repeated `threshold` times.
+                    if detector.record(tool_name, args):
+                        self._escalate(detector,
+                                       f"Stuck detected after "
+                                       f"{self._cfg.escalation_stuck_threshold} identical "
+                                       f"'{tool_name}' calls.")
 
             if on_turn is not None:          # stream the log after every turn
                 on_turn(result)
@@ -129,9 +137,30 @@ class RalphAgent:
 
         return result
 
+    # ---- escalation ----
+    def _escalate(self, detector: StuckDetector, why: str) -> None:
+        """Swap the live LLM client to the configured escalation API model — same
+        browser, same session, just a stronger model. At most once per run; a no-op
+        if escalation is disabled, already done, or the API key/provider is missing."""
+        if detector.escalated or not self._cfg.escalation_enabled:
+            return
+        detector.escalated = True   # never attempt more than once, even on failure
+        try:
+            from .providers import make_api_client
+            client = make_api_client(self._cfg.escalation_provider,
+                                     self._cfg.escalation_model)
+        except (RuntimeError, KeyError, ImportError) as e:
+            self._reporter.note(f"[ESCALATION] skipped — {e}")
+            return
+        self._client = client
+        self._reporter.note(
+            f"[ESCALATION] {why} Switching to "
+            f"{self._cfg.escalation_provider}:{self._cfg.escalation_model}."
+        )
+
     # ---- validation ----
     def _validate(self, task: str, args: dict, turn: Turn, memory: NarrativeMemory,
-                  result: RunResult) -> None:
+                  result: RunResult, detector: StuckDetector | None = None) -> None:
         self._reporter.note("validating — checking the task against a validator…")
         verdict = self._validator.validate(task, memory.render(), args.get("summary", ""))
         result.validations.append({"turn": turn.index, "passed": verdict.passed,
@@ -145,6 +174,10 @@ class RalphAgent:
             obs = (f"validation FAILED — {verdict.reason} "
                    f"Keep working to address this, then call validate again.")
             self._record(turn, Action("validate", args, obs, ok=False), memory)
+            # Premature validate (the model claimed done before it was) -> escalate.
+            if (detector is not None and self._cfg.escalation_on_premature_validate
+                    and detector.record_premature_validate()):
+                self._escalate(detector, "Premature validate detected.")
 
     # ---- helpers ----
     def _execute(self, tool_name: str | None, args: dict) -> Action:

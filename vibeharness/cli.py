@@ -115,6 +115,11 @@ def cmd_show_config() -> int:
     print(f"  max_steps   = {effective.max_steps}")
     print(f"  top_p       = {effective.top_p}")
     print(f"  top_k       = {effective.top_k}")
+    print(f"  escalation  = {effective.escalation_enabled} "
+          f"({effective.escalation_provider}:{effective.escalation_model}, "
+          f"stuck>={effective.escalation_stuck_threshold})")
+    print(f"  validation  = {effective.validation_provider or '(local)'}"
+          f"{':' + effective.validation_model if effective.validation_provider else ''}")
     return 0
 
 
@@ -166,7 +171,7 @@ def run_agent(args: argparse.Namespace) -> int:
     print(f" toolsets: {', '.join(names)} (+ validate)")
 
     client = OllamaClient(config)
-    validator = LLMValidator(client)
+    validator = LLMValidator(_build_validator_client(config, fallback=client))
     agent = RalphAgent(client, registry, system_prompt, config, validator, reporter=reporter)
 
     started = datetime.now()
@@ -191,6 +196,22 @@ def run_agent(args: argparse.Namespace) -> int:
     _safe_log(logger, task, config, result)   # final write
     print(f" log: {logger.json_path}")
     return 0 if result.finished else 2
+
+
+def _build_validator_client(config: Config, fallback):
+    """The validator runs on the configured API model by default for a stronger,
+    independent verdict. Falls back to the main (local) client when no validation
+    provider is configured or the provider/api key is unavailable — so the harness
+    still works with no env var set."""
+    provider = (config.validation_provider or "").strip()
+    if not provider:
+        return fallback
+    try:
+        from .providers import make_api_client
+        return make_api_client(provider, config.validation_model)
+    except (RuntimeError, KeyError, ImportError) as e:
+        print(f" validator: using local model (API validator unavailable — {e})")
+        return fallback
 
 
 def _safe_log(logger: RunLogger, task: str, config: Config, result) -> None:

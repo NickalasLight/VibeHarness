@@ -37,3 +37,19 @@ class Config:
     web_observation_char_limit: int = 4000
     web_headless: bool = False        # headed by default so a human can watch
     web_browser: str = "chrome"
+
+    # --- Escalation / API provider ---
+    # When the local model gets stuck, the agent swaps its LLM client to an
+    # external API model (same browser/session) for a stronger second attempt.
+    # base_url / api_key_env live in providers.PROVIDERS, NOT here — no secrets in Config.
+    escalation_enabled: bool = True
+    escalation_provider: str = "zhipuai"
+    escalation_model: str = "glm-5.2"
+    escalation_stuck_threshold: int = 3       # consecutive identical tool calls -> stuck
+    escalation_on_premature_validate: bool = True  # escalate on first premature validate
+
+    # --- Validation provider ---
+    # The validator uses this API model by default for an independent verdict. Leave
+    # validation_provider blank ("") to fall back to the main (local) client.
+    validation_provider: str = "zhipuai"
+    validation_model: str = "glm-5.2"
