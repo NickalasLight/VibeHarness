@@ -530,7 +530,20 @@ def _run_locked(args, task, config, registry, codec, names, workdir, logger,
         advisor = None
 
     client = OllamaClient(config)
-    validator = LLMValidator(client, logger=logger, config=config)
+
+    # Validator uses the API model by default (stronger, independent verdict).
+    # Falls back to the local Ollama client when the provider/key is unavailable.
+    _validator_client = client
+    if config.validation_provider:
+        try:
+            from .providers import api_key_present, get_provider, make_api_client
+            _vp = get_provider(config.validation_provider)
+            if api_key_present(_vp):
+                _validator_client = make_api_client(
+                    config.validation_provider, config.validation_model or None)
+        except Exception:
+            pass  # provider unknown or openai missing — use local client silently
+    validator = LLMValidator(_validator_client, logger=logger, config=config)
 
     # Refresh the system prompt every turn so its "# Workspace" section reflects
     # files the agent creates as it goes. Scanning Path.cwd() each call (rather

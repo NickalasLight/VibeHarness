@@ -32,6 +32,7 @@ _TOOL_BLOCK_RE = re.compile(
 
 from .codec import ToolCallCodec, get_codec
 from .config import Config
+from .escalation import StuckDetector
 from .llm import Decision, LLMClient
 from .memory import NarrativeMemory
 from .prompt import build_turn_prompt
@@ -203,6 +204,7 @@ class RalphAgent:
         # clicking a HEADING that does nothing) would otherwise loop forever now that clicks
         # are not no-op-blocked. After _SOFT_REPEAT_LIMIT identical repeats we steer instead.
         soft_repeat_counts: dict[str, int] = {}
+        detector = StuckDetector(self._cfg.escalation_stuck_threshold)
 
         # max_steps <= 0 means run until validation passes.
         turns = (itertools.count(1) if self._cfg.max_steps <= 0
@@ -306,7 +308,8 @@ class RalphAgent:
                         if _ti > 0:
                             time.sleep(1)  # 1-second safety gap between batched calls
                         if tool_name == "validate":
-                            self._validate(args, turn, memory, result, user)
+                            self._validate(args, turn, memory, result, user,
+                                           detector=detector)
                             if result.finished:
                                 break
                             continue
@@ -396,6 +399,13 @@ class RalphAgent:
                             attempted[sig] = action.ok
                         if action.ok and isinstance(args.get("target"), str):
                             handled_refs.add(args["target"])
+                        # Stuck detection: escalate to API model after N identical calls.
+                        if detector.record(tool_name, args):
+                            self._escalate(
+                                detector,
+                                f"stuck after {self._cfg.escalation_stuck_threshold} "
+                                f"identical '{tool_name}' calls",
+                            )
 
                 # After ALL tool calls finish: wait 1 s then capture ONE snapshot and
                 # record it as the final tool observation for this turn. The model will
@@ -677,7 +687,8 @@ class RalphAgent:
 
     # ---- validation ----
     def _validate(self, args: dict, turn: Turn, memory: NarrativeMemory,
-                  result: RunResult, user: str = "") -> None:
+                  result: RunResult, user: str = "",
+                  detector: "StuckDetector | None" = None) -> None:
         # `validate` takes NO args (issue #57); the validator no longer reads a
         # self-reported summary. It is fed the SAME context the main agent had — the
         # tool-less main system prompt (task + workspace + live page snapshot) — plus
@@ -701,6 +712,36 @@ class RalphAgent:
             obs = (f"validation FAILED — {verdict.reason} "
                    f"Keep working to address this, then call validate again.")
             self._record(turn, Action("validate", args, obs, ok=False), memory)
+            if (detector is not None and self._cfg.escalation_on_premature_validate
+                    and detector.record_premature_validate()):
+                self._escalate(detector, "premature validate (validator rejected the claim)")
+
+    # ---- escalation ----
+    def _escalate(self, detector: StuckDetector, why: str) -> None:
+        """Swap self._client to the configured API model — same browser, same session.
+
+        At most once per run (detector.escalated guards re-entry). A no-op with a
+        warning log when escalation is disabled or the provider key is absent, so the
+        run degrades gracefully rather than crashing.
+        """
+        if detector.escalated or not self._cfg.escalation_enabled:
+            return
+        detector.escalated = True
+        try:
+            from .providers import make_api_client
+            new_client = make_api_client(
+                self._cfg.escalation_provider,
+                self._cfg.escalation_model or None,
+            )
+            self._client = new_client
+            self._reporter.note(
+                f"[ESCALATION] {why} — switching to "
+                f"{self._cfg.escalation_provider}:{self._cfg.escalation_model}"
+            )
+        except Exception as exc:
+            self._reporter.note(
+                f"[ESCALATION] {why} — escalation disabled: {exc}"
+            )
 
     # Only tools whose identical repeat ADVANCES state (each call goes one step further)
     # are EXEMPT from the anti-loop guard.

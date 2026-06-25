@@ -254,3 +254,19 @@ class Config:
     # of the input. The pruned, ref-keyed prose (one line per interactable, with fillable
     # affordances per #70) is exactly what a small model needs to map field -> correct ref.
     web_snapshot_prose: bool = True
+
+    # --- Escalation / API provider ---
+    # When the local model gets stuck (same tool call repeated escalation_stuck_threshold
+    # times in a row), the run escalates mid-session to an external API model — same
+    # browser, same session, just a stronger LLM answering the next turn.
+    escalation_enabled: bool = True
+    escalation_provider: str = "zhipuai"           # key into providers.PROVIDERS
+    escalation_model: str = "glm-5.2"              # empty = use provider default
+    escalation_stuck_threshold: int = 3            # consecutive identical calls → stuck
+    escalation_on_premature_validate: bool = True  # escalate on first premature validate
+
+    # --- Validation provider ---
+    # LLMValidator uses this provider's API model for a stronger, independent verdict.
+    # Falls back to the main Ollama client when the provider key env var is absent.
+    validation_provider: str = "zhipuai"
+    validation_model: str = "glm-5.2"
