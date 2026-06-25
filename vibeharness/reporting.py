@@ -74,8 +74,43 @@ _C = {"reset": "\033[0m", "dim": "\033[2m", "bold": "\033[1m",
 
 
 def _enable_ansi() -> None:
-    if os.name == "nt":
-        os.system("")  # flips on virtual-terminal processing in conhost
+    """Enable Windows VT / ANSI processing on stdout and stderr.
+
+    ``os.system("")`` (the old approach) launches a cmd.exe subprocess whose
+    console handle gets VT mode set — but that does NOT help when Python's own
+    stdout/stderr are pipes (e.g. ``Tee-Object`` in PS7).  The ctypes approach
+    calls ``SetConsoleMode`` directly on the handles Python actually holds.
+
+    When a handle IS a real console, we set ENABLE_VIRTUAL_TERMINAL_PROCESSING
+    so conhost renders the escape sequences.  When the handle is a pipe (Tee-Object),
+    ``GetConsoleMode`` fails and we leave the handle alone — PowerShell 7 with
+    ``$PSStyle.OutputRendering = 'Ansi'`` (or Windows Terminal) will render the
+    raw escape sequences on its end, so no conversion is needed.
+    """
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        import ctypes.wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
+        STD_OUTPUT_HANDLE = -11
+        STD_ERROR_HANDLE = -12
+
+        for std_handle in (STD_OUTPUT_HANDLE, STD_ERROR_HANDLE):
+            handle = kernel32.GetStdHandle(std_handle)
+            if handle and handle != ctypes.wintypes.HANDLE(-1).value:
+                mode = ctypes.wintypes.DWORD(0)
+                if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+                    # Only a real console responds; set VT mode on it.
+                    kernel32.SetConsoleMode(
+                        handle, mode.value | ENABLE_VIRTUAL_TERMINAL_PROCESSING
+                    )
+                # If GetConsoleMode fails the handle is a pipe — leave it; ANSI
+                # passes through to PS7 / Windows Terminal automatically.
+    except Exception:
+        pass  # non-Windows or ctypes unavailable — never raise from a display helper
 
 
 class ConsoleReporter(Reporter):

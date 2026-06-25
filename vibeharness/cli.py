@@ -754,10 +754,15 @@ def _safe_log(logger: RunLogger, task: str, config: Config, result) -> None:
 def main(argv: list[str] | None = None) -> int:
     if argv is None:
         argv = sys.argv[1:]
-    try:
-        sys.stdout.reconfigure(encoding="utf-8")  # robust unicode on Windows consoles
-    except AttributeError:
-        pass
+    # Force UTF-8 on both stdout and stderr so box-drawing characters and other
+    # non-ASCII output aren't mis-encoded as Cp1252/Latin-1 in log files or
+    # pipe-captured streams (e.g. Tee-Object).  reconfigure() is Python 3.7+
+    # on TextIOWrapper; the AttributeError guard keeps us safe on exotic runtimes.
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(encoding="utf-8")
+        except AttributeError:
+            pass
 
     # ISSUE #77: cap Ollama at one loaded model on startup so a new runner evicts the
     # old one rather than stacking (the OOM/CUDA root cause). setdefault inside, so a
