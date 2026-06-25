@@ -155,6 +155,14 @@ class Config:
     # compact <tool_call> blocks (a few hundred tokens), so 4096 has ~10x headroom.
     reason_tokens: int = 4096         # phase 1 (free reasoning, discarded) — see #92/#123
     action_tokens: int = 4096         # phase 2 (codec action; unconstrained for hermes) — #92
+    # Qwen3 native-tools two-phase thinking cap (decide_chat path).
+    # Phase 1 stops at </think> or this many tokens, whichever comes first; the capped
+    # thinking is replayed as an assistant prefill so phase 2 starts after </think>.
+    # 1024 is the documented sweet-spot from the Qwen3 technical report (arXiv:2505.09388):
+    # sufficient for routine tool-call decisions, small enough to keep input budget healthy.
+    # The previous single-phase approach used think:False which qwen3:4b ignores in some
+    # Ollama versions (issue #12917); this two-phase cap is the reliable alternative.
+    thinking_budget: int = 1024       # max thinking tokens (native decide_chat path)
 
     # observation rendering
     observation_char_limit: int = 12000  # truncate big tool outputs in the narrative

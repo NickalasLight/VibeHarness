@@ -132,40 +132,52 @@ class OllamaClient(LLMClient):
                     constraint: DecodeConstraint,
                     on_reason: TokenSink | None = None,
                     on_action: TokenSink | None = None) -> Decision:
-        """Native stateful /api/chat generation over the FULL message history.
+        """Two-phase native /api/chat: cap Qwen3 thinking, then get the tool call.
 
-        ONE /api/chat call sends the whole ``messages`` history plus the enveloped
-        ``tools`` (so Ollama applies the model's own trained tool template — the
-        envelope + anti-fence wording — instead of a hand-injected block). Streams the
-        response token-by-token under ``message.content`` (ground-truth: this 3B model
-        streams the call as content, NOT as structured chunks), feeding ``on_action`` so
-        live rendering is unchanged. If Ollama DID return structured ``tool_calls`` they
-        are captured too; the agent prefers them and otherwise parses the content.
+        Phase 1 — thinking cap: sends ``messages`` WITHOUT tools, stops at ``</think>``
+        OR ``thinking_budget`` tokens (whichever comes first). Thinking tokens come
+        through ``message.thinking`` and are forwarded to ``on_reason``. This is the
+        reliable alternative to ``think:False`` (which qwen3:4b ignores in some Ollama
+        versions; see Ollama issue #12917 and arXiv:2505.09388 §4.2).
 
-        ``two_phase`` (VibeThinker) is intentionally NOT handled here: VibeThinker is the
-        advisor/validator, not the native-tools base agent, and gets confused by enveloped
-        tool schemas (verified live). Its two-phase <think> flow keeps the legacy
-        :meth:`decide` path. This method is for the single-phase native-tools base agent."""
-        payload: dict = {
+        Phase 2 — tool call: appends the capped thinking as ``{"role":"assistant",
+        "content":"<think>…</think>"}`` so the model "sees" its thinking is complete,
+        then calls /api/chat WITH the enveloped ``tools`` schema and streams the tool
+        call to ``on_action``.  The ``two_phase`` flag (VibeThinker) is intentionally
+        NOT used here — VibeThinker gets confused by enveloped tool schemas and keeps the
+        legacy :meth:`decide` path. This method is ONLY for the native-tools base agent."""
+        # Phase 1: cap thinking.
+        # _stream_chat reads message.thinking -> thinking_parts and fires on_reason.
+        # stop=["</think>"] fires at the raw token level even when thinking is routed to
+        # message.thinking (not message.content), so the generation halts correctly.
+        _, _, thinking = self._stream_chat({
             "model": self._cfg.model,
             "messages": messages,
-            # Disable Qwen3 thinking on the native tool-call path. Research (arXiv:2505.09388,
-            # arXiv:2512.19585) shows thinking provides no accuracy benefit for structured
-            # tool-calling tasks while consuming 1000-5000+ tokens per turn of context window.
-            # "think" must be top-level (NOT inside "options") per Ollama docs; the belt-and-
-            # suspenders "/no_think" in the system prompt covers Ollama versions that ignore it.
+            "options": {**self._options(),
+                        "num_predict": self._cfg.thinking_budget,
+                        "stop": ["</think>"]},
+        }, on_token=None, on_reason=on_reason)
+
+        # Phase 2: tool call with capped thinking replayed as assistant prefix.
+        # Wrapping in <think>…</think> signals to the model that reasoning is complete
+        # and it should proceed directly to the tool call.
+        prefill = f"<think>\n{thinking}\n</think>" if thinking.strip() else ""
+        convo = list(messages) + [{"role": "assistant", "content": prefill}] if prefill else list(messages)
+        phase2: dict = {
+            "model": self._cfg.model,
+            "messages": convo,
             "think": False,
             "options": {**self._options(),
                         "temperature": self._cfg.action_temperature,
-                        "num_predict": self._cfg.reason_tokens + self._cfg.action_tokens,
+                        "num_predict": self._cfg.action_tokens,
                         "stop": list(constraint.stop)},
         }
         if tools:
-            payload["tools"] = tools
+            phase2["tools"] = tools
         if constraint.json_schema is not None:
-            payload["format"] = constraint.json_schema
-        content, tool_calls, reasoning = self._stream_chat(payload, on_action, on_reason)
-        return Decision(reasoning=reasoning, action_json=content.strip(),
+            phase2["format"] = constraint.json_schema
+        content, tool_calls, _ = self._stream_chat(phase2, on_action)
+        return Decision(reasoning=thinking, action_json=content.strip(),
                         tool_calls=tuple(tool_calls))
 
     def generate(self, prompt: str, max_chars: int | None = None,
