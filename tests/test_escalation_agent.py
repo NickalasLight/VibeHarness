@@ -32,7 +32,7 @@ class FakeValidator(Validator):
     def __init__(self, passed=True, reason="ok"):
         self._passed, self._reason = passed, reason
 
-    def validate(self, task, history, claim):
+    def validate(self, task, history, on_reason=None, on_action=None):
         return Verdict(self._passed, self._reason)
 
 

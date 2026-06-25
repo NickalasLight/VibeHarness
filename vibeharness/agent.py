@@ -314,6 +314,15 @@ class RalphAgent:
                                 break
                             continue
                         sig = self._action_signature(tool_name, args)
+                        # Stuck detection fires on EVERY occurrence of this (tool, args),
+                        # including early-continue paths below, so we record BEFORE any
+                        # dedup guards can short-circuit the loop.
+                        if detector.record(tool_name, args):
+                            self._escalate(
+                                detector,
+                                f"stuck after {self._cfg.escalation_stuck_threshold} "
+                                f"identical '{tool_name}' calls",
+                            )
                         # SOFT-REPEAT (iter-1 fix): click/upload are not value-sets. A repeat
                         # is legitimate (re-click Continue after a validation block; re-open a
                         # combobox; retry an upload once the chooser is ready). Let them RUN on
@@ -399,13 +408,6 @@ class RalphAgent:
                             attempted[sig] = action.ok
                         if action.ok and isinstance(args.get("target"), str):
                             handled_refs.add(args["target"])
-                        # Stuck detection: escalate to API model after N identical calls.
-                        if detector.record(tool_name, args):
-                            self._escalate(
-                                detector,
-                                f"stuck after {self._cfg.escalation_stuck_threshold} "
-                                f"identical '{tool_name}' calls",
-                            )
 
                 # After ALL tool calls finish: wait 1 s then capture ONE snapshot and
                 # record it as the final tool observation for this turn. The model will
@@ -463,6 +465,19 @@ class RalphAgent:
                 on_turn(result)
             if result.finished:
                 break
+
+        # Log API usage if escalation happened (self._client was swapped to ApiLLMClient)
+        try:
+            from .api_llm import ApiLLMClient as _ApiLLMClient
+            if isinstance(self._client, _ApiLLMClient):
+                usage = self._client.usage_summary()
+                self._reporter.note(
+                    f"[API_USAGE] tokens_in={usage['tokens_in']} "
+                    f"tokens_out={usage['tokens_out']} "
+                    f"estimated_cost_usd={usage['estimated_cost_usd']:.6f}"
+                )
+        except Exception:
+            pass
 
         return result
 
