@@ -133,6 +133,7 @@ _NO_MATCH_MARKERS: tuple[str, ...] = (
     "could not find element",
     "waiting for locator",  # playwright timeout phrasing when a locator never appears
     "timeout",
+    "modal state",          # upload without an open OS file-picker (issue #144)
 )
 
 
@@ -1859,7 +1860,16 @@ class DragTool(_WebTool):
 
 class UploadTool(_WebTool):
     name = "upload"
-    description = "Upload one or more files to the active file input."
+    description = (
+        "Upload a file to a file input. "
+        "TWO-STEP SEQUENCE REQUIRED: "
+        "(1) First CLICK the file-upload trigger element (a button or file input ref) in the "
+        "snapshot — this opens the OS file-picker dialog ('modal state'). "
+        "(2) Then immediately call `upload` with the ABSOLUTE file path. "
+        "Calling upload before clicking the trigger fails with a 'modal state' error. "
+        "Always pass the path EXACTLY as given in the task (absolute, e.g. "
+        "C:\\\\path\\\\to\\\\file.docx) — never shorten it to a relative path."
+    )
     _verb = "uploaded a file to"
     _required = ("file",)
 
@@ -1868,10 +1878,31 @@ class UploadTool(_WebTool):
 
     @property
     def parameters(self):
-        return [Param("file", "string", "Absolute path of the file to upload.")]
+        return [Param("file", "string",
+                      "Absolute path of the file to upload. Must be an absolute path "
+                      "(e.g. C:\\\\Users\\\\...\\\\file.docx), exactly as provided in the task. "
+                      "Never use a relative path.")]
 
     def _build(self, args):
         return ["upload", args["file"]]
+
+    def run(self, args: dict) -> ToolResult:
+        result = super().run(args)
+        # The Playwright-CLI upload tool is named 'browser_file_upload' internally.
+        # When the OS file-picker is not open it exits 0 with "modal state" in the
+        # output — which _run_impl now correctly marks ok=False via _NO_MATCH_MARKERS
+        # (issue #144). Clean up the error text so the agent sees 'upload' (the tool
+        # it called) instead of the internal 'browser_file_upload' name.
+        if not result.ok:
+            msg = result.message.replace("browser_file_upload", "upload")
+            if "modal state" in msg.lower():
+                msg = (
+                    "upload failed: the OS file-picker is not open (no 'modal state'). "
+                    "You must FIRST click the file-upload trigger button/input ref in the "
+                    "snapshot to open the picker, THEN call upload with the absolute path."
+                )
+            return ToolResult(False, msg)
+        return result
 
 
 class ScreenshotTool(_WebTool):
@@ -2210,7 +2241,19 @@ class WebToolset(Toolset):
             "is touched, and the rejection lists the refs that are actually available. "
             "If a cookie/consent banner or modal dialog blocks what you need, clear it first: "
             "locate its Accept / Agree / Reject / Dismiss / Continue control in the snapshot and "
-            "click that ref before doing anything else."
+            "click that ref before doing anything else. "
+            "FILE UPLOADS — two-step sequence: (1) click the upload trigger button or file-input "
+            "ref in the snapshot to open the OS file-picker, then (2) immediately call `upload` "
+            "with the ABSOLUTE path exactly as given in the task. Never use a relative path. "
+            "Calling `upload` before the picker is open fails with a 'modal state' error. "
+            "FORM VALIDATION ERRORS — if after clicking a 'Next'/'Weiter'/'Submit'/'Absenden' "
+            "button the form still shows (page did not advance, or a field is marked [invalid] / "
+            "shows 'Eingabe erforderlich'), do NOT click the button again. Instead locate the "
+            "field(s) marked [invalid] in the snapshot, fill or select the correct value, and "
+            "only then click the advance/submit button again. "
+            "FAILED TOOL CALLS — never repeat the EXACT same tool call that just failed. "
+            "If an action fails, change your approach: use a different ref, open a prerequisite "
+            "dialog, or take a different action entirely."
         )
 
     def create_tools(self, config: Config) -> list[Tool]:
