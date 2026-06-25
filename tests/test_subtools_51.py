@@ -175,9 +175,14 @@ class NoAgentFacingSnapshotStringTest(unittest.TestCase):
             self.assertNotIn(forbidden, sp, f"agent-facing text advertises snapshot: {forbidden!r}")
 
     def test_page_section_is_labelled_provided_automatically(self):
-        # The injected page section makes clear it is automatic (prompt.py change).
+        # Issue #146: build() no longer renders the page section (the snapshot moved to
+        # the user turn). The validator-context section renderer keeps the labelled
+        # heading so the validator still sees the page is provided automatically.
+        from vibeharness.prompt import render_page_section
         sp = SystemPromptBuilder(_web_registry()).build("task", page="### live page content")
-        self.assertIn("# Current page (live snapshot — provided automatically)", sp)
+        self.assertNotIn("# Current page (live snapshot", sp)
+        section = render_page_section("### live page content")
+        self.assertIn("# Current page (live snapshot — provided automatically)", section)
 
     def test_subtool_descriptions_do_not_advertise_snapshot_as_tool(self):
         # The discrete tools' descriptions may REFERENCE the live page snapshot

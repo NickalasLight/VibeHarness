@@ -109,37 +109,41 @@ class CaptureRawSnapshotTest(unittest.TestCase):
 
 
 class PerTurnSnapshotInjectionTest(unittest.TestCase):
-    """Reproduce cli.py's wiring: when web is active, each turn's regenerated system
-    prompt carries the CURRENT snapshot under the page section."""
+    """Issue #146: the live snapshot is NO LONGER injected into the system prompt by
+    ``build()`` — it now rides the END of the USER turn (see ``append_snapshot_to_user``
+    and ``RalphAgent``). ``build(page=...)`` ignores ``page`` for backwards
+    compatibility. These tests pin the new contract."""
 
     def _provider(self, cli, limit=6000):
         return lambda: capture_page_snapshot(cli, limit)
 
-    def test_web_active_prompt_contains_current_snapshot(self):
+    def test_build_never_emits_page_section_even_with_page_arg(self):
+        # Even when a page is passed, build() emits no page section (issue #146).
         cli = _FakeSnapshotCli(["### Page\nFIRST-SNAP consent dialog"])
         builder = SystemPromptBuilder(_registry(["web"]))
         page = self._provider(cli)
         sp = builder.build("DO THE THING", page=page())
-        self.assertIn("# Current page (live snapshot", sp)
-        self.assertIn("FIRST-SNAP consent dialog", sp)
+        self.assertNotIn("# Current page (live snapshot", sp)
+        self.assertNotIn("FIRST-SNAP consent dialog", sp)
 
-    def test_second_turn_drops_stale_snapshot(self):
-        # Two turns, two DIFFERENT snapshots. Each turn the prompt is rebuilt from
-        # scratch via the provider, so the new snapshot replaces the old one.
-        cli = _FakeSnapshotCli(["### Page\nOLD-SNAP", "### Page\nNEW-SNAP"])
-        builder = SystemPromptBuilder(_registry(["web"]))
-        page = self._provider(cli)
+    def test_snapshot_appended_to_user_turn_at_the_end(self):
+        # The snapshot lands at the very END of the user turn (recency slot).
+        from vibeharness.prompt import append_snapshot_to_user, SNAPSHOT_USER_MARKER
+        user = build_turn_prompt("T", "did stuff")
+        out = append_snapshot_to_user(user, "### Page\nNEW-SNAP consent dialog")
+        self.assertTrue(out.startswith(user))               # user text preserved, first
+        self.assertIn(SNAPSHOT_USER_MARKER, out)
+        self.assertIn("NEW-SNAP consent dialog", out)
+        self.assertTrue(out.rstrip().endswith("NEW-SNAP consent dialog"))  # at the END
 
-        first = builder.build("DO THE THING", page=page())
-        self.assertIn("OLD-SNAP", first)
-
-        second = builder.build("DO THE THING", page=page())
-        self.assertIn("NEW-SNAP", second)
-        self.assertNotIn("OLD-SNAP", second)  # stale dropped by regeneration
+    def test_no_snapshot_leaves_user_unchanged(self):
+        from vibeharness.prompt import append_snapshot_to_user
+        user = build_turn_prompt("T", "did stuff")
+        self.assertEqual(append_snapshot_to_user(user, ""), user)
 
     def test_snapshot_not_in_narrative_memory(self):
-        # The snapshot lives ONLY in the regenerated system prompt; it must never be
-        # recorded into narrative memory (which would accumulate stale snapshots).
+        # The snapshot must never be recorded into narrative memory (which would
+        # accumulate stale snapshots).
         cli = _FakeSnapshotCli(["### Page\nSNAP-TEXT-XYZ"])
         page = self._provider(cli)
         _ = SystemPromptBuilder(_registry(["web"])).build("T", page=page())
@@ -151,17 +155,9 @@ class PerTurnSnapshotInjectionTest(unittest.TestCase):
         self.assertNotIn("SNAP-TEXT-XYZ", turn_prompt)
 
     def test_web_inactive_has_no_page_section(self):
-        # fs-only: cli.py passes no page provider, so build() gets page="" and emits
-        # no page section.
+        # fs-only: build() emits no page section regardless (issue #146).
         sp = SystemPromptBuilder(_registry(["fs"])).build("DO THE THING", page="")
         self.assertNotIn("# Current page (live snapshot", sp)
-
-    def test_page_section_truncated_to_cap(self):
-        cli = _FakeSnapshotCli(["z" * 9000])
-        sp = SystemPromptBuilder(_registry(["web"])).build(
-            "T", page=capture_page_snapshot(cli, char_limit=200))
-        self.assertIn("# Current page (live snapshot", sp)
-        self.assertIn("truncated", sp)
 
 
 class SnapshotCapDefaultTest(unittest.TestCase):
@@ -218,17 +214,20 @@ class CliSnapshotProviderGatingTest(unittest.TestCase):
         sp = SystemPromptBuilder(_registry(["fs"])).build("DO THE THING", page=render_page())
         self.assertNotIn("# Current page (live snapshot", sp)
 
-    def test_web_render_page_feeds_snapshot_into_page_section(self):
-        # web active: swap in a fake CLI (no browser) so the provider yields canned
-        # snapshot text, and confirm it lands under the page section.
+    def test_web_render_page_feeds_snapshot_into_user_turn(self):
+        # Issue #146: web active -> the captured snapshot rides the END of the USER turn,
+        # NOT the system prompt. Confirm the data flow into append_snapshot_to_user.
+        from vibeharness.prompt import append_snapshot_to_user, SNAPSHOT_USER_MARKER
         _, render_page = self._wire(["web"])
-        # render_page closes over a real provider whose CLI has no session, so on its
-        # own it returns ""; substitute a fake-backed provider to prove the data flow.
         cli = _FakeSnapshotCli(["### Page\nWIRED-SNAP consent banner"])
         render_page = lambda: capture_page_snapshot(cli, 6000)
+        # The system prompt carries no page section anymore:
         sp = SystemPromptBuilder(_registry(["web"])).build("T", page=render_page())
-        self.assertIn("# Current page (live snapshot", sp)
-        self.assertIn("WIRED-SNAP consent banner", sp)
+        self.assertNotIn("# Current page (live snapshot", sp)
+        # The user turn does, at its end:
+        user = append_snapshot_to_user(build_turn_prompt("T", ""), render_page())
+        self.assertIn(SNAPSHOT_USER_MARKER, user)
+        self.assertIn("WIRED-SNAP consent banner", user)
 
 
 class ValidatorContextProviderTest(unittest.TestCase):

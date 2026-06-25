@@ -118,17 +118,26 @@ class SystemPromptBuilder:
 
     def build(self, task: str = "", workspace: str = "", page: str = "",
               include_tool_guidance: bool = True, native_tools: bool = False) -> str:
-        """Render the full system prompt: header (task + workspace + page) + body.
+        """Render the system prompt: header (task + workspace) + body.
+
+        Issue #146: the live page snapshot is NO LONGER part of the system prompt.
+        Every major web-agent benchmark (WebArena, VisualWebArena, SeeAct, AgentBench,
+        WorkArena, browser-use) places the live page observation in a USER turn, never
+        the system prompt; "Lost in the Middle" (arXiv:2307.03172) shows LLMs attend
+        best to the START and END of the input, so the fast-changing snapshot is moved
+        to the very END of the user turn (the recency slot — see ``RalphAgent.run``).
+        The ``page`` parameter is KEPT for backwards compatibility but is now IGNORED:
+        no ``# Current page`` section is added here. Callers that still need the
+        snapshot rendered as a section (the validator context — issue #57) append it
+        themselves around this builder (see ``cli.render_page_section``).
 
         When ``include_tool_guidance`` is False, the body — the `# How the loop works`
         / codec format-instruction block, the `# Tools` docs, AND the
         `# Working with your tools` guidance — is omitted entirely, leaving ONLY the
-        header (task + workspace + the `# Current page (live snapshot)` section). This
-        is the validator's view (issue #57): it must see the SAME task/workspace/page
-        context the main agent had, but NOT the tool descriptions or format rules,
-        because it is judging the work, not producing tool calls. The header uses the
-        SAME rendering as the full prompt, so the already-#43-budgeted snapshot is
-        reused verbatim.
+        header (task + workspace). This is the validator's view (issue #57): it must
+        see the SAME task/workspace context the main agent had, but NOT the tool
+        descriptions or format rules, because it is judging the work, not producing
+        tool calls.
 
         When ``native_tools`` is True (issue #129/#130/#131), the harness sends the tool
         schemas in Ollama's ``tools:`` field, so Ollama injects the model's OWN `# Tools`
@@ -180,17 +189,52 @@ class SystemPromptBuilder:
             # A snapshot of the working directory, refreshed every turn so newly
             # created files show up next turn. Sits right after the task block.
             header += f"# Workspace\n{workspace}\n\n---\n\n"
-        if page:
-            # A fresh snapshot of the live browser page, regenerated every turn
-            # (issue #24) so the model always sees the CURRENT page state (consent
-            # banners, modals, …). This is PROVIDED AUTOMATICALLY: there is no agent
-            # tool to request it (the old `snapshot` action was removed, issue #51).
-            # Because the whole system prompt is rebuilt each turn, only the latest
-            # snapshot is ever present — the prior one disappears (stale-dropping by
-            # regeneration, never accumulated in narrative memory).
-            header += ("# Current page (live snapshot — provided automatically)\n"
-                       f"{page}\n\n---\n\n")
+        # Issue #146: the live page snapshot is intentionally NOT rendered here anymore.
+        # It now lives at the END of the user turn (the high-attention recency slot — see
+        # ``RalphAgent.run`` and ``cli.render_page_section``). ``page`` is accepted for
+        # backwards compatibility but ignored; passing it has no effect on the prompt.
         return header + body if header else body
+
+
+# Issue #146: the marker that identifies a live-snapshot block appended to a USER turn.
+# History pruning scans for this exact substring to strip stale snapshots, and the user-
+# turn appender / validator section renderer build their headings from it, so the three
+# stay in lock-step. Changing the wording here updates all three at once.
+SNAPSHOT_USER_MARKER = "## Current page (live snapshot"
+
+# The placeholder that replaces a pruned snapshot block in older user turns, so old
+# observations (tool results) survive in history while only the LATEST snapshot is shown.
+SNAPSHOT_PRUNED_PLACEHOLDER = (
+    "[page snapshot removed — only the latest snapshot is shown in the current turn]")
+
+
+def append_snapshot_to_user(user: str, snapshot: str) -> str:
+    """Append the live page snapshot to the END of a user-turn message (issue #146).
+
+    Placed at the very end so it occupies the high-attention recency slot ("Lost in the
+    Middle", arXiv:2307.03172) — the model attends most strongly to the most recent
+    content, which is exactly where the fast-changing page state belongs. Returns ``user``
+    unchanged when there is no snapshot this turn (web inactive, or the budget left no
+    room — issue #43), so non-web runs and overflow turns are unaffected."""
+    if not snapshot:
+        return user
+    return (f"{user}\n\n---\n"
+            f"{SNAPSHOT_USER_MARKER} — what the page looks like RIGHT NOW after your "
+            f"last actions)\n{snapshot}")
+
+
+def render_page_section(page: str) -> str:
+    """Render the standalone `# Current page` section for the validator context (#57).
+
+    The validator no longer reads the system prompt's page section (issue #146 moved the
+    snapshot out of the system prompt). It still needs the SAME budgeted snapshot the
+    agent saw, so the validator-context provider appends this section to the tool-less
+    prompt. Returns "" when there is no snapshot, so an fs-only / overflow turn renders
+    no page section."""
+    if not page:
+        return ""
+    return ("# Current page (live snapshot — provided automatically)\n"
+            f"{page}\n\n---\n\n")
 
 
 def build_turn_prompt(task: str, narrative: str,

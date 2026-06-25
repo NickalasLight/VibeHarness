@@ -24,7 +24,7 @@ from .config import Config
 from .filesystem import FileSystem, FileSystemError
 from .llm import OllamaClient, OllamaUnavailable, ensure_single_runner_env
 from .lock import SingleInstanceLock, VibeAlreadyRunning
-from .prompt import SystemPromptBuilder
+from .prompt import SystemPromptBuilder, render_page_section
 from .reporting import ConsoleReporter
 from .runlog import RunLogger
 from .settings import Settings, settable_keys
@@ -399,36 +399,88 @@ def make_render_workspace(fs, names):
     return render_workspace
 
 
+def _budget_snapshot_for_turn(builder, config, task, render_workspace,
+                              raw_snapshot_provider, user, include_tool_guidance,
+                              native_tools, cache=None):
+    """Shared per-turn budgeting core (#43). Returns ``(rest_system, page, raw)``.
+
+    ``rest_system`` is the system prompt WITHOUT the page section (issue #146: the page
+    no longer lives in the system prompt at all). ``page`` is the live snapshot trimmed
+    to the dynamic budget — sized so ``rest_system + user + page`` fits the input window
+    — or "" when there is no live page this turn or the rest already fills the window.
+    ``raw`` is the untruncated capture (for #37 diagnostics) or None.
+
+    The MAIN agent calls this twice per turn with the SAME ``user`` — once for the system
+    prompt, once for the user-turn snapshot (#146). A live browser capture is comparatively
+    expensive and could drift between two reads, so an optional one-entry ``cache`` dict
+    (keyed by ``user`` + the two flags) memoises the result, guaranteeing ONE capture per
+    (turn, user) shared by both providers. The validator path uses its own cache so its
+    later, independent capture is fresh."""
+    if cache is not None:
+        key = (user, include_tool_guidance, native_tools)
+        if cache.get("key") == key:
+            return cache["value"]
+    workspace = render_workspace()
+    rest_system = builder.build(task, workspace=workspace, page="",
+                                include_tool_guidance=include_tool_guidance,
+                                native_tools=native_tools)
+    raw = raw_snapshot_provider() if raw_snapshot_provider is not None else None
+
+    def _result(rest, page, raw_capture):
+        out = (rest, page, raw_capture)
+        if cache is not None:
+            cache["key"] = (user, include_tool_guidance, native_tools)
+            cache["value"] = out
+        return out
+
+    if not raw:
+        return _result(rest_system, "", raw or None)
+    # The "rest" of the message: system prompt with NO page section + the user turn
+    # (which itself does not yet carry the snapshot). We measure this to learn how much
+    # room the snapshot has, exactly as before — only the snapshot's final RESTING PLACE
+    # changed (user turn, not system prompt), not the total it is budgeted against.
+    rest_text = rest_system + user
+    budget = compute_snapshot_budget(config, rest_text)
+    if budget.overflow:
+        print(
+            f"\nwarning: the message without the page snapshot "
+            f"(~{budget.rest_tokens} tokens) already meets the input budget of "
+            f"~{budget.input_budget_tokens} tokens; injecting no page snapshot this "
+            f"turn to stay within num_ctx ({config.num_ctx}).",
+            file=sys.stderr,
+        )
+        return _result(rest_system, "", raw)
+    page = render_budgeted_snapshot(raw, budget.budget_chars)
+    return _result(rest_system, page, raw)
+
+
 def make_system_prompt_provider(builder, config, task, render_workspace,
                                 raw_snapshot_provider, logger=None,
-                                include_tool_guidance=True, native_tools=False):
+                                include_tool_guidance=True, native_tools=False,
+                                cache=None):
     """Build the per-turn system-prompt provider with the DYNAMIC snapshot budget (#43).
 
     Returns a callable taking the per-turn ``user`` message (RalphAgent passes it so
-    the snapshot can be sized against the FULL model message). Each turn:
+    the snapshot can be sized against the FULL model message). Each turn it renders the
+    workspace, captures + budgets the snapshot (see ``_budget_snapshot_for_turn``), and
+    returns the system prompt.
 
-      1. Render the workspace and capture the UNTRUNCATED live page snapshot.
-      2. Build ``rest`` = the system prompt WITHOUT the page section + the user
-         message. This is everything that will share the context window besides the
-         snapshot.
-      3. Size the snapshot to the remaining token budget and truncate it to fit.
-      4. Rebuild the system prompt with the budgeted snapshot injected.
-
-    When no snapshot provider is wired (web inactive), this degrades to the original
-    workspace-only refresh — no page section, no budgeting work.
+    Issue #146: the budgeted snapshot is NO LONGER injected into the system prompt for
+    the MAIN agent — it is appended to the END of the user turn instead (see
+    ``RalphAgent.run`` / ``make_user_snapshot_provider``). To preserve the validator
+    path (issue #57), the TOOL-LESS variant (``include_tool_guidance=False``) STILL
+    renders the page as a `# Current page` section appended to the returned context, so
+    the validator sees the same budgeted snapshot the agent saw. The full-tool variant
+    (the agent's system prompt) renders NO page section.
 
     Issue #57: ``include_tool_guidance`` is threaded through to every ``builder.build``
-    call so the SAME function can produce the TOOL-LESS variant fed to the validator —
-    identical task/workspace/page rendering and identical snapshot budgeting, just
-    without the tool descriptions / format-instruction block. The budget is computed
-    against the same ``rest`` text either way, so the snapshot trims to fit num_ctx.
+    call so the SAME function can produce the TOOL-LESS variant fed to the validator.
 
     Per-turn diagnostic logging (issue #37): when a ``logger`` is given, each turn we
     dump the COMPLETE raw snapshot (ground-truth size, BEFORE budgeting) and the EXACT
-    system prompt injected into the model into the run's .vibe diagnostics folder. This
-    is the single per-turn seam, so it captures exactly what the model saw. All logging
-    is guarded so a dump failure can never break the turn. The tool-less validator
-    variant does NOT dump (logger left None) so it never double-counts a turn.
+    system prompt injected into the model into the run's .vibe diagnostics folder. The
+    tool-less validator variant does NOT dump (logger left None) so it never
+    double-counts a turn.
     """
     turn_counter = itertools.count(1)
 
@@ -442,43 +494,41 @@ def make_system_prompt_provider(builder, config, task, render_workspace,
             pass   # diagnostics must never abort the turn
 
     def provider(user: str = "") -> str:
-        workspace = render_workspace()
-        raw = raw_snapshot_provider() if raw_snapshot_provider is not None else None
-        if not raw:
-            # No live page this turn: render no page section (issue #24 behaviour).
-            prompt = builder.build(task, workspace=workspace, page="",
-                                   include_tool_guidance=include_tool_guidance,
-                                   native_tools=native_tools)
-            _dump(prompt, raw or None)
-            return prompt
-        # The "rest" of the message: system prompt with NO page section + the user
-        # turn message. We measure this to learn how much room the snapshot has.
-        rest_system = builder.build(task, workspace=workspace, page="",
-                                    include_tool_guidance=include_tool_guidance,
-                                    native_tools=native_tools)
-        rest_text = rest_system + user
-        budget = compute_snapshot_budget(config, rest_text)
-        if budget.overflow:
-            # The rest of the message already fills the window: inject NO snapshot and
-            # warn, so we never overflow num_ctx (issue #43).
-            print(
-                f"\nwarning: the message without the page snapshot "
-                f"(~{budget.rest_tokens} tokens) already meets the input budget of "
-                f"~{budget.input_budget_tokens} tokens; injecting no page snapshot this "
-                f"turn to stay within num_ctx ({config.num_ctx}).",
-                file=sys.stderr,
-            )
-            prompt = builder.build(task, workspace=workspace, page="",
-                                   include_tool_guidance=include_tool_guidance,
-                                   native_tools=native_tools)
-            _dump(prompt, raw)
-            return prompt
-        page = render_budgeted_snapshot(raw, budget.budget_chars)
-        prompt = builder.build(task, workspace=workspace, page=page,
-                               include_tool_guidance=include_tool_guidance,
-                               native_tools=native_tools)
+        rest_system, page, raw = _budget_snapshot_for_turn(
+            builder, config, task, render_workspace, raw_snapshot_provider, user,
+            include_tool_guidance, native_tools, cache=cache)
+        # The MAIN agent's system prompt (full tools) carries NO page section — the
+        # snapshot rides the user turn (#146). The validator's TOOL-LESS context keeps a
+        # `# Current page` section appended so it still sees the budgeted snapshot (#57).
+        prompt = rest_system
+        if not include_tool_guidance:
+            prompt = rest_system + render_page_section(page)
         _dump(prompt, raw)
         return prompt
+    return provider
+
+
+def make_user_snapshot_provider(builder, config, task, render_workspace,
+                                raw_snapshot_provider, native_tools=False, cache=None):
+    """Build the per-turn provider of the budgeted snapshot to append to the USER turn.
+
+    Issue #146: the live snapshot now lives at the END of the user turn (the recency
+    slot), not the system prompt. RalphAgent calls this with the per-turn ``user``
+    message; it returns the SAME dynamically-budgeted snapshot text (#43) that the
+    system-prompt provider sizes against the rest of the message, computed via the
+    shared ``_budget_snapshot_for_turn`` core so the two never disagree. Returns "" when
+    there is no live page this turn (web inactive) or the budget left no room.
+
+    ``cache`` is the SAME one-entry memo passed to the matching system-prompt provider,
+    so the snapshot is captured ONCE per turn and both providers see identical bytes.
+
+    Built with ``include_tool_guidance=True`` so the budget is sized against the FULL
+    (tooled) system prompt — exactly what the model receives at request time."""
+    def provider(user: str = "") -> str:
+        _rest_system, page, _raw = _budget_snapshot_for_turn(
+            builder, config, task, render_workspace, raw_snapshot_provider, user,
+            include_tool_guidance=True, native_tools=native_tools, cache=cache)
+        return page
     return provider
 
 
@@ -558,22 +608,36 @@ def _run_locked(args, task, config, registry, codec, names, workdir, logger,
         and codec.tools(registry) is not None
     )
 
+    # Issue #146: the live snapshot now rides the END of the USER turn (the recency
+    # slot), not the system prompt. The system-prompt provider and the user-turn
+    # snapshot provider share a one-entry per-turn cache so the page is captured ONCE
+    # per turn and both see identical bytes (a live capture is costly and could drift).
+    _turn_snapshot_cache: dict = {}
     # The per-turn provider applies #43's dynamic snapshot budget AND, given the
     # logger, performs #37's per-turn diagnostic dump (raw snapshot + injected prompt).
+    # It NO LONGER injects the page into the (tooled) system prompt — that is appended to
+    # the user turn by the snapshot provider below.
     system_prompt_provider = make_system_prompt_provider(
         builder, config, task, render_workspace, raw_snapshot_provider, logger,
-        native_tools=native_tools)
+        native_tools=native_tools, cache=_turn_snapshot_cache)
+    # Issue #146: the budgeted snapshot to append to the END of each user turn.
+    user_snapshot_provider = make_user_snapshot_provider(
+        builder, config, task, render_workspace, raw_snapshot_provider,
+        native_tools=native_tools, cache=_turn_snapshot_cache)
     # Issue #57: a TOOL-LESS twin of the same per-turn prompt to feed the validator —
-    # task + workspace + the same #43-budgeted page snapshot, but with the tool
+    # task + workspace + the same #43-budgeted page snapshot (appended as a `# Current
+    # page` section, since #146 took it out of the system prompt), with the tool
     # descriptions / format-instruction block stripped, so the validator sees the real
-    # context the agent had (no self-claim). No logger here so it never double-dumps a
-    # turn's diagnostics.
+    # context the agent had (no self-claim). A SEPARATE cache (its capture happens at a
+    # different point — validate-time — so it should re-read the page). No logger here so
+    # it never double-dumps a turn's diagnostics.
     validator_context_provider = make_system_prompt_provider(
         builder, config, task, render_workspace, raw_snapshot_provider,
-        logger=None, include_tool_guidance=False)
+        logger=None, include_tool_guidance=False, cache={})
     agent = RalphAgent(client, registry, system_prompt, config, validator,
                        reporter=reporter, system_prompt_provider=system_prompt_provider,
-                       codec=codec, validator_context_provider=validator_context_provider)
+                       codec=codec, validator_context_provider=validator_context_provider,
+                       snapshot_provider=user_snapshot_provider)
 
     # Advisor advice buffer: the checkpoint populates it after N accumulated tool calls;
     # advice_provider drains it once at the start of the next turn.

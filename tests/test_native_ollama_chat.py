@@ -262,5 +262,87 @@ class NativeSystemPromptTest(unittest.TestCase):
         self.assertIn("<tools>", prompt)
 
 
+class SnapshotOnUserTurnTest(unittest.TestCase):
+    """Issue #146: the live page snapshot rides the END of the USER turn (recency slot),
+    NOT the system prompt, and stale snapshots are pruned from chat history so only the
+    latest one is visible to the model."""
+
+    def setUp(self):
+        self.reg = _registry()
+        self.cfg = Config(max_steps=5)
+
+    def _agent(self, client, snapshots):
+        # snapshots: a list yielding one snapshot string per turn (the cli wires this
+        # to the budgeted live capture). We ignore the user arg and pop in order.
+        snaps = iter(snapshots)
+        def provider(user=""):
+            try:
+                return next(snaps)
+            except StopIteration:
+                return ""
+        return RalphAgent(client, self.reg, "SYS", self.cfg,
+                          FakeValidator(passed=True), codec=get_codec("hermes"),
+                          snapshot_provider=provider)
+
+    def test_snapshot_appended_to_current_user_turn_not_system(self):
+        from vibeharness.prompt import SNAPSHOT_USER_MARKER
+        call = '<tool_call>{"name": "list_directory", "arguments": {"path": "."}}</tool_call>'
+        client = _ScriptedNativeClient([
+            Decision("", call),
+            Decision("", '<tool_call>{"name": "validate", "arguments": {}}</tool_call>')])
+        agent = self._agent(client, ["### Page\nSNAP-TURN-1 ref e9"])
+        agent.run("do it")
+        # Turn-1 request: system carries NO snapshot; the user turn ends with it.
+        msgs = client.seen_messages[0]
+        system = [m for m in msgs if m["role"] == "system"][0]["content"]
+        self.assertNotIn(SNAPSHOT_USER_MARKER, system)
+        self.assertNotIn("SNAP-TURN-1", system)
+        user = [m for m in msgs if m["role"] == "user"][-1]["content"]
+        self.assertIn(SNAPSHOT_USER_MARKER, user)
+        self.assertIn("SNAP-TURN-1 ref e9", user)
+        self.assertTrue(user.rstrip().endswith("SNAP-TURN-1 ref e9"))
+
+    def test_old_snapshots_pruned_from_history(self):
+        from vibeharness.prompt import (SNAPSHOT_USER_MARKER,
+                                         SNAPSHOT_PRUNED_PLACEHOLDER)
+        call = '<tool_call>{"name": "list_directory", "arguments": {"path": "."}}</tool_call>'
+        client = _ScriptedNativeClient([
+            Decision("", call),                        # turn 1
+            Decision("", call),                        # turn 2
+            Decision("", '<tool_call>{"name": "validate", "arguments": {}}</tool_call>')])
+        agent = self._agent(client, [
+            "### Page\nSNAP-ONE", "### Page\nSNAP-TWO", "### Page\nSNAP-THREE"])
+        agent.run("loop")
+        # On turn 3's request, the history holds turns 1 & 2's user messages. Only the
+        # MOST RECENT user turn with a snapshot keeps it; older ones are placeholdered.
+        msgs = client.seen_messages[2]
+        user_msgs = [m for m in msgs if m["role"] == "user"]
+        with_marker = [m for m in user_msgs if SNAPSHOT_USER_MARKER in m["content"]]
+        # Exactly one user message still carries a live snapshot block (the current turn).
+        self.assertEqual(len(with_marker), 1)
+        self.assertIn("SNAP-THREE", with_marker[0]["content"])
+        # The earlier turns were pruned to the placeholder, and their old snapshot text
+        # is gone, but the user message body (task reminder) survives.
+        joined = "\n".join(m["content"] for m in user_msgs)
+        self.assertIn(SNAPSHOT_PRUNED_PLACEHOLDER, joined)
+        self.assertNotIn("SNAP-ONE", joined)
+        self.assertNotIn("SNAP-TWO", joined)
+
+    def test_tool_observations_survive_pruning(self):
+        # Pruning strips only the snapshot block; action observations (tool messages)
+        # are untouched so the model keeps the record of what it did.
+        call = '<tool_call>{"name": "list_directory", "arguments": {"path": "."}}</tool_call>'
+        client = _ScriptedNativeClient([
+            Decision("", call),
+            Decision("", call),
+            Decision("", '<tool_call>{"name": "validate", "arguments": {}}</tool_call>')])
+        agent = self._agent(client, ["### Page\nA", "### Page\nB", "### Page\nC"])
+        agent.run("loop")
+        msgs = client.seen_messages[2]
+        tool_msgs = [m for m in msgs if m["role"] == "tool"]
+        self.assertGreaterEqual(len(tool_msgs), 2)  # one per executed turn-1/turn-2 call
+        self.assertTrue(all(m.get("content") for m in tool_msgs))
+
+
 if __name__ == "__main__":
     unittest.main()

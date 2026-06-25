@@ -34,7 +34,12 @@ from .codec import ToolCallCodec, get_codec
 from .config import Config
 from .llm import Decision, LLMClient
 from .memory import NarrativeMemory
-from .prompt import build_turn_prompt
+from .prompt import (
+    SNAPSHOT_PRUNED_PLACEHOLDER,
+    SNAPSHOT_USER_MARKER,
+    append_snapshot_to_user,
+    build_turn_prompt,
+)
 from .registry import ToolRegistry
 from .reporting import NullReporter, Reporter
 from .snapshot_budget import estimate_tokens, input_budget_tokens
@@ -122,7 +127,8 @@ class RalphAgent:
                  config: Config, validator: Validator, reporter: Reporter | None = None,
                  system_prompt_provider: Callable[[], str] | None = None,
                  codec: ToolCallCodec | None = None,
-                 validator_context_provider: Callable[[str], str] | None = None):
+                 validator_context_provider: Callable[[str], str] | None = None,
+                 snapshot_provider: Callable[[str], str] | None = None):
         self._client = client
         self._registry = registry
         self._system = system_prompt
@@ -138,6 +144,12 @@ class RalphAgent:
         # agent had, WITHOUT tool descriptions / format instructions. When None, the
         # validator falls back to seeing only the action history (no page context).
         self._validator_context_provider = validator_context_provider
+        # Issue #146: per-turn provider of the live page snapshot to append to the END
+        # of the user turn (the high-attention recency slot). It is sized against the
+        # rest of the message by the same #43 dynamic budget the system-prompt provider
+        # uses. When None (no web / fs runs / unit tests), no snapshot is appended and the
+        # user turn is unchanged.
+        self._snapshot_provider = snapshot_provider
         # Cached arity of the provider (does it accept the per-turn user message?).
         # Resolved lazily on first use so the inspection happens once per run.
         self._provider_wants_user: bool | None = None
@@ -232,6 +244,20 @@ class RalphAgent:
                         user += (f"\n\n<user_advice>The human user gives you the following "
                                  f"hint: '{hint}'</user_advice>")
                 system = self._build_system(user)
+                # Keep the snapshot-free user message for the validator's context
+                # budgeting (#57): the validator builds its OWN context (task + workspace
+                # + page section) and must size the snapshot against the user WITHOUT the
+                # agent's appended snapshot, or it would double-count it.
+                user_base = user
+                # Issue #146: append the LIVE page snapshot to the END of the user turn
+                # (the recency slot — research: WebArena/SeeAct put observations in the
+                # user turn; "Lost in the Middle" shows the END maximises attention to the
+                # current page state). The snapshot is budgeted (#43) against the user
+                # message BEFORE this append, so it is sized AND captured exactly once —
+                # _build_system(user) and the snapshot provider share a per-turn cache.
+                # Done for BOTH the native and legacy paths so the model always sees the
+                # current page at the bottom of its prompt.
+                user = self._append_snapshot(user)
                 if self._native:
                     decision = self._decide_chat(system, chat_history, user, constraint)
                 else:
@@ -301,7 +327,7 @@ class RalphAgent:
                         if _ti > 0:
                             time.sleep(1)  # 1-second safety gap between batched calls
                         if tool_name == "validate":
-                            self._validate(args, turn, memory, result, user)
+                            self._validate(args, turn, memory, result, user_base)
                             if result.finished:
                                 break
                             continue
@@ -395,6 +421,12 @@ class RalphAgent:
                 # budget. Skipped on the legacy path (chat_history stays empty/unused).
                 if self._native:
                     self._commit_turn_to_history(chat_history, user, decision, turn)
+                    # Issue #146: prune the snapshot block from EVERY user turn in history.
+                    # Every committed snapshot is now stale — the NEXT request appends a
+                    # fresh user turn carrying the newest snapshot — so only that latest
+                    # snapshot should be visible to the model. Old snapshots are pure noise
+                    # that contradicts the current page. Action observations are preserved.
+                    self._prune_old_snapshots(chat_history)
                     self._evict_history(chat_history, system, user)
             except BaseException as exc:
                 # Failsafe: any unexpected mid-turn error (an uncaught tool/validator/
@@ -439,6 +471,42 @@ class RalphAgent:
         if self._provider_wants_user is None:
             self._provider_wants_user = _accepts_one_positional(provider)
         return provider(user) if self._provider_wants_user else provider()
+
+    def _append_snapshot(self, user: str) -> str:
+        """Append this turn's budgeted live page snapshot to the END of the user message
+        (issue #146). No-op when no snapshot provider is wired or it yields "" (fs/non-web
+        runs, or a turn where the #43 budget left no room)."""
+        provider = self._snapshot_provider
+        if provider is None:
+            return user
+        snapshot = provider(user)
+        return append_snapshot_to_user(user, snapshot)
+
+    def _prune_old_snapshots(self, chat_history: list[dict]) -> None:
+        """Strip stale snapshot blocks from chat history, keeping ONLY the latest (#146).
+
+        Old page snapshots accumulate noise and contradict the current page state — and
+        the model attends most to the END of its context ("Lost in the Middle"), so a
+        stale snapshot buried in history actively misleads. Every snapshot already in
+        ``chat_history`` is OLDER than the one on the current turn (the fresh ``user``
+        message, appended at request time in ``_decide_chat``, always carries the newest
+        capture), so we prune the snapshot block from EVERY user message in history,
+        leaving only the current turn's snapshot visible to the model.
+
+        We replace each appended snapshot block — everything from the marker's
+        ``\\n\\n---\\n`` separator to the end of that user message (it is always appended
+        last) — with a short placeholder, so the turn's task/narrative text and the action
+        observations (the role:"tool" messages) are preserved: history keeps WHAT happened
+        while only the freshest snapshot shows WHAT the page looks like now. Idempotent:
+        an already-pruned message has no marker and is skipped."""
+        for m in chat_history:
+            if m.get("role") != "user":
+                continue
+            content = m.get("content") or ""
+            cut = content.find(f"\n\n---\n{SNAPSHOT_USER_MARKER}")
+            if cut == -1:
+                continue
+            m["content"] = content[:cut] + f"\n\n{SNAPSHOT_PRUNED_PLACEHOLDER}"
 
     def _validator_context(self, user: str) -> str:
         """The tool-less main system prompt to hand the validator (issue #57).
