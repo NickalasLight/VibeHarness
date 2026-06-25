@@ -19,7 +19,7 @@ import json
 import re
 import threading
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace as _dc_replace
 
 from typing import Callable
 
@@ -283,24 +283,25 @@ class RalphAgent:
                     self._record(turn, Action(None, {}, f"your last response was invalid and "
                                               f"could not be run: {error}.", ok=False), memory)
                 else:
-                    # Defensive guard: even if a batch slips past the schema cap, only the
-                    # first `limit` actions run. Explicitly list the dropped calls so the
-                    # model can re-issue them with the SAME tools on the next turn — silent
-                    # dropping caused the Country combobox to be re-attempted with fill
-                    # instead of select_option in iter3 (13 wasted turns).
+                    # Defensive guard: if the model emits more tool calls than the per-turn
+                    # limit, silently keep only the first `limit` and discard the rest.
+                    # The excess calls are also stripped from `decision` so chat history
+                    # appears as if the model only ever requested the executed calls —
+                    # no error is surfaced, no "re-issue" noise added to the context.
                     if limit > 0 and len(actions) > limit:
-                        dropped_calls = actions[limit:]
                         actions = actions[:limit]
-                        dropped_desc = "; ".join(
-                            f"{t}({', '.join(f'{k}={repr(v)[:40]}' for k, v in (a or {}).items())})"
-                            for t, a in dropped_calls
-                        )
-                        self._record(turn, Action(None, {}, (
-                            f"ERROR: you emitted {limit + len(dropped_calls)} actions but the "
-                            f"per-turn limit is {limit}. The following {len(dropped_calls)} "
-                            f"action(s) were NOT executed — re-issue them on your NEXT turn "
-                            f"with the SAME tools and exact values: {dropped_desc}"
-                        ), ok=False), memory)
+                        if decision.tool_calls:
+                            decision = _dc_replace(
+                                decision, tool_calls=decision.tool_calls[:limit])
+                        elif decision.action_json:
+                            # Text-based path: strip excess <tool_call> blocks from content.
+                            _tc_blocks = re.findall(
+                                r"<tool_call>[\s\S]*?</tool_call>", decision.action_json)
+                            if len(_tc_blocks) > limit:
+                                _end = decision.action_json.rindex(_tc_blocks[limit - 1]) + len(
+                                    _tc_blocks[limit - 1])
+                                decision = _dc_replace(
+                                    decision, action_json=decision.action_json[:_end])
                     for _ti, (tool_name, args) in enumerate(actions):
                         if _ti > 0:
                             time.sleep(1)  # 1-second safety gap between batched calls

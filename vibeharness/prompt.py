@@ -74,6 +74,8 @@ progress. Keep going until the task is fully done, then call `validate`.
 calling format — do NOT paste tool definitions or wrap calls in markdown.
 - Each action's result is returned to you as a tool message. Use it to decide your \
 next turn. On an error, adapt — never repeat the same failing call.
+- You may call at most {max_actions} tool(s) per turn. Batch related actions together \
+when useful, but never exceed this limit.
 - When the task is genuinely done, end your turn with `validate` plus a short \
 summary. A validator checks your work: if it agrees the run ends; otherwise you get \
 feedback on what is missing — fix it and validate again.
@@ -155,7 +157,10 @@ class SystemPromptBuilder:
             if native_tools:
                 # Ollama injects the tools + format instructions from the model's own
                 # template; omit the harness's `# Tools` docs and format block.
-                body = _SYSTEM_TEMPLATE_NATIVE.format(tool_guidance=tool_guidance)
+                max_actions_label = (str(self._max_actions)
+                                     if self._max_actions > 0 else "multiple")
+                body = _SYSTEM_TEMPLATE_NATIVE.format(
+                    tool_guidance=tool_guidance, max_actions=max_actions_label)
             else:
                 # The active codec may supply its own tool-definition rendering (issue
                 # #105 / #123): a Hermes/Qwen model reads tools as a <tools> function-schema
