@@ -2182,10 +2182,10 @@ def capture_page_snapshot_raw(cli: PlaywrightCli) -> str:
 
     Blank-snapshot recovery: if the first capture returns about:blank or empty ARIA
     (stale orphaned browser attaches snapshot subprocess to wrong context), wait 1.5s
-    and retry once. Warns to stderr if still blank so the anomaly is diagnosable.
+    and retry once. Silently returns the blank text if still blank after retry — the
+    caller's observation path handles this gracefully with no error output.
     """
     import time as _time
-    import sys as _sys
     for attempt in range(2):
         try:
             ok, output = _capture(cli)
@@ -2197,12 +2197,7 @@ def capture_page_snapshot_raw(cli: PlaywrightCli) -> str:
         if not _snapshot_is_blank(text):
             return text
         if attempt == 0:
-            _sys.stderr.write(
-                "\nwarning: snapshot returned about:blank / empty — retrying in 1.5s "
-                "(possible stale browser context)\n"
-            )
             _time.sleep(1.5)
-    _sys.stderr.write("\nwarning: snapshot still blank after retry — model will have no page context this turn\n")
     return text
 
 
