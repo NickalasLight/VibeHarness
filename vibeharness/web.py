@@ -133,6 +133,7 @@ _NO_MATCH_MARKERS: tuple[str, ...] = (
     "could not find element",
     "waiting for locator",  # playwright timeout phrasing when a locator never appears
     "timeout",
+    "modal state",          # upload without an open OS file-picker (issue #144)
 )
 
 
@@ -191,6 +192,36 @@ _OPTION_LINE_RE = re.compile(
     r'\s+"(?P<name>(?:[^"\\]|\\.)*)"',
     re.IGNORECASE,
 )
+
+
+def _snapshot_line_for_ref(snapshot: str, ref: str | None) -> str | None:
+    """Return the snapshot line carrying ``[ref=<ref>]`` (stripped), or None."""
+    if not ref:
+        return None
+    for line in (snapshot or "").splitlines():
+        if f"[ref={ref}]" in line:
+            return line.strip()
+    return None
+
+
+def target_is_open_listbox(snapshot: str, target: str) -> bool:
+    """True when ``target``'s snapshot line is an OPEN listbox/option container.
+
+    A custom combobox's TRIGGER is rendered as ``button [role=combobox]``; once opened, the
+    overlay it spawns is a separate ``listbox`` node (with ``option`` children). When the
+    agent mistakenly calls select_option on that LISTBOX (or an OPTION) ref instead of the
+    trigger, the popup is ALREADY open — pressing Escape (the normal trigger path) would CLOSE
+    it without selecting (iter-3 turn 5: select_option(e188=listbox) -> Escape closed it ->
+    Country never set). Detecting this lets the caller skip Escape+click and click the matching
+    option directly in the already-open list."""
+    line = _snapshot_line_for_ref(snapshot, normalize_ref(target))
+    if not line:
+        return False
+    low = line.lower()
+    # The target's own line is the listbox container, or is itself a selectable option.
+    if "listbox" in low:
+        return True
+    return bool(_OPTION_LINE_RE.search(line))
 
 
 def find_option_ref_by_text(snapshot: str, value: str) -> str | None:
@@ -331,6 +362,26 @@ def _interactable_ref_lines(snapshot: str, limit: int = 40) -> list[str]:
     return out
 
 
+def _extract_validation_alerts(snapshot: str) -> list[str]:
+    """Return the text of any ``alert`` nodes in ``snapshot`` (client-side validation errors).
+
+    A wizard step that rejects a Continue click renders one ``alert [ref=eN]: <message>``
+    line per invalid field (iter-2 Step 2: "Invalid enum value... received ''" for the
+    unset work arrangement, "Please choose a valid date"). Surfacing these verbatim lets
+    the steer name the EXACT fields still blocking advancement instead of leaving the model
+    to re-click Continue blindly (iter-2 turns 16-19: 4 blind Continue clicks, never read
+    the errors, never advanced)."""
+    alerts: list[str] = []
+    for line in (snapshot or "").splitlines():
+        # Snapshot shape: '- alert [ref=e189]: Invalid enum value. Expected ...'
+        m = re.search(r"\balert\b[^:]*\[ref=e\d+\][^:]*:\s*(.+?)\s*$", line)
+        if m:
+            text = m.group(1).strip()
+            if text and text not in alerts:
+                alerts.append(text)
+    return alerts
+
+
 def _check_dom_delta(cli: "PlaywrightCli", before_snapshot: str,
                      result: "ToolResult") -> "ToolResult":
     """Append a DOM-change summary to ``result`` when new elements appeared.
@@ -346,8 +397,12 @@ def _check_dom_delta(cli: "PlaywrightCli", before_snapshot: str,
         return result
     after = capture_page_snapshot_raw(cli) or ""
     new_refs = _diff_snapshot_refs(before_snapshot, after)
-    if not new_refs:
-        return result
+    # NOTE (iter-3 fix): do NOT early-return when ``new_refs`` is empty. A blind Continue
+    # re-click on a step whose validation errors are ALREADY rendered produces NO new refs
+    # (the alert nodes were created by the FIRST rejected Continue and persist), yet the form
+    # is still stuck — the model needs the "FORM NOT ADVANCED" steer EVERY time it re-clicks
+    # Continue while errors are visible, not only the first time (iter-3 turns 6-9: 4 blind
+    # Continue clicks, Country alert pre-existing -> no new refs -> steer never re-fired).
     # PAGE-ADVANCE detection (iter-2): a wizard Continue/Back click swaps the ENTIRE step
     # — most old refs vanish and a fresh batch appears. Distinguish that from a small
     # in-place change (a dropdown opening, an inline error). When the page substantially
@@ -367,6 +422,33 @@ def _check_dom_delta(cli: "PlaywrightCli", before_snapshot: str,
             + "\n".join(f"  {line}" for line in controls[:40])
         )
         return ToolResult(result.ok, (result.observation or "") + delta_msg)
+    # VALIDATION-REJECT detection (iter-2 fix; iter-3 extension): the page did NOT turn over
+    # (no page advance), but `alert` nodes are visible — i.e. a Continue/Submit click was
+    # REJECTED by client-side validation. Tell the model the EXACT errors and that the form did
+    # not advance, so it fixes the named fields instead of re-clicking Continue blindly.
+    #
+    # ITER-3 FIX: surface ALL currently-visible alerts, not just NEWLY-appeared ones. After the
+    # FIRST rejected Continue, the alert nodes persist in the DOM. A subsequent Continue re-click
+    # that leaves a field still unset produces NO new alert (it was already there) — under the
+    # old new-alerts-only check the steer went silent and the agent looped Continue blindly
+    # (iter-3 turns 6-9: Country alert pre-existing from turn 2, never re-surfaced, 4 wasted
+    # clicks). Any alert visible after a Continue means the form is still rejecting, so we
+    # always re-surface them.
+    alerts = _extract_validation_alerts(after)
+    if alerts:
+        errs = "\n".join(f"  • {a}" for a in alerts)
+        reject_msg = (
+            "\n\nFORM NOT ADVANCED — the page did NOT move to the next step. The form is still "
+            "REJECTED by validation. Fix these errors BEFORE clicking Continue again:\n"
+            + errs
+            + "\nFor each error: find the matching field in the snapshot above and set it "
+            "(select_option for dropdowns, the calendar for dates). Do NOT click Continue "
+            "again until every error above is resolved — re-clicking it without fixing them "
+            "does nothing."
+        )
+        return ToolResult(result.ok, (result.observation or "") + reject_msg)
+    if not new_refs:
+        return result
     new_lines = _extract_ref_lines(new_refs, after)
     delta_msg = (
         f"\n\nDOM CHANGE DETECTED: {len(new_refs)} new element(s) appeared:\n"
@@ -1064,6 +1146,17 @@ class SelectOptionTool(_WebTool):
             misfire = self._guard_date_target(args.get("target", ""), before)
             if misfire is not None:
                 return misfire
+        # SPINBUTTON GUARD (iter-2 fix): a number stepper (spinbutton) is not a dropdown
+        # and cannot be interacted with via select_option. Its value is set by clicking the
+        # adjacent Increase/Decrease buttons (not the spinbutton container itself). The guard
+        # detects a spinbutton target and returns a message pointing to the correct Increase
+        # button ref so the agent can batch-click it to reach the target value.
+        # Must run BEFORE _target_is_plain_button because "spinbutton" contains "button" and
+        # the plain-button guard would otherwise fire with a less specific 'use click(eN)'
+        # message that points to the spinbutton container — not the Increase button.
+        sb = self._guard_spinbutton(args.get("target", ""), before)
+        if sb is not None:
+            return sb
         # PLAIN-BUTTON GUARD (iter-2): the model sometimes calls select_option on a real
         # <button> (e.g. "Continue →"/"Submit") instead of click. The custom-combobox
         # fallback would then just CLICK the button — which "works" once but records the
@@ -1151,6 +1244,55 @@ class SelectOptionTool(_WebTool):
         )
 
     @staticmethod
+    def _guard_spinbutton(target: str, snapshot: str) -> "ToolResult | None":
+        """Reject select_option on a spinbutton, pointing to its Increase button (iter-2).
+
+        A number stepper (spinbutton) cannot be interacted with via select_option or fill
+        — the value is changed by clicking its adjacent Increase/Decrease BUTTONS. When the
+        agent calls select_option on a spinbutton ref, return a targeted message naming the
+        correct Increase button ref so the agent clicks the right thing immediately. Must
+        run BEFORE _target_is_plain_button, since spinbutton lines contain 'button' as a
+        substring and would otherwise be caught by the plain-button guard with a less
+        specific 'use click(eN)' message that points to the spinbutton container (wrong)."""
+        ref = normalize_ref(target)
+        if ref is None:
+            return None
+        lines = (snapshot or "").splitlines()
+        for i, line in enumerate(lines):
+            if f"[ref={ref}]" not in line:
+                continue
+            if "spinbutton" not in line.lower():
+                return None  # not a spinbutton -> let normal path handle it
+            # Found the spinbutton. Search forward for the Increase button.
+            increase_ref = None
+            for j in range(i + 1, min(i + 8, len(lines))):
+                sib = lines[j]
+                if "increase" in sib.lower() and "[ref=" in sib:
+                    m = re.search(r"\[ref=(e\d+)\]", sib)
+                    if m:
+                        increase_ref = m.group(1)
+                        break
+            if increase_ref:
+                return ToolResult(
+                    False,
+                    f"'{target}' is a NUMBER STEPPER (spinbutton) — select_option/fill do "
+                    f"NOT apply. To increment it click the INCREASE BUTTON '{increase_ref}' "
+                    f"(aria-label 'Increase …') — NOT the spinbutton container '{target}' "
+                    f"which only focuses the field without changing the value. "
+                    f"To set the value to 9: click(target='{increase_ref}') nine times. "
+                    f"You can batch all 9 clicks in one turn.",
+                )
+            return ToolResult(
+                False,
+                f"'{target}' is a NUMBER STEPPER (spinbutton) — select_option/fill do not "
+                f"apply. Find the 'Increase …' button sibling in the snapshot (it is a "
+                f"button whose aria-label starts with 'Increase') and click it once per "
+                f"unit (9 times to reach 9). Do NOT click the spinbutton container "
+                f"itself — only the Increase/Decrease sibling buttons change the value.",
+            )
+        return None  # target not in snapshot -> fail open
+
+    @staticmethod
     def _target_is_plain_button(target: str, snapshot: str) -> "ToolResult | None":
         """Steer to `click` when ``target`` is a plain <button> (not a dropdown).
 
@@ -1159,7 +1301,8 @@ class SelectOptionTool(_WebTool):
         "Continue →"/"Submit"), so select_option does not accidentally click it and poison
         the anti-loop guard (iter-2). Returns ``None`` (proceed) for combobox-buttons
         (`button` lines that ALSO say combobox/listbox/haspopup) and when the target can't
-        be found (fail open)."""
+        be found (fail open). Spinbuttons are excluded here — they are handled earlier by
+        _guard_spinbutton, which gives a more targeted message about the Increase button."""
         ref = normalize_ref(target)
         if ref is None:
             return None
@@ -1170,7 +1313,9 @@ class SelectOptionTool(_WebTool):
             if "button" not in low:
                 return None  # not a button line -> let normal path handle it
             # A combobox/listbox rendered as a button IS a dropdown -> proceed normally.
-            if any(k in low for k in ("combobox", "listbox", "haspopup", "select", "expanded")):
+            # Spinbuttons contain 'button' as a substring but are handled by _guard_spinbutton.
+            if any(k in low for k in ("combobox", "listbox", "haspopup", "select", "expanded",
+                                      "spinbutton")):
                 return None
             return ToolResult(
                 False,
@@ -1196,6 +1341,45 @@ class SelectOptionTool(_WebTool):
 
         Returns a :class:`ToolResult`, or ``None`` to fall back to the original error
         (e.g. the trigger click itself failed for a non-combobox reason)."""
+        # ITER-4 FIX (root cause 2): the agent sometimes calls select_option on the OPEN
+        # listbox container (or one of its option nodes) instead of the combobox TRIGGER —
+        # i.e. the dropdown is ALREADY open. The normal path below presses Escape first to
+        # clear stray overlays, but here that Escape would CLOSE the very listbox we want and
+        # the selection would never happen (iter-3 turn 5: select_option(e188=listbox,
+        # 'United States') -> Escape closed it -> click on now-invisible e188 -> Country never
+        # set -> 4 blind Continue clicks). When the target is itself an open listbox/option,
+        # skip Escape+trigger-click entirely and click the matching option directly from the
+        # already-visible options.
+        pre_snapshot = capture_page_snapshot_raw(self._cli) or ""
+        if target_is_open_listbox(pre_snapshot, target):
+            ref = find_option_ref_by_text(pre_snapshot, value)
+            if ref is None:
+                return ToolResult(
+                    True,
+                    f"the '{value}' option's dropdown is already OPEN. Its options are shown in "
+                    f"the page snapshot — click the one matching '{value}' by its ref (do not "
+                    f"call select_option on the listbox container itself).")
+            ok, out = self._cli.run("click", ref)
+            if ok and output_signals_no_match(out):
+                ok = False
+            if not ok:
+                return ToolResult(
+                    False,
+                    f"the dropdown was already open but clicking the '{value}' option ({ref}) "
+                    f"failed: {self._trim(out)}")
+            return ToolResult(
+                True,
+                f"you selected '{value}' by clicking option {ref} in the already-open dropdown. "
+                f"Result:\n{self._trim(out)}")
+        # ITER-3 FIX: if another dropdown/listbox is currently open (e.g. the agent called
+        # select_option on two comboboxes in the same turn), its overlay intercepts the click
+        # on ``target`` and prevents this combobox from opening — which makes the fallback
+        # click return ok=True but the calendar/listbox never appears, causing _select_via_combobox
+        # to return None and propagate the native "not a <select>" error (root cause of the
+        # work-arrangement + date-picker interference on Step 2 in iter-2). Press Escape first
+        # to close any open popup/listbox so the click reaches the actual trigger.
+        self._cli.run("press", "Escape")
+        time.sleep(0.15)
         ok, out = self._cli.run("click", target)
         if not ok and output_signals_session_closed(out):
             return ToolResult(False, f"you tried to open the '{target}' dropdown but the browser "
@@ -1309,6 +1493,281 @@ class SelectOptionTool(_WebTool):
                           f"navigated to {iso_date[:7]}, and clicked day {day_ref}).")
 
 
+# A spinbutton's adjacent display generic shows its current value as "<number> yrs"
+# (e.g. "0 yrs", "9 yrs"). Used to read the current value when no aria-valuenow is
+# captured in the snapshot. Captures the first integer on/near the spinbutton line.
+_SPINBUTTON_YRS_RE = re.compile(r"(\d+)\s*yrs?\b", re.IGNORECASE)
+# aria-valuenow is the authoritative current value when the snapshot exposes it on the
+# spinbutton line (e.g. "spinbutton ... [valuenow=2]" / "aria-valuenow=\"2\"").
+_VALUENOW_RE = re.compile(r'(?:aria-)?valuenow[=:]\s*"?(\d+)"?', re.IGNORECASE)
+
+
+def spinbutton_current_value(snapshot: str, ref: str) -> int | None:
+    """Best-effort current integer value of the spinbutton ``ref`` from ``snapshot``.
+
+    Reads, in priority order: an ``aria-valuenow``/``valuenow`` on the spinbutton's own
+    line, then a ``<number> yrs`` display on the spinbutton line or the line immediately
+    after it (the adjacent display generic, e.g. ``generic [ref=eN]: "0 yrs"``). Returns
+    ``None`` when the ref isn't present or no value can be read (the caller then refuses
+    to act rather than guess)."""
+    if not ref:
+        return None
+    lines = (snapshot or "").splitlines()
+    for i, line in enumerate(lines):
+        if f"[ref={ref}]" not in line:
+            continue
+        m = _VALUENOW_RE.search(line)
+        if m:
+            return int(m.group(1))
+        m = _SPINBUTTON_YRS_RE.search(line)
+        if m:
+            return int(m.group(1))
+        # Fall back to the adjacent display generic on the next couple of lines.
+        for j in range(i + 1, min(i + 3, len(lines))):
+            m = _SPINBUTTON_YRS_RE.search(lines[j])
+            if m:
+                return int(m.group(1))
+        return None
+    return None
+
+
+def find_stepper_button_ref(snapshot: str, ref: str, direction: str) -> str | None:
+    """Ref of the Increase/Decrease button adjacent to spinbutton ``ref`` in ``snapshot``.
+
+    ``direction`` is 'increase' or 'decrease'. Searches the lines following the
+    spinbutton (its sibling stepper buttons, e.g. ``button "Increase Total years…"``)
+    for a button whose accessible name starts with the direction word, returning its
+    ref. Returns ``None`` when no such sibling button is found."""
+    want = direction.lower()
+    lines = (snapshot or "").splitlines()
+    for i, line in enumerate(lines):
+        if f"[ref={ref}]" not in line:
+            continue
+        for j in range(i + 1, min(i + 10, len(lines))):
+            sib = lines[j]
+            low = sib.lower()
+            if want in low and "button" in low:
+                m = re.search(r"\[ref=(e\d+)\]", sib)
+                if m:
+                    return m.group(1)
+        return None
+    return None
+
+
+class SetSpinbuttonTool(_WebTool):
+    """Set a number stepper (role="spinbutton") to a target value in ONE tool call.
+
+    qwen3:4b makes exactly one LLM tool call per spinbutton click, so reaching "9 years"
+    used to cost nine LLM roundtrips per field (iter-4: stalled on page 3 with
+    totalExperienceYears stuck at 2). This tool reads the spinbutton's current value from
+    the snapshot, finds its adjacent Increase/Decrease sibling buttons, and clicks the
+    right one ``|target - current|`` times INSIDE Python — so the model sets the value in
+    a single roundtrip instead of N."""
+
+    name = "set_spinbutton"
+    description = (
+        "Set a spinbutton (numeric stepper) to a specific integer value by clicking its "
+        "Increase/Decrease buttons. Use this instead of clicking the Increase button many "
+        "times. Target the element whose role is 'spinbutton' (NOT the Increase/Decrease "
+        "buttons). " + _REF_NOTE
+    )
+    _verb = "set the spinbutton"
+    _required = ("target", "value")
+    _validate_target = True
+
+    # Refuse to click a stepper more than this many times in one call — a runaway delta
+    # almost certainly means a misread current value, and 50+ clicks would wedge the turn.
+    _MAX_CLICKS = 50
+
+    @property
+    def parameters(self):
+        return [
+            Param("target", "string", "Element ref (e.g. 'e730') of the spinbutton (the numeric "
+                  "stepper container, role='spinbutton') — never the Increase/Decrease button, and "
+                  "never a guessed CSS selector/class/id."),
+            Param("value", "integer", "The integer value to set the spinbutton to (e.g. 9)."),
+        ]
+
+    def _subject(self, args):
+        return f"spinbutton '{args.get('target')}'"
+
+    def _build(self, args):  # pragma: no cover - run() is overridden, never reached
+        return ["snapshot"]
+
+    def run(self, args: dict) -> ToolResult:
+        # Standard missing-param + ref-on-page guards (issues #51/#73).
+        missing = [p for p in self._required if args.get(p) in (None, "")]
+        if missing:
+            return ToolResult(False, f"you called `{self.name}` but did not provide: "
+                              f"{', '.join(missing)}.")
+        guard = self._guard_target(args)
+        if guard is not None:
+            return guard
+        target = normalize_ref(args.get("target", "") or "")
+        try:
+            value = int(args["value"])
+        except (TypeError, ValueError):
+            return ToolResult(False, f"you called `{self.name}` with a non-integer value "
+                              f"'{args.get('value')}'. Pass an integer, e.g. value=9.")
+
+        snapshot = capture_page_snapshot_raw(self._cli) or ""
+        # Confirm the target really is a spinbutton; if not, steer to the right tool so a
+        # mistargeted call doesn't blindly click a sibling button N times.
+        sb_line = _snapshot_line_for_ref(snapshot, target)
+        if sb_line is not None and "spinbutton" not in sb_line.lower():
+            return ToolResult(
+                False,
+                f"'{args.get('target')}' is not a spinbutton (its snapshot line is: {sb_line[:90]}). "
+                f"set_spinbutton only applies to a numeric stepper (role='spinbutton'). Use fill "
+                f"for text inputs, select_option for dropdowns, or click for buttons.")
+
+        current = spinbutton_current_value(snapshot, target)
+        if current is None:
+            current = 0  # display not parseable -> assume the stepper starts at 0
+        delta = value - current
+        if delta == 0:
+            return ToolResult(True, f"spinbutton '{args.get('target')}' is already {value} — "
+                              f"no clicks needed.")
+        direction = "increase" if delta > 0 else "decrease"
+        clicks = abs(delta)
+        if clicks > self._MAX_CLICKS:
+            return ToolResult(
+                False,
+                f"refusing to click the stepper {clicks} times to go from {current} to {value} "
+                f"(over the {self._MAX_CLICKS}-click safety limit). Re-check the target value; "
+                f"if it really needs that many steps, set it in smaller increments.")
+
+        button_ref = find_stepper_button_ref(snapshot, target, direction)
+        if button_ref is None:
+            return ToolResult(
+                False,
+                f"could not find the '{direction.capitalize()}' button next to spinbutton "
+                f"'{args.get('target')}' in the snapshot. The stepper's Increase/Decrease buttons "
+                f"are siblings of the spinbutton — re-read the live page snapshot and use the "
+                f"button whose label starts with '{direction.capitalize()}'.")
+
+        before = capture_page_snapshot_raw(self._cli) or ""
+        for n in range(clicks):
+            ok, out = self._cli.run("click", button_ref)
+            if ok and output_signals_no_match(out):
+                ok = False
+            if not ok:
+                if output_signals_session_closed(out):
+                    return ToolResult(
+                        False,
+                        f"you tried to set spinbutton '{args.get('target')}' but the browser "
+                        f"session is closed and could not be restored. Call `open_browser`, then "
+                        f"`goto` your URL and continue.")
+                return ToolResult(
+                    False,
+                    f"set spinbutton '{args.get('target')}' partway: clicked {direction.capitalize()} "
+                    f"({button_ref}) {n} of {clicks} times before a click failed: {self._trim(out)}")
+        result = ToolResult(
+            True,
+            f"you set spinbutton '{args.get('target')}' to {value} (clicked {direction.capitalize()} "
+            f"button {button_ref} {clicks} time(s), from {current}).")
+        return _check_dom_delta(self._cli, before, result)
+
+
+class DrawSignatureTool(_WebTool):
+    """Draw a signature stroke on a canvas drawing pad (SignaturePad component).
+
+    The Review & Submit page has a canvas element (role='img', aria-label='Signature')
+    that requires drawn pointer-event strokes — fill/click cannot activate it.
+    This tool dispatches pointerdown + pointermove + pointerup via JS evaluate to
+    simulate a drawn stroke, satisfying the 'Please provide your signature' validation.
+
+    The SignaturePad React component sets drawing.current=true and calls ctx.beginPath/
+    moveTo BEFORE setPointerCapture, so the stroke lands even if setPointerCapture
+    throws for synthetic events. We wrap that dispatchEvent in try/catch to absorb it.
+    """
+
+    name = "draw_signature"
+    description = (
+        "Draw a signature stroke on the canvas signature pad on the Review & Submit page. "
+        "Use when the form shows 'Please provide your signature'. "
+        "Pass the ref of the signature canvas (role='img', aria-label='Signature'). "
+        "Do NOT use this on the 'Type your full legal name' textbox — fill that separately first. "
+        + _REF_NOTE
+    )
+    _verb = "drew signature on"
+    _required = ("target",)
+    _validate_target = True
+
+    @property
+    def parameters(self):
+        return [
+            Param("target", "string",
+                  "Element ref of the signature canvas (role='img', aria-label='Signature') "
+                  "from the current snapshot. NOT the 'Type your full legal name' textbox."),
+        ]
+
+    def _subject(self, args):
+        return f"signature canvas '{args.get('target')}'"
+
+    def _build(self, args):  # pragma: no cover — run() is overridden
+        return ["snapshot"]
+
+    def run(self, args: dict) -> ToolResult:
+        missing = [p for p in self._required if args.get(p) in (None, "")]
+        if missing:
+            return ToolResult(False, f"you called `{self.name}` but did not provide: "
+                              f"{', '.join(missing)}.")
+        guard = self._guard_target(args)
+        if guard is not None:
+            return guard
+
+        # Dispatch pointer events on the signature canvas via JS evaluate.
+        # setPointerCapture in onPointerDown may throw for synthetic events, but
+        # drawing.current=true, ctx.beginPath, and ctx.moveTo all execute BEFORE it,
+        # so the stroke still registers. Wrap that dispatchEvent in try/catch.
+        js = (
+            "() => {"
+            "  const c = document.querySelector('canvas[aria-label=\"Signature\"]');"
+            "  if (!c) return 'ERROR: no canvas[aria-label=Signature] found';"
+            "  const r = c.getBoundingClientRect();"
+            "  const y  = r.top  + r.height * 0.5;"
+            "  const x1 = r.left + r.width  * 0.15;"
+            "  const xm = r.left + r.width  * 0.50;"
+            "  const x2 = r.left + r.width  * 0.85;"
+            "  const pe = (t, x) => new PointerEvent(t, {"
+            "    bubbles:true, cancelable:true,"
+            "    clientX:x, clientY:y,"
+            "    pointerId:1, pointerType:'mouse', isPrimary:true,"
+            "    button:0, buttons: t==='pointermove' ? 1 : 0"
+            "  });"
+            "  try { c.dispatchEvent(pe('pointerdown', x1)); } catch(e) {}"
+            "  c.dispatchEvent(pe('pointermove', xm));"
+            "  c.dispatchEvent(pe('pointermove', x2));"
+            "  c.dispatchEvent(pe('pointerup',   x2));"
+            "  return 'OK: stroke drawn across canvas (' + Math.round(r.width) + 'x' + Math.round(r.height) + ')';"
+            "}"
+        )
+
+        before = capture_page_snapshot_raw(self._cli) or ""
+        ok, output = self._cli.run("eval", js)
+        if not ok:
+            return ToolResult(
+                False,
+                f"you tried to draw a signature on canvas '{args.get('target')}' but the "
+                f"JS evaluate call failed: {self._trim(output)}. "
+                f"Make sure you are on the Review & Submit page with the signature canvas visible."
+            )
+        out_text = (output or "").strip()
+        if out_text.startswith("ERROR:"):
+            return ToolResult(
+                False,
+                f"you tried to draw a signature but: {out_text}. "
+                f"Confirm the signature canvas (role='img', aria-label='Signature') is on the page."
+            )
+        result = ToolResult(
+            True,
+            f"you drew a signature stroke on the canvas '{args.get('target')}'. "
+            f"Result: {out_text}"
+        )
+        return _check_dom_delta(self._cli, before, result)
+
+
 class CheckTool(_WebTool):
     name = "check"
     description = "Check a checkbox or radio button (no-op if already checked). " + _REF_NOTE
@@ -1401,7 +1860,16 @@ class DragTool(_WebTool):
 
 class UploadTool(_WebTool):
     name = "upload"
-    description = "Upload one or more files to the active file input."
+    description = (
+        "Upload a file to a file input. "
+        "TWO-STEP SEQUENCE REQUIRED: "
+        "(1) First CLICK the file-upload trigger element (a button or file input ref) in the "
+        "snapshot — this opens the OS file-picker dialog ('modal state'). "
+        "(2) Then immediately call `upload` with the ABSOLUTE file path. "
+        "Calling upload before clicking the trigger fails with a 'modal state' error. "
+        "Always pass the path EXACTLY as given in the task (absolute, e.g. "
+        "C:\\\\path\\\\to\\\\file.docx) — never shorten it to a relative path."
+    )
     _verb = "uploaded a file to"
     _required = ("file",)
 
@@ -1410,10 +1878,31 @@ class UploadTool(_WebTool):
 
     @property
     def parameters(self):
-        return [Param("file", "string", "Absolute path of the file to upload.")]
+        return [Param("file", "string",
+                      "Absolute path of the file to upload. Must be an absolute path "
+                      "(e.g. C:\\\\Users\\\\...\\\\file.docx), exactly as provided in the task. "
+                      "Never use a relative path.")]
 
     def _build(self, args):
         return ["upload", args["file"]]
+
+    def run(self, args: dict) -> ToolResult:
+        result = super().run(args)
+        # The Playwright-CLI upload tool is named 'browser_file_upload' internally.
+        # When the OS file-picker is not open it exits 0 with "modal state" in the
+        # output — which _run_impl now correctly marks ok=False via _NO_MATCH_MARKERS
+        # (issue #144). Clean up the error text so the agent sees 'upload' (the tool
+        # it called) instead of the internal 'browser_file_upload' name.
+        if not result.ok:
+            msg = result.message.replace("browser_file_upload", "upload")
+            if "modal state" in msg.lower():
+                msg = (
+                    "upload failed: the OS file-picker is not open (no 'modal state'). "
+                    "You must FIRST click the file-upload trigger button/input ref in the "
+                    "snapshot to open the picker, THEN call upload with the absolute path."
+                )
+            return ToolResult(False, msg)
+        return result
 
 
 class ScreenshotTool(_WebTool):
@@ -1614,6 +2103,7 @@ class SnapshotTool(_WebTool):
 # ``snapshot`` lets the agent explicitly request a fresh page view mid-turn.
 _WEB_TOOL_CLASSES: tuple[type[_WebTool], ...] = (
     GotoTool, ClickTool, FillTool, TypeTool, PressKeyTool, SelectOptionTool,
+    SetSpinbuttonTool, DrawSignatureTool,
     CheckTool, UncheckTool, HoverTool, DragTool, UploadTool,
     ReloadTool,
     # Excluded: OpenBrowserTool (goto opens browser automatically),
@@ -1751,7 +2241,19 @@ class WebToolset(Toolset):
             "is touched, and the rejection lists the refs that are actually available. "
             "If a cookie/consent banner or modal dialog blocks what you need, clear it first: "
             "locate its Accept / Agree / Reject / Dismiss / Continue control in the snapshot and "
-            "click that ref before doing anything else."
+            "click that ref before doing anything else. "
+            "FILE UPLOADS — two-step sequence: (1) click the upload trigger button or file-input "
+            "ref in the snapshot to open the OS file-picker, then (2) immediately call `upload` "
+            "with the ABSOLUTE path exactly as given in the task. Never use a relative path. "
+            "Calling `upload` before the picker is open fails with a 'modal state' error. "
+            "FORM VALIDATION ERRORS — if after clicking a 'Next'/'Weiter'/'Submit'/'Absenden' "
+            "button the form still shows (page did not advance, or a field is marked [invalid] / "
+            "shows 'Eingabe erforderlich'), do NOT click the button again. Instead locate the "
+            "field(s) marked [invalid] in the snapshot, fill or select the correct value, and "
+            "only then click the advance/submit button again. "
+            "FAILED TOOL CALLS — never repeat the EXACT same tool call that just failed. "
+            "If an action fails, change your approach: use a different ref, open a prerequisite "
+            "dialog, or take a different action entirely."
         )
 
     def create_tools(self, config: Config) -> list[Tool]:

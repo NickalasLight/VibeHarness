@@ -275,7 +275,7 @@ _ROLE_INFO: dict[str, tuple[str, str | None]] = {
     "textbox": ("text field", _AFF_FILL),
     "searchbox": ("search field", _AFF_FILL),
     "combobox": ("dropdown", _AFF_COMBO),     # ambiguous combobox -> select_option (has open+pick fallback)
-    "spinbutton": ("number field", _AFF_FILL),
+    "spinbutton": ("number stepper", "click the 'Increase …'/'Decrease …' button inside it — do NOT fill or select_option this element"),
     # genuine option pickers -> select_option
     "listbox": ("dropdown list", _AFF_SELECT),
     "select": ("dropdown list", _AFF_SELECT),

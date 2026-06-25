@@ -1,0 +1,27 @@
+# Job Application
+
+Apply for the following job on behalf of the candidate below.
+
+**Job URL:** http://localhost:3000/careers/senior-csharp-developer-wien-FILL-2024-0001
+
+## Candidate Information
+
+- Name: Jakob Steinberg
+- Date of Birth: 1990-03-15
+- Nationality: German (Deutschland)
+- Address: Mariahilfer Straße 45, 1060 Wien, Austria
+  (Street and house number may be separate fields)
+- Email: jakob.steinberg.dev@example.com
+- Phone: +43 660 1234567
+- How did you hear about this position: Sonstiges
+
+## Documents
+
+- CV / Resume: C:\git\vibethinkharnessProto1\test_assets\jason_statham_resume.docx
+- Cover Letter: C:\git\vibethinkharnessProto1\test_assets\jason_statham_cover_letter.docx
+
+## Instructions
+
+Complete the full application form and submit it. Use only the candidate information provided above — do not invent any details. If a required field has no value listed here, leave it blank rather than making something up.
+
+You are done when the application has been submitted and the page confirms it was received.
