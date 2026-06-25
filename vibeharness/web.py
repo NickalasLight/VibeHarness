@@ -193,6 +193,36 @@ _OPTION_LINE_RE = re.compile(
 )
 
 
+def _snapshot_line_for_ref(snapshot: str, ref: str | None) -> str | None:
+    """Return the snapshot line carrying ``[ref=<ref>]`` (stripped), or None."""
+    if not ref:
+        return None
+    for line in (snapshot or "").splitlines():
+        if f"[ref={ref}]" in line:
+            return line.strip()
+    return None
+
+
+def target_is_open_listbox(snapshot: str, target: str) -> bool:
+    """True when ``target``'s snapshot line is an OPEN listbox/option container.
+
+    A custom combobox's TRIGGER is rendered as ``button [role=combobox]``; once opened, the
+    overlay it spawns is a separate ``listbox`` node (with ``option`` children). When the
+    agent mistakenly calls select_option on that LISTBOX (or an OPTION) ref instead of the
+    trigger, the popup is ALREADY open — pressing Escape (the normal trigger path) would CLOSE
+    it without selecting (iter-3 turn 5: select_option(e188=listbox) -> Escape closed it ->
+    Country never set). Detecting this lets the caller skip Escape+click and click the matching
+    option directly in the already-open list."""
+    line = _snapshot_line_for_ref(snapshot, normalize_ref(target))
+    if not line:
+        return False
+    low = line.lower()
+    # The target's own line is the listbox container, or is itself a selectable option.
+    if "listbox" in low:
+        return True
+    return bool(_OPTION_LINE_RE.search(line))
+
+
 def find_option_ref_by_text(snapshot: str, value: str) -> str | None:
     """Find the ref of an OPEN-listbox option whose visible text matches ``value``.
 
@@ -366,8 +396,12 @@ def _check_dom_delta(cli: "PlaywrightCli", before_snapshot: str,
         return result
     after = capture_page_snapshot_raw(cli) or ""
     new_refs = _diff_snapshot_refs(before_snapshot, after)
-    if not new_refs:
-        return result
+    # NOTE (iter-3 fix): do NOT early-return when ``new_refs`` is empty. A blind Continue
+    # re-click on a step whose validation errors are ALREADY rendered produces NO new refs
+    # (the alert nodes were created by the FIRST rejected Continue and persist), yet the form
+    # is still stuck — the model needs the "FORM NOT ADVANCED" steer EVERY time it re-clicks
+    # Continue while errors are visible, not only the first time (iter-3 turns 6-9: 4 blind
+    # Continue clicks, Country alert pre-existing -> no new refs -> steer never re-fired).
     # PAGE-ADVANCE detection (iter-2): a wizard Continue/Back click swaps the ENTIRE step
     # — most old refs vanish and a fresh batch appears. Distinguish that from a small
     # in-place change (a dropdown opening, an inline error). When the page substantially
@@ -387,18 +421,24 @@ def _check_dom_delta(cli: "PlaywrightCli", before_snapshot: str,
             + "\n".join(f"  {line}" for line in controls[:40])
         )
         return ToolResult(result.ok, (result.observation or "") + delta_msg)
-    # VALIDATION-REJECT detection (iter-2 fix): the page did NOT turn over (no page advance),
-    # but new `alert` nodes appeared — i.e. a Continue/Submit click was REJECTED by client-side
-    # validation. Tell the model the EXACT errors and that the form did not advance, so it fixes
-    # the named fields instead of re-clicking Continue blindly (iter-2 turns 16-19: 4 wasted
-    # Continue clicks, run died on Step 2 never having set the work arrangement).
+    # VALIDATION-REJECT detection (iter-2 fix; iter-3 extension): the page did NOT turn over
+    # (no page advance), but `alert` nodes are visible — i.e. a Continue/Submit click was
+    # REJECTED by client-side validation. Tell the model the EXACT errors and that the form did
+    # not advance, so it fixes the named fields instead of re-clicking Continue blindly.
+    #
+    # ITER-3 FIX: surface ALL currently-visible alerts, not just NEWLY-appeared ones. After the
+    # FIRST rejected Continue, the alert nodes persist in the DOM. A subsequent Continue re-click
+    # that leaves a field still unset produces NO new alert (it was already there) — under the
+    # old new-alerts-only check the steer went silent and the agent looped Continue blindly
+    # (iter-3 turns 6-9: Country alert pre-existing from turn 2, never re-surfaced, 4 wasted
+    # clicks). Any alert visible after a Continue means the form is still rejecting, so we
+    # always re-surface them.
     alerts = _extract_validation_alerts(after)
-    new_alerts = [a for a in alerts if a not in _extract_validation_alerts(before_snapshot)]
-    if new_alerts:
-        errs = "\n".join(f"  • {a}" for a in new_alerts)
+    if alerts:
+        errs = "\n".join(f"  • {a}" for a in alerts)
         reject_msg = (
-            "\n\nFORM NOT ADVANCED — the page did NOT move to the next step. Your last click "
-            "was REJECTED by validation. Fix these errors BEFORE clicking Continue again:\n"
+            "\n\nFORM NOT ADVANCED — the page did NOT move to the next step. The form is still "
+            "REJECTED by validation. Fix these errors BEFORE clicking Continue again:\n"
             + errs
             + "\nFor each error: find the matching field in the snapshot above and set it "
             "(select_option for dropdowns, the calendar for dates). Do NOT click Continue "
@@ -406,6 +446,8 @@ def _check_dom_delta(cli: "PlaywrightCli", before_snapshot: str,
             "does nothing."
         )
         return ToolResult(result.ok, (result.observation or "") + reject_msg)
+    if not new_refs:
+        return result
     new_lines = _extract_ref_lines(new_refs, after)
     delta_msg = (
         f"\n\nDOM CHANGE DETECTED: {len(new_refs)} new element(s) appeared:\n"
@@ -1298,6 +1340,36 @@ class SelectOptionTool(_WebTool):
 
         Returns a :class:`ToolResult`, or ``None`` to fall back to the original error
         (e.g. the trigger click itself failed for a non-combobox reason)."""
+        # ITER-4 FIX (root cause 2): the agent sometimes calls select_option on the OPEN
+        # listbox container (or one of its option nodes) instead of the combobox TRIGGER —
+        # i.e. the dropdown is ALREADY open. The normal path below presses Escape first to
+        # clear stray overlays, but here that Escape would CLOSE the very listbox we want and
+        # the selection would never happen (iter-3 turn 5: select_option(e188=listbox,
+        # 'United States') -> Escape closed it -> click on now-invisible e188 -> Country never
+        # set -> 4 blind Continue clicks). When the target is itself an open listbox/option,
+        # skip Escape+trigger-click entirely and click the matching option directly from the
+        # already-visible options.
+        pre_snapshot = capture_page_snapshot_raw(self._cli) or ""
+        if target_is_open_listbox(pre_snapshot, target):
+            ref = find_option_ref_by_text(pre_snapshot, value)
+            if ref is None:
+                return ToolResult(
+                    True,
+                    f"the '{value}' option's dropdown is already OPEN. Its options are shown in "
+                    f"the page snapshot — click the one matching '{value}' by its ref (do not "
+                    f"call select_option on the listbox container itself).")
+            ok, out = self._cli.run("click", ref)
+            if ok and output_signals_no_match(out):
+                ok = False
+            if not ok:
+                return ToolResult(
+                    False,
+                    f"the dropdown was already open but clicking the '{value}' option ({ref}) "
+                    f"failed: {self._trim(out)}")
+            return ToolResult(
+                True,
+                f"you selected '{value}' by clicking option {ref} in the already-open dropdown. "
+                f"Result:\n{self._trim(out)}")
         # ITER-3 FIX: if another dropdown/listbox is currently open (e.g. the agent called
         # select_option on two comboboxes in the same turn), its overlay intercepts the click
         # on ``target`` and prevents this combobox from opening — which makes the fallback

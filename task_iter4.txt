@@ -15,7 +15,7 @@ fill the form. You do NOT need to read any file for the candidate's data.
 - Email: jason.statham.dev@example.com
 - Phone: +1 (214) 555-0199
 - Address: 1820 McKinney Avenue, Apt 14C
-- City: Dallas — State: TX — ZIP/postal code: 75201 — Country: United States
+- City: Dallas — State: TX (use TWO-LETTER abbreviation 'TX', NOT 'Texas') — ZIP/postal code: 75201 — Country: United States
 - LinkedIn: https://www.linkedin.com/in/jason-statham-dotnet
 - GitHub: https://github.com/jstatham-dev
 - Portfolio: https://jstatham.dev

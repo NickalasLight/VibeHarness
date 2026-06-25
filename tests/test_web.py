@@ -358,6 +358,37 @@ class ValidationAlertTest(unittest.TestCase):
         self.assertEqual(_extract_validation_alerts(''), [])
 
 
+class OpenListboxTargetTest(unittest.TestCase):
+    """iter-4 fix (root cause 2): select_option called on the already-OPEN listbox container
+    (or an option) instead of the combobox trigger must be detected, so the harness clicks the
+    option directly rather than pressing Escape (which would close the listbox unselected)."""
+
+    LISTBOX_SNAP = (
+        '- button "Country" [ref=e73] [cursor=pointer]\n'
+        '- listbox [ref=e188]:\n'
+        '  - option "United States" [ref=e189] [cursor=pointer]\n'
+        '  - option "Canada" [ref=e190] [cursor=pointer]\n'
+    )
+
+    def test_listbox_container_is_open_listbox(self):
+        from vibeharness.web import target_is_open_listbox
+        self.assertTrue(target_is_open_listbox(self.LISTBOX_SNAP, "e188"))
+
+    def test_option_ref_is_open_listbox(self):
+        from vibeharness.web import target_is_open_listbox
+        self.assertTrue(target_is_open_listbox(self.LISTBOX_SNAP, "e189"))
+
+    def test_trigger_button_is_not_open_listbox(self):
+        from vibeharness.web import target_is_open_listbox
+        # e73 is the combobox TRIGGER (a plain button line) -> normal Escape+click path.
+        self.assertFalse(target_is_open_listbox(self.LISTBOX_SNAP, "e73"))
+
+    def test_missing_ref_is_not_open_listbox(self):
+        from vibeharness.web import target_is_open_listbox
+        self.assertFalse(target_is_open_listbox(self.LISTBOX_SNAP, "e999"))
+        self.assertFalse(target_is_open_listbox("", "e1"))
+
+
 class CalendarNavigationTest(unittest.TestCase):
     """iter-1: SelectOptionTool._select_calendar_date drives a custom calendar to the
     target ISO date by stepping the month/year nav buttons, then clicking the day."""
