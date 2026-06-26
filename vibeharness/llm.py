@@ -94,6 +94,22 @@ class LLMClient(ABC):
         return self.decide(system, user, constraint,
                            on_reason=on_reason, on_action=on_action)
 
+    def supports_native_tools(self) -> bool:
+        """Whether this client can drive Ollama-style NATIVE tool calling — i.e. the
+        stateful :meth:`decide_chat` transport with an enveloped ``tools:`` field
+        (issue #129/#130/#131) — as opposed to the single-shot :meth:`decide` path.
+
+        The agent uses this as the capability gate for ``_use_chat`` (issue #163): a
+        non-native client (e.g. the OpenAI-compatible :class:`~vibeharness.api_llm.ApiLLMClient`,
+        which is single-shot) is automatically routed to ``_decide`` and a constrained-JSON
+        codec, so the user only picks a model and the harness picks a compatible path.
+
+        Default: a client is native-capable iff it OVERRIDES :meth:`decide_chat` (the native
+        transport). A client that implements only the single-shot :meth:`decide` (the base
+        contract / the API client / the test fakes that only script ``decide``) returns
+        ``False`` and is driven single-shot. Concrete clients may override this explicitly."""
+        return type(self).decide_chat is not LLMClient.decide_chat
+
 
 def ensure_single_runner_env() -> None:
     """ISSUE #77: cap Ollama at ONE loaded model so a new runner EVICTS the old one
@@ -113,6 +129,12 @@ class OllamaClient(LLMClient):
     def __init__(self, config: Config):
         self._cfg = config
         ensure_single_runner_env()
+
+    def supports_native_tools(self) -> bool:
+        """Ollama speaks native tool calling (the ``tools:`` /api/chat path). Stated
+        explicitly per issue #163 even though the base default (decide_chat overridden)
+        would already report True — it documents the capability at the concrete client."""
+        return True
 
     def decide(self, system: str, user: str, constraint: DecodeConstraint,
                on_reason: TokenSink | None = None,
