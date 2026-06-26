@@ -22,6 +22,15 @@ class ModelSpec:
     temperature: float | None = None
     top_p: float | None = None
     top_k: int | None = None
+    # ISSUE #179 / #178 — per-MODEL tool-call codec and per-turn tool-call cap. Optional
+    # per-role overrides of the wire format the model is driven with and how many tool
+    # calls it may emit per turn. Resolution (see resolve_model_codec / resolve_model_limit)
+    # is spec-override → per-model registry (MODEL_TOOL_POLICIES, keyed by model id) →
+    # Config fallback, so leaving them None inherits the run's global codec/cap exactly as
+    # before. The BASE agent's spec drives the run's codec + cap (the validator is single
+    # shot = 1).
+    codec: str | None = None
+    max_actions_per_turn: int | None = None
 
 
 @dataclass(frozen=True)
@@ -356,3 +365,121 @@ def resolve_role_spec(config: Config, role: str) -> ModelSpec:
     if role == "advisor" and not model:
         model = config.model       # empty advisor_model => self-advise on the base model
     return ModelSpec(provider=provider, model=model)
+
+
+# --------------------------------------------------------------------------- #
+# Per-MODEL tool-call policy (issues #179 + #178).
+# --------------------------------------------------------------------------- #
+@dataclass(frozen=True)
+class ModelToolPolicy:
+    """The per-MODEL tool-call codec + per-turn tool-call cap, keyed by model id.
+
+    A single global codec/cap cannot serve a tiny local Ollama model AND a frontier API
+    model: the local qwen3:4b speaks the native Hermes ``<tool_call>`` dialect and is a
+    sub-7B model whose parallel-call reliability peaks at 3 calls/turn, whereas the z.ai/GLM
+    API models expose a SEPARATE thinking trace (``reasoning_content``) and are best driven
+    by a JSON-schema-constrained tool call (the ``json`` codec) and can safely batch more
+    calls per turn. This registry makes both choices EXPLICIT per model.
+    """
+    codec: str
+    max_actions_per_turn: int
+    rationale: str = ""
+
+
+# Keyed by model id (matched case-insensitively, exact first; see ``model_tool_policy``).
+#
+# qwen3:4b — hermes + 3 (UNCHANGED behaviour, made explicit):
+#   The native Qwen2.5/Hermes <tool_call> dialect is what qwen3:4b was trained on (codec
+#   ground-truthed from its chat template; see QWEN3CODER_ANALYSIS.md). 3 calls/turn is the
+#   empirical accuracy peak for sub-7B web agents (arXiv:2602.07359 "W&D": 68% at 3 vs 60%
+#   at 5); a sub-7B model's parallel-call reliability is weaker than a frontier model's.
+#
+# z.ai/GLM API models — `json` (schema-constrained) + ground-truthed caps:
+#   The OpenAI-compatible API path is single-shot and the GLM reasoning models stream their
+#   thinking SEPARATELY as `reasoning_content` (consumed as reasoning by ApiLLMClient), so
+#   the tool call must be constrained with a JSON-schema action array — the `json` codec —
+#   not the native-only `hermes` codec (whose DecodeConstraint.json_schema is None → the
+#   model emits free prose, the #179 root-cause failure). Caps are HARNESS-side policy
+#   justified by documented capability, NOT a vendor-mandated per-turn limit (no such hard
+#   limit is documented — z.ai exposes a `parallel_tool_calls` switch and allows up to 128
+#   tool DEFINITIONS per request, AI/ML API GLM-4.7 ref). GLM-4.5 scored 90.6% on the
+#   BrowseComp web benchmark and GLM-4.6 "expects fewer unnecessary errors when handling
+#   multiple tool calls" (z.ai GLM-4.6 notes), so these frontier models tolerate more
+#   batching than a sub-7B local model. Best practice (z.ai): only parallelise truly
+#   independent calls — so we stay conservative, well under the 128-definition ceiling:
+#     glm-4.7-flash → 5  (lighter/faster "flash" tier; W&D's 5-call setting is safe given
+#                         native parallel_tool_calls support, kept modest for the small tier)
+#     glm-4.7       → 8  (flagship agentic-coding model: 200K ctx, native parallel_tool_calls)
+#     glm-5.2       → 8  (newest flagship, long-horizon agentic line — z.ai GLM-5.x)
+# Sources (cited in the PR): https://docs.z.ai/guides/capabilities/function-calling ,
+#   https://docs.aimlapi.com/api-references/text-models-llm/zhipu/glm-4.7 ,
+#   https://z.ai/blog/glm-4.6 , arXiv:2602.07359.
+MODEL_TOOL_POLICIES: dict[str, ModelToolPolicy] = {
+    "qwen3:4b": ModelToolPolicy(
+        codec="hermes", max_actions_per_turn=3,
+        rationale="native Hermes dialect; sub-7B 3-call accuracy peak (arXiv:2602.07359)"),
+    "glm-4.7-flash": ModelToolPolicy(
+        codec="json", max_actions_per_turn=5,
+        rationale="API reasoning model; schema-constrained JSON; lighter flash tier (cap 5)"),
+    "glm-4.7": ModelToolPolicy(
+        codec="json", max_actions_per_turn=8,
+        rationale="flagship agentic-coding; 200K ctx + native parallel_tool_calls (cap 8)"),
+    "glm-5.2": ModelToolPolicy(
+        codec="json", max_actions_per_turn=8,
+        rationale="newest flagship long-horizon agentic line (cap 8)"),
+}
+
+# Family fallback for any other z.ai/GLM API model id (e.g. a future glm-4.7-air): the API
+# path still needs a JSON-schema-constrained codec (never the native-only hermes), so an
+# unrecognised GLM model resolves to the conservative `json` + 5 policy rather than silently
+# inheriting the local `hermes` default. The qwen-local default is the global Config codec.
+_GLM_FAMILY_POLICY = ModelToolPolicy(
+    codec="json", max_actions_per_turn=5,
+    rationale="unrecognised GLM/z.ai model: API JSON codec + conservative cap")
+
+
+def model_tool_policy(model: str | None) -> ModelToolPolicy | None:
+    """Return the :class:`ModelToolPolicy` for ``model`` (issues #179/#178), or ``None``.
+
+    Exact (case-insensitive) match in :data:`MODEL_TOOL_POLICIES` wins; otherwise any GLM /
+    z.ai family id (``glm`` prefix) falls back to the conservative API policy so a new GLM
+    variant is still driven with a schema-constrained codec. Everything else returns
+    ``None`` → the caller uses the :class:`Config` fallback (no behaviour change)."""
+    if not model:
+        return None
+    key = model.strip().lower()
+    for name, policy in MODEL_TOOL_POLICIES.items():
+        if key == name.lower():
+            return policy
+    if key.startswith("glm"):
+        return _GLM_FAMILY_POLICY
+    return None
+
+
+def resolve_model_codec(config: Config, spec: ModelSpec) -> str:
+    """Resolve the tool-call codec NAME for ``spec`` (issue #179).
+
+    Precedence: the spec's explicit ``codec`` field WINS; else the per-model registry
+    (:func:`model_tool_policy`) keyed by the model id; else ``config.codec`` (the global
+    fallback). The BASE agent's spec is what drives the run's codec."""
+    if spec.codec:
+        return spec.codec
+    policy = model_tool_policy(spec.model)
+    if policy is not None:
+        return policy.codec
+    return config.codec
+
+
+def resolve_model_limit(config: Config, spec: ModelSpec) -> int:
+    """Resolve the per-turn tool-call cap for ``spec`` (issue #178).
+
+    Precedence: the spec's explicit ``max_actions_per_turn`` field WINS; else the per-model
+    registry (:func:`model_tool_policy`); else ``config.max_actions_per_turn`` (the global
+    fallback). The BASE agent's spec is what drives the run's cap (the validator stays
+    single-shot = 1)."""
+    if spec.max_actions_per_turn is not None:
+        return spec.max_actions_per_turn
+    policy = model_tool_policy(spec.model)
+    if policy is not None:
+        return policy.max_actions_per_turn
+    return config.max_actions_per_turn

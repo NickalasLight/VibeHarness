@@ -132,10 +132,20 @@ class ApiLLMClient(LLMClient):
             {"role": "system", "content": system},
             {"role": "user", "content": instructed_user},
         ], on_token=on_action, on_reason=on_reason, stop=stop)
-        # GLM reasoning models (e.g. glm-4.7-flash) sometimes stream the WHOLE answer as
-        # reasoning_content and leave content empty. If so, fall back to the reasoning text
-        # as the action payload so the verdict/action is never lost (see _chat).
-        action = text if text.strip() else reasoning
+        # The action is parsed ONLY from the constrained ``content`` (issue #179): the
+        # model's thinking trace is streamed to ``on_reason`` and stored in
+        # ``Decision.reasoning`` SEPARATELY, so it never reaches the tool-call parser. With
+        # a JSON-schema constraint present (the json codec for GLM) the model emits the
+        # tool-call JSON as ``content`` and its thinking as ``reasoning_content`` — the
+        # #179 root cause (thinking prose landing in the action channel) cannot recur.
+        action = text
+        if not action.strip():
+            # GLM reasoning models occasionally stream the WHOLE answer as
+            # reasoning_content and leave content empty (e.g. the validator's verdict). To
+            # avoid losing it WITHOUT feeding free-form thinking to the parser, recover the
+            # schema-shaped JSON value embedded in the reasoning; only if none is found do
+            # we fall back to the raw reasoning (preserving the prior behaviour).
+            action = _recover_json(reasoning) or reasoning
         return Decision(reasoning=reasoning, action_json=_strip_fences(action))
 
     # ---- transport ----
@@ -232,6 +242,50 @@ def _unpack_constraint(
         return constraint, ()
     # Duck-typed fallback: anything exposing the two attributes.
     return getattr(constraint, "json_schema", None), tuple(getattr(constraint, "stop", ()) or ())
+
+
+def _recover_json(text: str) -> str:
+    """Extract the first complete top-level JSON object/array embedded in ``text``.
+
+    Used only as the empty-``content`` fallback (issue #179): a GLM reasoning model may put
+    the whole schema-shaped answer in ``reasoning_content`` with content empty. A
+    brace/bracket-balanced, string-aware scan recovers the JSON value so the constrained
+    answer is not lost, while free-form thinking prose (no JSON) yields ``""`` and is NOT
+    treated as a tool call. Returns the matched JSON substring, or ``""`` if none parses."""
+    s = (text or "").strip()
+    if not s:
+        return ""
+    for opener, closer in (("{", "}"), ("[", "]")):
+        start = s.find(opener)
+        if start < 0:
+            continue
+        depth = 0
+        in_str = False
+        esc = False
+        for i in range(start, len(s)):
+            ch = s[i]
+            if in_str:
+                if esc:
+                    esc = False
+                elif ch == "\\":
+                    esc = True
+                elif ch == '"':
+                    in_str = False
+                continue
+            if ch == '"':
+                in_str = True
+            elif ch == opener:
+                depth += 1
+            elif ch == closer:
+                depth -= 1
+                if depth == 0:
+                    candidate = s[start:i + 1]
+                    try:
+                        json.loads(candidate)
+                    except json.JSONDecodeError:
+                        break
+                    return candidate
+    return ""
 
 
 def _is_streaming_unsupported(exc: Exception) -> bool:

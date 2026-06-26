@@ -23,7 +23,8 @@ from . import providers
 from .agent import RalphAgent, RunResult
 from .clients import build_client, select_execution_codec
 from .codec import UnknownCodec, available_codecs, get_codec
-from .config import Config, ModelSpec, resolve_role_spec
+from .config import (Config, ModelSpec, model_tool_policy, resolve_model_codec,
+                     resolve_role_spec)
 from .filesystem import FileSystem, FileSystemError
 from .llm import OllamaClient, OllamaUnavailable, ensure_single_runner_env
 from .lock import SingleInstanceLock, VibeAlreadyRunning
@@ -306,31 +307,76 @@ def codec_error(name: str) -> str | None:
     return f"error: unknown codec '{name}'. Available: {', '.join(available_codecs())}"
 
 
-def resolve_max_actions(args: argparse.Namespace) -> int:
-    """Resolve the per-turn tool-call cap for the selected agent (issue #52).
+def resolve_max_actions(args: argparse.Namespace,
+                        base_spec: "ModelSpec | None" = None) -> int:
+    """Resolve the per-turn tool-call cap for the selected agent (issues #52 + #178).
 
     Precedence (high to low):
       1. an EXPLICIT ``--max-actions-per-turn`` flag, or a saved setting for it,
-      2. the selected ``--agent`` type's default (``agent_default_max_actions``),
-      3. the global ``Config.max_actions_per_turn`` default.
+      2. an agent-type cap that DIFFERS from the global default — an agent-specific HARD
+         cap (e.g. the ``validator`` agent is single-shot = 1; it never batches),
+      3. the per-MODEL cap for the BASE model (``model_tool_policy``; issue #178),
+      4. the selected ``--agent`` type's default (== global) / the global default.
 
     The resolved value is the SINGLE source of truth: it is written into the run's
-    Config so BOTH the prompt builder ("you may emit up to N actions") and the agent
-    loop (which executes at most N) read the same number and cannot drift.
+    Config so BOTH the prompt builder ("you may emit up to N actions"), the codec
+    ``format_instructions`` / ``action_schema(maxItems)``, and the agent loop (which
+    executes at most N) read the same number and cannot drift. ``base_spec`` (the resolved
+    BASE :class:`ModelSpec`) supplies the per-model cap; when ``None`` the per-model step is
+    skipped so legacy callers behave exactly as before.
+
+    The per-MODEL cap intentionally sits BELOW an agent-specific hard cap: a frontier GLM
+    base model batches more (#178), but a single-shot agent (validator) must stay 1 no
+    matter which model drives it. When the agent's cap equals the global default (fs/web),
+    the per-model cap takes over.
     """
     # An explicit per-run flag wins outright.
     if getattr(args, "max_actions_per_turn", None) is not None:
         return args.max_actions_per_turn
-    # A saved setting is an explicit user choice too — honour it over the agent default.
+    # A saved setting is an explicit user choice too — honour it over per-model/agent caps.
     saved = Settings.load()
     if "max_actions_per_turn" in saved:
         return int(saved["max_actions_per_turn"])
-    # Otherwise fall back to the selected agent's default, then the global default.
     global_default = Config.max_actions_per_turn
     agent = getattr(args, "agent", None)
-    if agent:
-        return agent_default_max_actions(global_default).get(agent, global_default)
-    return global_default
+    agent_cap = (agent_default_max_actions(global_default).get(agent, global_default)
+                 if agent else global_default)
+    # An agent cap that differs from the global default is an agent-specific HARD cap
+    # (validator single-shot = 1) and wins over the per-model batching cap.
+    if agent_cap != global_default:
+        return agent_cap
+    # Per-MODEL cap for the base model (issue #178): a frontier GLM model batches more than
+    # the sub-7B local default; qwen3:4b is pinned to 3 explicitly in the registry.
+    if base_spec is not None:
+        policy = model_tool_policy(base_spec.model)
+        if policy is not None:
+            return policy.max_actions_per_turn
+    return agent_cap
+
+
+def resolve_run_codec(args: argparse.Namespace, config: Config,
+                      base_spec: "ModelSpec | None" = None) -> str:
+    """Resolve the tool-call codec NAME for the run (issue #179).
+
+    Precedence (high to low):
+      1. an EXPLICIT ``--codec`` flag, or a saved ``codec`` setting (an explicit user
+         choice always wins),
+      2. the per-MODEL codec for the BASE model (the spec's ``codec`` field, else the
+         ``MODEL_TOOL_POLICIES`` registry — ``resolve_model_codec``; issue #179),
+      3. the global ``Config.codec`` default.
+
+    Resolving from the BASE model means qwen3:4b is driven with ``hermes`` (its native
+    dialect) while a z.ai/GLM API base model is driven with the schema-constrained ``json``
+    codec, so the single-shot API path always has a JSON schema to force a parseable tool
+    call (the #179 root cause). ``base_spec`` is the resolved BASE :class:`ModelSpec`."""
+    if getattr(args, "codec", None) is not None:
+        return args.codec
+    saved = Settings.load()
+    if "codec" in saved:
+        return str(saved["codec"])
+    if base_spec is not None:
+        return resolve_model_codec(config, base_spec)
+    return config.codec
 
 
 def resolve_config(args: argparse.Namespace) -> Config:
@@ -351,14 +397,8 @@ def resolve_config(args: argparse.Namespace) -> Config:
         overrides["num_ctx"] = args.num_ctx
     if args.model is not None:
         overrides["model"] = args.model
-    if getattr(args, "codec", None) is not None:
-        overrides["codec"] = args.codec
     if args.max_steps is not None:
         overrides["max_steps"] = args.max_steps
-    # Resolve the per-turn cap once for the selected agent (explicit flag / saved
-    # setting > agent-type default > global default) and thread it through Config so
-    # the prompt builder and the agent loop share one source of truth.
-    overrides["max_actions_per_turn"] = resolve_max_actions(args)
     if getattr(args, "headless", False):
         overrides["web_headless"] = True
     if getattr(args, "web_snapshot_prose", False):
@@ -368,6 +408,7 @@ def resolve_config(args: argparse.Namespace) -> Config:
     # Per-role endpoint overrides (issue #163): fold the convenience flags into
     # config.models, filling any unspecified field from the role's current (settings/legacy)
     # resolution so e.g. `--base-provider zhipuai` alone keeps the existing base model.
+    # Resolved FIRST so the per-MODEL codec + cap below see the run's actual base model.
     models = dict(cfg.models)
     for role, provider_arg, model_arg in (
         ("base", "base_provider", "base_model"),
@@ -382,6 +423,21 @@ def resolve_config(args: argparse.Namespace) -> Config:
                                model=mdl or current.model)
     if models != cfg.models:
         overrides["models"] = models
+    # Resolve the BASE model spec against the (possibly model-overridden) interim config so
+    # the per-MODEL codec + per-turn cap below key off the run's actual base model
+    # (issues #179/#178). The base model can come from --model, --base-model, config.models,
+    # or the legacy default — resolve_role_spec covers them all.
+    _interim = replace(cfg, **overrides) if overrides else cfg
+    base_spec = resolve_role_spec(_interim, "base")
+    # Per-MODEL tool-call codec (issue #179): explicit --codec / saved setting > per-model
+    # registry for the base model > Config.codec. qwen3:4b → hermes; z.ai/GLM → json
+    # (schema-constrained, so the single-shot API path forces a parseable tool call).
+    overrides["codec"] = resolve_run_codec(args, _interim, base_spec)
+    # Per-MODEL per-turn tool-call cap (issue #178): explicit flag / saved setting >
+    # per-model registry > agent-type default > global default. Threaded through Config so
+    # the prompt builder, the codec format_instructions/action_schema, and the agent loop
+    # all share ONE source of truth and cannot drift.
+    overrides["max_actions_per_turn"] = resolve_max_actions(args, base_spec)
     cfg = replace(cfg, **overrides) if overrides else cfg
     # Mint a UNIQUE per-run Playwright session name (issues #111/#112) so concurrent
     # runs never share — and tear down — one another's browser daemon. An explicitly

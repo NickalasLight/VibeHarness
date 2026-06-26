@@ -26,6 +26,10 @@ _MODEL_FIELD_TYPES: dict[str, type] = {
     "temperature": float,
     "top_p": float,
     "top_k": int,
+    # Per-model tool-call codec + per-turn cap (issues #179/#178). Optional overrides of the
+    # registry/Config resolution for this role's model.
+    "codec": str,
+    "max_actions_per_turn": int,
 }
 
 def _csv_set(raw: str) -> list:
@@ -193,7 +197,9 @@ class Settings:
                 models[role] = ModelSpec(
                     provider=provider, model=model,
                     temperature=attrs.get("temperature"),
-                    top_p=attrs.get("top_p"), top_k=attrs.get("top_k"))
+                    top_p=attrs.get("top_p"), top_k=attrs.get("top_k"),
+                    codec=attrs.get("codec"),
+                    max_actions_per_turn=attrs.get("max_actions_per_turn"))
             if models != cfg.models:
                 cfg = replace(cfg, models=models)
         return cfg
