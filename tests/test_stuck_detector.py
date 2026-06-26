@@ -60,6 +60,37 @@ class StuckDetectorTest(unittest.TestCase):
         sig = _make_sig("t", {"nested": {"a": [1, 2]}})
         self.assertIn("t::", sig)
 
+    # ---- no-progress CYCLE detection (issue #191) ----
+    def test_two_step_no_progress_cycle_escalates(self):
+        # The exact #191 failure mode: a 2-step A,B,A,B,... loop that a consecutive-only
+        # counter (each B resets A's run) would NEVER flag. threshold=3 -> trips after
+        # three full (A,B) repeats = 6 recorded calls.
+        d = StuckDetector(threshold=3)
+        A = ("goto", {"url": "https://form"})
+        B = ("page_snapshot", {})
+        self.assertFalse(d.record(*A))   # A           (1)
+        self.assertFalse(d.record(*B))   # A,B         (cycle x1)
+        self.assertFalse(d.record(*A))   # A,B,A       (1.5)
+        self.assertFalse(d.record(*B))   # A,B,A,B     (cycle x2)
+        self.assertFalse(d.record(*A))   # A,B,A,B,A
+        self.assertTrue(d.record(*B))    # A,B,A,B,A,B (cycle x3) -> STUCK
+
+    def test_three_step_cycle_detected(self):
+        d = StuckDetector(threshold=2)
+        seq = [("a", {}), ("b", {}), ("c", {})]
+        # one full cycle: not yet (need 2 repeats at threshold=2)
+        for s in seq:
+            self.assertFalse(d.record(*s))
+        self.assertFalse(d.record(*seq[0]))   # a
+        self.assertFalse(d.record(*seq[1]))   # b
+        self.assertTrue(d.record(*seq[2]))    # c -> (a,b,c) repeated 2x -> STUCK
+
+    def test_progressing_distinct_calls_never_stuck(self):
+        # Distinct (tool,args) every call -> no repeating cycle -> never flagged.
+        d = StuckDetector(threshold=3)
+        for n in range(12):
+            self.assertFalse(d.record("fill", {"target": f"e{n}", "text": str(n)}))
+
 
 if __name__ == "__main__":
     unittest.main()
