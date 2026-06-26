@@ -15,6 +15,33 @@ class ProvidersTest(unittest.TestCase):
         self.assertEqual(p.api_key_env, "ZHIPUAI_API_KEY")
         self.assertTrue(p.base_url.startswith("https://"))
 
+    def test_get_known_deepseek_provider(self):
+        # Issue #182: DeepSeek registered as an OpenAI-compatible provider, key from env only.
+        p = get_provider("deepseek")
+        self.assertEqual(p.name, "deepseek")
+        self.assertEqual(p.model, "deepseek-chat")
+        self.assertEqual(p.api_key_env, "DEEPSEEK_API_KEY")
+        self.assertEqual(p.base_url, "https://api.deepseek.com")
+
+    def test_deepseek_missing_key_raises_runtime_error(self):
+        # The key is read from DEEPSEEK_API_KEY at construction; absent → RuntimeError.
+        with mock.patch.dict(os.environ, {}, clear=True):
+            with self.assertRaises(RuntimeError) as ctx:
+                make_api_client("deepseek")
+            self.assertIn("DEEPSEEK_API_KEY", str(ctx.exception))
+
+    def test_deepseek_constructs_client_with_env_key(self):
+        fake = object()
+        with mock.patch.dict(os.environ, {"DEEPSEEK_API_KEY": "secret"}, clear=False):
+            with mock.patch("vibeharness.api_llm.ApiLLMClient",
+                            return_value=fake) as ctor:
+                client = make_api_client("deepseek")
+        self.assertIs(client, fake)
+        _, kwargs = ctor.call_args
+        self.assertEqual(kwargs["api_key"], "secret")
+        self.assertEqual(kwargs["model"], "deepseek-chat")
+        self.assertEqual(kwargs["provider"].name, "deepseek")
+
     def test_get_unknown_provider_raises_with_known_names(self):
         with self.assertRaises(KeyError) as ctx:
             get_provider("nope")
