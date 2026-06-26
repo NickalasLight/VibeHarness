@@ -34,9 +34,18 @@ browser, a model, or an agent run.
 """
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 
 from .config import Config
+
+# The header the agent stamps on the post-turn live page snapshot it commits to the
+# stateful chat history (see ``RalphAgent._record`` / the page_snapshot observation).
+# The fit logic below uses it to locate the LATEST snapshot message so it can be
+# preserved (and only truncated as a last resort) while older history is evicted first
+# (issue #173). Kept here, beside the budgeting maths, so both producer and budgeter
+# agree on the marker.
+SNAPSHOT_HISTORY_MARKER = "## Latest page state"
 
 
 @dataclass(frozen=True)
@@ -143,3 +152,192 @@ def render_budgeted_snapshot(raw: str, budget_chars: int) -> str:
     if not body:
         return ""  # zero budget -> inject nothing (caller warns separately)
     return body + f"\n…[+{dropped} chars truncated]"
+
+
+# ---------------------------------------------------------------------------
+# Full stateful-request budgeting (issues #170/#172/#173)
+#
+# The single-message budgeter above sizes ONE snapshot against ``system + user``. The
+# NATIVE stateful path (``OllamaClient.decide_chat``) instead sends
+# ``[system] + chat_history + [user]`` — the accumulated multi-turn history PLUS the
+# latest page snapshot (committed as a tool observation in the history). As history
+# grows the assembled request can exceed ``num_ctx`` even though each individual piece
+# looked fine; Ollama then silently truncates the prompt (dropping the system/task from
+# the middle) and the model rambles with no tool call — the #170 silent-mid-turn death.
+#
+# ``fit_chat_history`` budgets the WHOLE message list. The page snapshot is the agent's
+# eyes, so the ordering of cuts is (most-preferred first):
+#   1. evict the OLDEST non-snapshot history messages (FIFO), respecting the optional
+#      ``chat_history_max_turns`` cap, NEVER touching the latest snapshot;
+#   2. only if the request STILL overflows, truncate the latest snapshot (last resort);
+#   3. never silently — the caller emits a loud, grep-able CONTEXT-OVERRUN line.
+# ---------------------------------------------------------------------------
+
+# Appended to a snapshot whose tail we had to cut to fit the window (distinct from the
+# single-message marker so logs make the stateful path obvious).
+_HISTORY_TRUNC_MARKER = "…[+{dropped} chars truncated to fit the context window]"
+# Replacement body when even a single char of snapshot won't fit (the dangerous case).
+_SNAPSHOT_DROPPED_BODY = (
+    "## Latest page state — [PAGE SNAPSHOT DROPPED: it exceeded the context budget even "
+    "after evicting all prior history. The agent is effectively blind this turn.]")
+
+
+@dataclass(frozen=True)
+class BudgetFitReport:
+    """What :func:`fit_chat_history` did to keep the request within ``num_ctx``.
+
+    ``acted`` is True iff any eviction or snapshot truncation was performed (i.e. the
+    request was over budget). The caller uses the fields to emit the loud overrun line
+    (#172) and to assert the fit in tests (#173)."""
+    over_budget: bool
+    fits_after: bool
+    evicted_msgs: int
+    evicted_tokens: int
+    snapshot_truncated: bool
+    snapshot_dropped: bool
+    snapshot_raw_chars: int
+    snapshot_kept_chars: int
+    snapshot_dropped_chars: int
+    request_tokens_before: int
+    request_tokens_after: int
+    input_budget_tokens: int
+    num_ctx: int
+    history_msgs_after: int
+    history_tokens_after: int
+
+    @property
+    def acted(self) -> bool:
+        return (self.evicted_msgs > 0 or self.snapshot_truncated
+                or self.snapshot_dropped)
+
+
+def message_tokens(message: dict, chars_per_token: float) -> int:
+    """Conservative token estimate for one chat message: its ``content`` plus any
+    structured ``tool_calls`` (serialised the way they ride the wire)."""
+    text = message.get("content") or ""
+    for tc in message.get("tool_calls", []) or []:
+        try:
+            text += json.dumps(tc, ensure_ascii=False)
+        except (TypeError, ValueError):
+            text += str(tc)
+    return estimate_tokens(text, chars_per_token)
+
+
+def _latest_snapshot_index(chat_history: list[dict]) -> int | None:
+    """Index of the most-recent message carrying the live page snapshot, or None."""
+    for i in range(len(chat_history) - 1, -1, -1):
+        if SNAPSHOT_HISTORY_MARKER in (chat_history[i].get("content") or ""):
+            return i
+    return None
+
+
+def fit_chat_history(chat_history: list[dict], system: str, user: str,
+                     config: Config) -> BudgetFitReport:
+    """Trim ``chat_history`` IN PLACE so ``[system] + chat_history + [user]`` fits the
+    input window, evicting OLDEST history first and truncating the latest snapshot only
+    as a last resort (issue #173). Returns a :class:`BudgetFitReport`.
+
+    Pure except for the in-place mutation of ``chat_history`` (and the snapshot message's
+    ``content`` when truncation is the last resort), so it is unit-testable without a
+    model or a browser."""
+    cpt = config.snapshot_chars_per_token
+    in_budget = input_budget_tokens(config)
+    fixed = estimate_tokens(system, cpt) + estimate_tokens(user, cpt)
+
+    def hist_tokens() -> int:
+        return sum(message_tokens(m, cpt) for m in chat_history)
+
+    def request_tokens() -> int:
+        return fixed + hist_tokens()
+
+    req_before = request_tokens()
+    over = req_before > in_budget
+
+    snap_idx = _latest_snapshot_index(chat_history)
+    snapshot_raw_chars = (
+        len(chat_history[snap_idx].get("content") or "") if snap_idx is not None else 0)
+
+    evicted_msgs = 0
+    evicted_tokens = 0
+
+    def _oldest_evictable() -> int | None:
+        si = _latest_snapshot_index(chat_history)
+        for i in range(len(chat_history)):
+            if i != si:
+                return i
+        return None  # nothing left but the snapshot itself
+
+    # (1a) Coarse fixed message cap (chat_history_max_turns; 0 = off). Never evicts the
+    # latest snapshot — it is the agent's current view of the page.
+    cap = config.chat_history_max_turns
+    if cap and cap > 0:
+        while len(chat_history) > cap:
+            i = _oldest_evictable()
+            if i is None:
+                break
+            evicted_tokens += message_tokens(chat_history[i], cpt)
+            del chat_history[i]
+            evicted_msgs += 1
+
+    # (1b) Token budget: evict oldest non-snapshot messages until the request fits or
+    # only the snapshot (and whatever can't be evicted) remains.
+    while request_tokens() > in_budget:
+        i = _oldest_evictable()
+        if i is None:
+            break
+        evicted_tokens += message_tokens(chat_history[i], cpt)
+        del chat_history[i]
+        evicted_msgs += 1
+
+    # (2) Last resort: the latest snapshot alone still overflows -> truncate it.
+    snapshot_truncated = False
+    snapshot_dropped = False
+    snapshot_dropped_chars = 0
+    snapshot_kept_chars = snapshot_raw_chars
+    snap_idx = _latest_snapshot_index(chat_history)
+    if request_tokens() > in_budget and snap_idx is not None:
+        snap_msg = chat_history[snap_idx]
+        content = snap_msg.get("content") or ""
+        snap_tok = message_tokens(snap_msg, cpt)
+        other_tok = request_tokens() - snap_tok           # everything but the snapshot
+        allow_tok = in_budget - other_tok                 # tokens the snapshot may use
+        allow_chars = max(0, int(allow_tok * cpt)) if cpt > 0 else max(0, allow_tok)
+        # The truncation marker is appended to the kept body, so it MUST be reserved
+        # against the char budget — otherwise the message re-tokenises to more than
+        # ``allow_tok`` and the request creeps back over ``num_ctx``. We reserve the
+        # marker at its longest (the full ``dropped`` count) so the bound always holds.
+        marker = "\n" + _HISTORY_TRUNC_MARKER.format(dropped=len(content))
+        body_budget = allow_chars - len(marker)
+        if body_budget <= 0:
+            # Nothing meaningful fits — drop the snapshot body but keep a LOUD
+            # blind-this-turn note so the model (and the logs) know the page is
+            # unavailable, not empty.
+            snapshot_dropped_chars = len(content)
+            snapshot_kept_chars = 0
+            snap_msg["content"] = _SNAPSHOT_DROPPED_BODY
+            snapshot_dropped = True
+        else:
+            body, dropped = truncate_snapshot(content, body_budget)
+            if dropped > 0:
+                snapshot_dropped_chars = dropped
+                snapshot_kept_chars = len(body)
+                snap_msg["content"] = body + marker
+                snapshot_truncated = True
+
+    return BudgetFitReport(
+        over_budget=over,
+        fits_after=request_tokens() <= in_budget,
+        evicted_msgs=evicted_msgs,
+        evicted_tokens=evicted_tokens,
+        snapshot_truncated=snapshot_truncated,
+        snapshot_dropped=snapshot_dropped,
+        snapshot_raw_chars=snapshot_raw_chars,
+        snapshot_kept_chars=snapshot_kept_chars,
+        snapshot_dropped_chars=snapshot_dropped_chars,
+        request_tokens_before=req_before,
+        request_tokens_after=request_tokens(),
+        input_budget_tokens=in_budget,
+        num_ctx=config.num_ctx,
+        history_msgs_after=len(chat_history),
+        history_tokens_after=hist_tokens(),
+    )
