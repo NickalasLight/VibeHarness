@@ -30,12 +30,7 @@ jobs:
       # live-environment integration tests (no Ollama server / no browser in CI).
       # unittest discover (the old runner) ignored these markers and so ran the
       # needs_ollama / needs_web tests, which errored in CI (#176).
-      #
-      # tests/test_snapshot_budget.py::EndToEndProviderTest is deselected: it is
-      # being rewritten by the in-flight snapshot-overflow PR (#172/#173) and still
-      # imports a since-removed cli helper. Remove this deselect once that PR lands.
       - name: Run test suite (default lane)
         run: >-
           python -m pytest -q
           -m "not needs_ollama and not needs_web"
-          --deselect tests/test_snapshot_budget.py::EndToEndProviderTest
