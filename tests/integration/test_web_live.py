@@ -131,12 +131,15 @@ class WebToolsetPrereqTest(unittest.TestCase):
 
     def test_toolset_creates_the_discrete_subtools(self):
         names = [t.name for t in WebToolset().create_tools(Config())]
-        # The monolithic browse, the snapshot tool, and the evaluate/JS tool are
-        # gone (#67); navigate_back/forward and screenshot were later trimmed from the
-        # registered set too (see web._WEB_TOOL_CLASSES).
-        for absent in ("browse", "snapshot", "evaluate",
+        # The monolithic browse + snapshot tool are gone; navigate_back/forward and
+        # screenshot are not in the run-loaded set here (#206 owns nav). ISSUE #203:
+        # the evaluate/JS tool is now LOADED so capable API models can use it — qwen3:4b's
+        # PER-MODEL toolset omits it (see test_remove_evaluate_67), so it is absent from the
+        # small model's VIEW, not from the toolset.
+        for absent in ("browse", "snapshot",
                        "navigate_back", "navigate_forward", "screenshot"):
             self.assertNotIn(absent, names)
+        self.assertIn("evaluate", names)   # #203: loaded; gated per-model for qwen
         for expected in ("goto", "click", "fill", "type", "press_key",
                          "select_option", "hover", "reload"):
             self.assertIn(expected, names)

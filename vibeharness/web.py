@@ -2143,24 +2143,33 @@ class ReloadTool(_WebTool):
 
 
 class EvaluateTool(_WebTool):
-    """Run JavaScript on the page (or on one element) to inspect its state.
+    """Run JavaScript on the page (or on one element) to inspect OR set its state.
 
-    Use this when you need to understand what kind of element a ref points to before
-    deciding which interaction tool to use — e.g. inspect whether a combobox is a
-    native <select> or a custom widget, read its current value, list its <option>
-    children, or check a data attribute. Returns the JavaScript return value as text.
-    Does NOT modify the page. Never use it to set values — use fill/select_option/click.
+    Use this to understand what kind of element a ref points to before deciding which
+    interaction tool to use (inspect whether a combobox is a native <select> or a custom
+    widget, read its current value, list its <option> children, check a data attribute),
+    AND — for complex widgets where clicking is unreliable (date pickers/calendars, custom
+    dropdowns, sliders) — to SET a value directly on the underlying input instead of many
+    blind clicks. When setting a value, dispatch the events the page listens for
+    (``input``/``change``) so frameworks pick it up. Returns the JS return value as text.
+
+    ISSUE #203: this tool is exposed ONLY to capable API models (GLM/DeepSeek); the small
+    local model never sees it (its per-model toolset omits it), preserving #67's guarantee
+    that the 3B agent cannot execute arbitrary JavaScript.
     """
 
     name = "evaluate"
     description = (
-        "Run a JavaScript snippet on the page (or on a specific element) to inspect "
-        "its state. Use to identify element types, list dropdown options, read current "
-        "values, or check attributes before choosing the right interaction tool. "
-        "Example: expression='el => el.tagName + \" \" + el.type' with target='e6' "
-        "inspects element e6. Without a target, the expression runs on the whole page "
-        "(use 'document.title' or 'document.readyState' etc.). "
-        "Does NOT modify the page."
+        "Run a JavaScript snippet on the page (or on a specific element) to INSPECT or SET "
+        "its state. Inspect: identify element types, list dropdown options, read current "
+        "values/attributes — e.g. expression='el => el.tagName + \" \" + el.type' with "
+        "target='e6'. SET (for complex widgets like date pickers where clicking loops): "
+        "target the underlying input and assign + dispatch events, e.g. "
+        "expression=\"el => { el.value = '2026-06-27'; "
+        "el.dispatchEvent(new Event('input', {bubbles:true})); "
+        "el.dispatchEvent(new Event('change', {bubbles:true})); }\" with target='e6'. "
+        "Without a target, the expression runs on the whole page (e.g. 'document.title'). "
+        "Prefer this over many blind clicks for date pickers / custom dropdowns / sliders."
     )
     _verb = "evaluated JS on"
 
@@ -2290,9 +2299,17 @@ _WEB_TOOL_CLASSES: tuple[type[_WebTool], ...] = (
     SetSpinbuttonTool, DrawSignatureTool,
     CheckTool, UncheckTool, HoverTool, DragTool, UploadTool,
     ReloadTool,
+    # ISSUE #203: EvaluateTool (run-JS) is LOADED again so capable API models (GLM/DeepSeek)
+    # can set values directly on complex widgets (date pickers, custom dropdowns) instead of
+    # looping on blind clicks. Issue #67's guarantee that the limited 3B local model must
+    # NEVER execute arbitrary JavaScript is preserved PER-MODEL: qwen3:4b's per-model toolset
+    # (config.MODEL_TOOL_POLICIES) OMITS evaluate, so its view is unchanged; only the capable
+    # models — which are also PROMPT-GUIDED to prefer it (config._EVALUATE_GUIDANCE) — see it.
+    EvaluateTool,
     # Excluded: OpenBrowserTool (goto opens browser automatically),
-    # EvaluateTool (not needed), SnapshotTool (auto-injected into system prompt),
-    # NavigateBackTool, NavigateForwardTool (not needed), ScreenshotTool (model is not visual).
+    # SnapshotTool (auto-injected into system prompt), ScreenshotTool (model is not visual).
+    # NavigateBackTool / NavigateForwardTool are added (loaded) by #206 (it removes the
+    # back-button guard); qwen3:4b's per-model toolset OMITS them (forward-compatible here).
 )
 
 

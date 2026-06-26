@@ -48,6 +48,19 @@ class ModelSpec:
     # the registry value (resolve_model_collapse_dups): spec → MODEL_TOOL_POLICIES → True.
     # None inherits the per-model policy (so leaving it None is a no-op).
     collapse_consecutive_dup_tool_calls: bool | None = None
+    # ISSUE #203 — per-MODEL toolset / tool-allowlist + system-prompt augmentation.
+    # Optional per-role OVERRIDES of the registry value (MODEL_TOOL_POLICIES); each is None
+    # to INHERIT the per-model policy (so leaving them None is a no-op). Resolution is
+    # spec → MODEL_TOOL_POLICIES → empty (resolve_model_tool_omit / _allow / _prompt_aug).
+    #   * tool_omit  — tool names this model must NOT be exposed to (a denylist).
+    #   * tool_allow — optional allowlist; None = no allowlist restriction.
+    #   * system_prompt_augmentation — per-model capability guidance appended to the prompt.
+    # Composition is by SUBTRACTION only (see ToolRegistry.filtered): the model's view is a
+    # subset of the run's loaded toolset, so a model can never invoke a tool the run did not
+    # load.
+    tool_omit: frozenset[str] | None = None
+    tool_allow: frozenset[str] | None = None
+    system_prompt_augmentation: str | None = None
 
 
 @dataclass(frozen=True)
@@ -458,6 +471,21 @@ class ModelToolPolicy:
     # today's safety; the resolver (resolve_model_collapse_dups) reads the ACTIVE model's
     # policy, so an escalation take-over to a powerful model also lifts the collapse.
     collapse_consecutive_dup_tool_calls: bool = True
+    # ISSUE #203 — per-MODEL toolset / tool-allowlist + system-prompt augmentation. All
+    # default to a NO-OP so an unconfigured model keeps today's exposure and prompt:
+    #   * tool_omit  — tool names this model is NOT exposed to (a denylist). qwen3:4b omits
+    #     navigate_back/navigate_forward (it cannot navigate browser history away from a
+    #     multi-step form without losing progress — the toolset-level replacement for the
+    #     back-button guard #206 deletes); capable models keep them.
+    #   * tool_allow — optional allowlist (None = no allowlist restriction). Composes by
+    #     INTERSECTION with the run's loaded toolset, so it can only ever NARROW exposure.
+    #   * system_prompt_augmentation — per-model capability guidance appended to the system
+    #     prompt (e.g. GLM/DeepSeek are guided to prefer evaluate() for complex widgets).
+    # Composition is by SUBTRACTION only (ToolRegistry.filtered): a model can never invoke a
+    # tool the run did not load.
+    tool_omit: frozenset[str] = frozenset()
+    tool_allow: frozenset[str] | None = None
+    system_prompt_augmentation: str = ""
     rationale: str = ""
 
 
@@ -547,6 +575,28 @@ class ModelToolPolicy:
 #                   small tier, still ~25x the largest snapshot.
 #   glm-5.2       → 1M (1048576): z.ai release notes — "GLM-5.2 supports 1M lossless context"
 #                   (https://docs.z.ai/release-notes/new-released).
+# ISSUE #203 — per-MODEL system-prompt augmentation for capable API models (GLM / DeepSeek).
+# Live evidence (FlashTec run): DeepSeek had ``evaluate`` available (web.py:2035) but was
+# never guided to use it and looped on a calendar date-picker. ``evaluate`` runs arbitrary
+# JavaScript in the page, so a capable model can set a value DIRECTLY on the underlying
+# input instead of clicking through a multi-step widget. This guidance is appended to the
+# system prompt ONLY for the models whose policy carries it (qwen3:4b's is "" → its prompt
+# is unchanged). The tiny local qwen3:4b is deliberately NOT given this guidance — it is not
+# reliable at hand-writing DOM-mutating JS.
+_EVALUATE_GUIDANCE = (
+    "You are a capable model: for complex widgets where clicking is unreliable (date "
+    "pickers / calendars, custom dropdowns, sliders), prefer `evaluate(js)` to read or set "
+    "the underlying value DIRECTLY rather than many blind clicks. To set a value, target the "
+    "real input and dispatch the events the page listens for, e.g. "
+    "expression=\"el => { el.value = '2026-06-27'; "
+    "el.dispatchEvent(new Event('input', {bubbles:true})); "
+    "el.dispatchEvent(new Event('change', {bubbles:true})); }\" with target set to the "
+    "input's ref. Use `evaluate` first to inspect an element's tag/type/value when unsure, "
+    "then set it directly. Always re-check the page snapshot afterwards to confirm the value "
+    "took."
+)
+
+
 MODEL_TOOL_POLICIES: dict[str, ModelToolPolicy] = {
     # ISSUE #210 (disentangle the two limits): #197 had blanket-set max_actions_per_turn=99
     # on EVERY policy, conflating it with max_steps (turns/session — now 99, see Config).
@@ -556,33 +606,51 @@ MODEL_TOOL_POLICIES: dict[str, ModelToolPolicy] = {
     "qwen3:4b": ModelToolPolicy(
         codec="hermes", max_actions_per_turn=3, context_window=32768,
         collapse_consecutive_dup_tool_calls=True,  # #201: small local model repeats itself
+        # ISSUE #203: OMIT the browser-history-nav tools AND evaluate (run-JS):
+        #  * navigate_back / navigate_forward — the tiny local model cannot use them without
+        #    navigating AWAY from a multi-step form and losing its progress, so it is simply
+        #    not handed them (the toolset-level replacement for the global back-button guard
+        #    #206 deletes). These are loaded for capable models by #206; this omit is
+        #    forward-compatible (a no-op until they are in the run-loaded set).
+        #  * evaluate — issue #67's guarantee that "the limited 3B agent must NEVER execute
+        #    arbitrary JavaScript" is now enforced per-MODEL here: evaluate is loaded for the
+        #    capable API models (GLM/DeepSeek) and removed from qwen3:4b's view, so qwen's
+        #    exposure is UNCHANGED while capable models gain it. qwen gets no evaluate guidance
+        #    either — it is not reliable at hand-writing DOM-mutating JS.
+        tool_omit=frozenset({"navigate_back", "navigate_forward", "evaluate"}),
         rationale="native Hermes dialect; sub-7B 3-call accuracy peak (arXiv:2602.07359); "
                   "ctx 32768 = GPU-pinned num_ctx (#77/#140), NOT a model limit; "
                   "cap restored to 3 — #197 wrongly conflated this per-turn batch cap with "
-                  "max_steps (turns/session) and lifted it to 99 (#210)"),
+                  "max_steps (turns/session) and lifted it to 99 (#210); omits nav-history + "
+                  "evaluate (#203/#67/#206)"),
     "glm-4.7-flash": ModelToolPolicy(
         codec="json", max_actions_per_turn=10, context_window=131072,
         collapse_consecutive_dup_tool_calls=False,  # #201: capable model; keep legit repeats
+        system_prompt_augmentation=_EVALUATE_GUIDANCE,  # #203: guide evaluate() for widgets
         rationale="API reasoning model; schema-constrained JSON; lighter flash tier; "
                   "128K ctx (GLM-4.5-Flash documented 128K); cap set to 10 (#206)"),
     "glm-4.7": ModelToolPolicy(
         codec="json", max_actions_per_turn=10, context_window=204800,
         collapse_consecutive_dup_tool_calls=False,  # #201: capable model; keep legit repeats
+        system_prompt_augmentation=_EVALUATE_GUIDANCE,  # #203: guide evaluate() for widgets
         rationale="flagship agentic-coding; 200K ctx (GLM-4.6 documented 200K) + native "
                   "parallel_tool_calls; cap set to 10 (#206)"),
     "glm-5.2": ModelToolPolicy(
         codec="json", max_actions_per_turn=10, context_window=1048576,
         collapse_consecutive_dup_tool_calls=False,  # #201: capable model; keep legit repeats
+        system_prompt_augmentation=_EVALUATE_GUIDANCE,  # #203: guide evaluate() for widgets
         rationale="newest flagship long-horizon agentic line; 1M lossless ctx "
                   "(z.ai release notes); cap set to 10 (#206)"),
     "deepseek-chat": ModelToolPolicy(
         codec="json", max_actions_per_turn=10, context_window=131072,
         collapse_consecutive_dup_tool_calls=False,  # #201: capable model; keep legit repeats
+        system_prompt_augmentation=_EVALUATE_GUIDANCE,  # #203: guide evaluate() for widgets
         rationale="DeepSeek-V3.1 non-thinking; OpenAI-compat function calling; "
                   "128K ctx (V3.1 documented baseline); cap set to 10 (#206)"),
     "deepseek-reasoner": ModelToolPolicy(
         codec="json", max_actions_per_turn=10, context_window=131072,
         collapse_consecutive_dup_tool_calls=False,  # #201: capable model; keep legit repeats
+        system_prompt_augmentation=_EVALUATE_GUIDANCE,  # #203: guide evaluate() for widgets
         rationale="DeepSeek-V3.1 thinking; tool calls supported since V3.1 (was unsupported "
                   "on legacy R1); reasoning_content consumed as reasoning; 128K ctx (V3.1 "
                   "documented baseline); cap set to 10 (#206)"),
@@ -598,11 +666,13 @@ MODEL_TOOL_POLICIES: dict[str, ModelToolPolicy] = {
     "deepseek-v4-flash": ModelToolPolicy(
         codec="json", max_actions_per_turn=10, context_window=1_000_000,
         collapse_consecutive_dup_tool_calls=False,  # #201: capable model; keep legit repeats
+        system_prompt_augmentation=_EVALUATE_GUIDANCE,  # #203: guide evaluate() for widgets
         rationale="DeepSeek-V4-Flash (284B/13B-active); OpenAI-compat tool calling; native 1M "
                   "context (news260424); json single-shot codec; cap set to 10 (#206)"),
     "deepseek-v4-pro": ModelToolPolicy(
         codec="json", max_actions_per_turn=10, context_window=1_000_000,
         collapse_consecutive_dup_tool_calls=False,  # #201: capable model; keep legit repeats
+        system_prompt_augmentation=_EVALUATE_GUIDANCE,  # #203: guide evaluate() for widgets
         rationale="DeepSeek-V4-Pro (1.6T/49B-active); OpenAI-compat tool calling; native 1M "
                   "context (news260424); json single-shot codec; cap set to 10 (#206)"),
 }
@@ -614,6 +684,7 @@ MODEL_TOOL_POLICIES: dict[str, ModelToolPolicy] = {
 _GLM_FAMILY_POLICY = ModelToolPolicy(
     codec="json", max_actions_per_turn=10, context_window=131072,
     collapse_consecutive_dup_tool_calls=False,  # #201: capable GLM family; keep legit repeats
+    system_prompt_augmentation=_EVALUATE_GUIDANCE,  # #203: guide evaluate() for widgets
     rationale="unrecognised GLM/z.ai model: API JSON codec + 128K ctx; "
               "cap set to 10 (#206)")
 
@@ -625,6 +696,7 @@ _GLM_FAMILY_POLICY = ModelToolPolicy(
 _DEEPSEEK_FAMILY_POLICY = ModelToolPolicy(
     codec="json", max_actions_per_turn=10, context_window=131072,
     collapse_consecutive_dup_tool_calls=False,  # #201: capable DeepSeek family; keep repeats
+    system_prompt_augmentation=_EVALUATE_GUIDANCE,  # #203: guide evaluate() for widgets
     rationale="unrecognised DeepSeek model: API JSON codec + 128K ctx; "
               "cap set to 10 (#206)")
 
@@ -684,6 +756,54 @@ def resolve_model_collapse_dups(config: Config, spec: ModelSpec) -> bool:
     if policy is not None:
         return policy.collapse_consecutive_dup_tool_calls
     return True
+
+
+def resolve_model_tool_omit(config: Config, spec: ModelSpec) -> frozenset[str]:
+    """Resolve the per-MODEL tool DENYLIST for ``spec`` (issue #203).
+
+    Precedence (mirrors :func:`resolve_model_codec`): the spec's explicit ``tool_omit`` field
+    WINS; else the per-model registry (:func:`model_tool_policy`); else ``frozenset()`` — no
+    tools removed (today's behaviour). qwen3:4b resolves to ``{navigate_back,
+    navigate_forward}``; capable API models resolve to the empty set. The ACTIVE model's spec
+    drives this, so an escalation take-over re-resolves it (``_escalate``)."""
+    if spec.tool_omit is not None:
+        return frozenset(spec.tool_omit)
+    policy = model_tool_policy(spec.model)
+    if policy is not None:
+        return frozenset(policy.tool_omit)
+    return frozenset()
+
+
+def resolve_model_tool_allow(config: Config, spec: ModelSpec) -> "frozenset[str] | None":
+    """Resolve the per-MODEL tool ALLOWLIST for ``spec`` (issue #203), or ``None``.
+
+    Precedence: the spec's explicit ``tool_allow`` field WINS; else the per-model registry
+    (:func:`model_tool_policy`); else ``None`` — no allowlist restriction (today's behaviour).
+    An allowlist composes by INTERSECTION with the run's loaded toolset (see
+    :meth:`ToolRegistry.filtered`), so it can only NARROW exposure — never grant a tool the
+    run did not load."""
+    if spec.tool_allow is not None:
+        return frozenset(spec.tool_allow)
+    policy = model_tool_policy(spec.model)
+    if policy is not None:
+        return policy.tool_allow
+    return None
+
+
+def resolve_model_prompt_augmentation(config: Config, spec: ModelSpec) -> str:
+    """Resolve the per-MODEL system-prompt augmentation for ``spec`` (issue #203).
+
+    Precedence: the spec's explicit ``system_prompt_augmentation`` field WINS; else the
+    per-model registry (:func:`model_tool_policy`); else ``""`` — no augmentation (qwen3:4b's
+    prompt is unchanged). GLM/DeepSeek resolve to the evaluate()-preference guidance. The
+    text is appended to the toolset-assembled guidance and layers on top of the codec-level
+    prompt (see :class:`~vibeharness.prompt.SystemPromptBuilder`)."""
+    if spec.system_prompt_augmentation is not None:
+        return spec.system_prompt_augmentation
+    policy = model_tool_policy(spec.model)
+    if policy is not None:
+        return policy.system_prompt_augmentation
+    return ""
 
 
 def resolve_model_limit(config: Config, spec: ModelSpec) -> int:

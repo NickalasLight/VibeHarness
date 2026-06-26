@@ -24,7 +24,8 @@ from .agent import RalphAgent, RunResult
 from .clients import build_client, select_execution_codec
 from .codec import UnknownCodec, available_codecs, get_codec
 from .config import (Config, ModelSpec, model_tool_policy, resolve_model_codec,
-                     resolve_model_limit, resolve_role_spec)
+                     resolve_model_limit, resolve_model_prompt_augmentation,
+                     resolve_role_spec)
 from .filesystem import FileSystem, FileSystemError
 from .llm import OllamaClient, OllamaUnavailable, ensure_single_runner_env
 from .lock import SingleInstanceLock, VibeAlreadyRunning
@@ -37,6 +38,7 @@ from .toolset import (
     ToolsetCatalog,
     agent_default_max_actions,
     agent_default_toolsets,
+    apply_model_toolset,
     default_catalog,
 )
 from .validation import LLMValidator
@@ -497,6 +499,21 @@ def cmd_set(key: str, value: str) -> int:
     return 0
 
 
+def _augmented_guidance(toolsets, config: Config, spec: "ModelSpec") -> str:
+    """Toolset-assembled system guidance with the ACTIVE model's per-model augmentation
+    appended (issue #203).
+
+    The per-toolset ``system_guidance`` (issue #19) is assembled first; the model's
+    ``system_prompt_augmentation`` (resolved spec → policy → "") is then appended as a final
+    paragraph so it layers on TOP of the codec-level prompt without a new template branch.
+    qwen3:4b's augmentation is "" → the guidance (and the whole prompt) is unchanged."""
+    base = SystemPromptBuilder.assemble_guidance(toolsets)
+    aug = resolve_model_prompt_augmentation(config, spec).strip()
+    if not aug:
+        return base
+    return f"{base}\n\n{aug}".strip()
+
+
 def run_agent(args: argparse.Namespace) -> int:
     if args.task_file:
         task = Path(args.task_file).read_text(encoding="utf-8").strip()
@@ -529,22 +546,32 @@ def run_agent(args: argparse.Namespace) -> int:
             print(f"  - {p}")
         return 2
 
+    # FULL run-loaded registry (every tool the selected toolset(s) provide). The BASE
+    # model's per-model VIEW is a subset of this (issue #203, apply_model_toolset); the FULL
+    # set is handed to the agent so an escalation take-over can re-derive the escalator
+    # model's own view.
     registry = catalog.build_registry(toolsets, config)
+    # ISSUE #203 — the BASE model's per-model toolset view (omit/allowlist composed with the
+    # run's loaded toolset) drives the prompt/codec/native schema for the local model.
+    base_spec = resolve_role_spec(config, "base")
+    model_registry = apply_model_toolset(registry, config, base_spec)
     try:
         codec = get_codec(config.codec)
     except UnknownCodec as e:
         print(f"error: {e}")
         return 2
     # Vary the system prompt by the SELECTED toolset(s): each advertises its own short
-    # guidance, assembled into one "# Working with your tools" section.
-    guidance = SystemPromptBuilder.assemble_guidance(toolsets)
+    # guidance, assembled into one "# Working with your tools" section. ISSUE #203: the
+    # active model's per-model augmentation (e.g. GLM/DeepSeek evaluate() guidance) is
+    # appended on top; qwen3:4b's augmentation is "" so its prompt is unchanged.
+    guidance = _augmented_guidance(toolsets, config, base_spec)
     _native = bool(
         getattr(config, "native_tools", False)
         and not config.two_phase
-        and codec.tools(registry) is not None
+        and codec.tools(model_registry) is not None
     )
     system_prompt = SystemPromptBuilder(
-        registry, config.max_actions_per_turn, codec,
+        model_registry, config.max_actions_per_turn, codec,
         guidance=guidance).build(task, native_tools=_native)   # task anchored at the front
 
     if args.workdir:
@@ -737,14 +764,20 @@ def _run_locked(args, task, config, registry, codec, names, workdir, logger,
     # Base agent client built from the per-role "base" spec (issue #163): config.models
     # ["base"] if set, else the legacy model/backend keys via resolve_role_spec. For the
     # default local config this is exactly OllamaClient(config) as before.
-    client = build_client(resolve_role_spec(config, "base"), config)
+    base_spec = resolve_role_spec(config, "base")
+    client = build_client(base_spec, config)
+    # ISSUE #203 — the BASE model's per-model toolset VIEW (a subset of the run-loaded
+    # ``registry``). It drives the prompt docs, native ``tools:`` schemas, decode constraint,
+    # and tool-execution lookup. The FULL ``registry`` is still handed to the agent so an
+    # escalation take-over can re-derive the escalator model's own view.
+    model_registry = apply_model_toolset(registry, config, base_spec)
 
     # Capability-driven path selection (#163): if the base client is NON-native (an API
     # client), auto-degrade to the single-shot path and a constrained-JSON codec (swapping
     # a native-only codec like `hermes` for `json`). The chosen codec is then used
     # everywhere this run — the system prompt, the agent loop, and the validator context —
     # so the user only picks a model and the harness picks a compatible path.
-    codec, native_tools, _codec_note = select_execution_codec(config, client, codec, registry)
+    codec, native_tools, _codec_note = select_execution_codec(config, client, codec, model_registry)
     if _codec_note:
         print(f" note: {_codec_note}")
 
@@ -771,9 +804,11 @@ def _run_locked(args, task, config, registry, codec, names, workdir, logger,
     # Refresh the system prompt every turn so its "# Workspace" section reflects
     # files the agent creates as it goes. Scanning Path.cwd() each call (rather
     # than a cached tree) is what makes newly written files appear next turn.
+    # ISSUE #203: the builder uses the BASE model's per-model registry view + the BASE
+    # model's prompt augmentation (qwen3:4b: nav tools omitted, no augmentation → unchanged).
     builder = SystemPromptBuilder(
-        registry, config.max_actions_per_turn, codec,
-        guidance=SystemPromptBuilder.assemble_guidance(toolsets))
+        model_registry, config.max_actions_per_turn, codec,
+        guidance=_augmented_guidance(toolsets, config, base_spec))
     fs = FileSystem()
 
     # Per-turn "# Workspace" renderer, gated on whether the fs toolset is active:
@@ -852,9 +887,12 @@ def _run_locked(args, task, config, registry, codec, names, workdir, logger,
             _esc_spec = resolve_role_spec(config, "escalation")
             _esc_codec = get_codec(resolve_model_codec(config, _esc_spec))
             _esc_limit = resolve_model_limit(config, _esc_spec)
+            # ISSUE #203: the escalation prompt uses the ESCALATOR model's per-model registry
+            # view (e.g. GLM/DeepSeek keep nav tools) + its augmentation (evaluate() guidance).
+            _esc_registry = apply_model_toolset(registry, config, _esc_spec)
             _esc_builder = SystemPromptBuilder(
-                registry, _esc_limit, _esc_codec,
-                guidance=SystemPromptBuilder.assemble_guidance(toolsets))
+                _esc_registry, _esc_limit, _esc_codec,
+                guidance=_augmented_guidance(toolsets, config, _esc_spec))
             # native_tools=False so the `# Tools` block + format instructions are present
             # for the single-shot API path (the #179 root cause when omitted).
             escalation_system_prompt_provider = make_system_prompt_provider(
@@ -863,9 +901,13 @@ def _run_locked(args, task, config, registry, codec, names, workdir, logger,
         except Exception:
             escalation_system_prompt_provider = None  # never block the run on this aid
 
-    agent = RalphAgent(client, registry, system_prompt, config, validator,
+    # ISSUE #203: the agent runs on the BASE model's per-model registry view; the FULL
+    # run-loaded registry is passed as ``full_registry`` so an escalation take-over can
+    # re-derive the escalator model's own view (e.g. restore nav tools for GLM/DeepSeek).
+    agent = RalphAgent(client, model_registry, system_prompt, config, validator,
                        reporter=reporter, system_prompt_provider=system_prompt_provider,
                        codec=codec, validator_context_provider=validator_context_provider,
+                       full_registry=registry,
                        raw_snapshot_provider=raw_snapshot_provider,
                        turn_input_logger=logger.dump_turn_input,
                        turn_output_logger=logger.dump_turn_output,
@@ -1096,7 +1138,12 @@ def main(argv: list[str] | None = None) -> int:
         # Show the prompt the model ACTUALLY receives: when native tools are active
         # (issue #129/#130/#131) Ollama injects the # Tools block + format instructions
         # from the model's template, so the harness prompt omits them — render that.
-        _registry = catalog.build_registry(toolsets, cfg)
+        # ISSUE #203: render the BASE model's per-model VIEW (e.g. qwen3:4b's prompt omits
+        # the nav-history tools) + the model's prompt augmentation, so --print-system shows
+        # exactly what the model receives.
+        _full_registry = catalog.build_registry(toolsets, cfg)
+        _base_spec = resolve_role_spec(cfg, "base")
+        _registry = apply_model_toolset(_full_registry, cfg, _base_spec)
         _native = bool(
             getattr(cfg, "native_tools", False)
             and not cfg.two_phase
@@ -1104,7 +1151,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         print(SystemPromptBuilder(
             _registry, cfg.max_actions_per_turn, codec,
-            guidance=SystemPromptBuilder.assemble_guidance(toolsets)).build(
+            guidance=_augmented_guidance(toolsets, cfg, _base_spec)).build(
                 native_tools=_native))
         return 0
     if not args.task and not args.task_file:

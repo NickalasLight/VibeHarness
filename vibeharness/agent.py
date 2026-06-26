@@ -159,9 +159,17 @@ class RalphAgent:
                  raw_snapshot_provider: Callable[[], str] | None = None,
                  turn_input_logger: "Callable[[int, str, list, str, float], None] | None" = None,
                  turn_output_logger: "Callable[[int, str, str], None] | None" = None,
-                 escalation_system_prompt_provider: Callable[[str], str] | None = None):
+                 escalation_system_prompt_provider: Callable[[str], str] | None = None,
+                 full_registry: ToolRegistry | None = None):
         self._client = client
         self._registry = registry
+        # ISSUE #203 — the FULL run-loaded registry (every tool the selected toolset(s)
+        # provide). ``self._registry`` is the ACTIVE model's per-model VIEW of it (a subset:
+        # e.g. qwen3:4b's view omits the nav-history tools). On escalation take-over the
+        # agent re-derives the escalator model's view FROM this full set (so a capable model
+        # regains tools the local model was denied). Defaults to ``registry`` when not given
+        # (fs/test path) → no per-model filtering, today's behaviour.
+        self._full_registry = full_registry or registry
         self._system = system_prompt
         self._cfg = config
         # ISSUE #193 — the model spec currently driving the run, used to size the input/
@@ -998,6 +1006,13 @@ class RalphAgent:
         # model: escalating from qwen3:4b (collapse on) to a capable API model (GLM/DeepSeek,
         # collapse off) lifts the collapse mid-run, so legit repeats are no longer dropped.
         self._collapse_dup_tool_calls = resolve_model_collapse_dups(self._cfg, spec)
+        # ISSUE #203 — re-derive the ACTIVE registry from the FULL run-loaded set for the
+        # ESCALATOR model's per-model toolset view: escalating from qwen3:4b (nav-history
+        # tools omitted) to a capable API model RESTORES those tools (the escalator's omit set
+        # is empty), and any escalator allowlist is intersected with the loaded set. The
+        # prompt-augmentation swap rides the escalation_system_prompt_provider below.
+        from .toolset import apply_model_toolset
+        self._registry = apply_model_toolset(self._full_registry, self._cfg, spec)
         # Switch the ACTIVE codec + call path + cap to the escalator model's (#179/#178).
         codec_name = resolve_model_codec(self._cfg, spec)
         escalator_codec = get_codec(codec_name)
