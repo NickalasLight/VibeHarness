@@ -1,0 +1,9 @@
+{
+  "baseModel": "qwen3:4b",
+  "validatorModel": "glm-5.2",
+  "validatorProvider": "zhipuai",
+  "escalationModel": "glm-5.2",
+  "codec": "hermes",
+  "headless": false,
+  "maxSteps": 15
+}

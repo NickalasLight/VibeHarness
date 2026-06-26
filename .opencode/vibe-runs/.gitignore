@@ -1,0 +1,3 @@
+# Per-run state is runtime-only; never commit run artifacts.
+*
+!.gitignore
