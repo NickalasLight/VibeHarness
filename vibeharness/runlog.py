@@ -229,6 +229,10 @@ class RunLogger:
             "finished": result.finished,
             "final_summary": result.final_summary,
             "validations": result.validations,
+            # Context-budget overrun events (issues #170/#172/#173): every history
+            # eviction / snapshot truncation that kept the request within num_ctx, so a
+            # budgeting event is on the permanent record, not just the live stdout.
+            "context_events": getattr(result, "context_events", []),
             "turns": result.to_dict()["turns"],   # includes per-turn reasoning traces
         }
         # Encode defensively: model/browser-snapshot text can contain lone
