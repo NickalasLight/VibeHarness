@@ -89,6 +89,42 @@ _ATTR_RE = re.compile(r"\[(?P<body>[^\]]*)\]")
 _URL_RE = re.compile(r"^/url:\s*(?P<url>.+)$")
 _TEXT_RE = re.compile(r"^text:\s*(?P<text>.*)$")
 
+# An element whose value/text is emitted inline as a YAML scalar AFTER its node, e.g.
+#   ``textbox "First name" [ref=e1]: Jason``      -> current value "Jason"
+#   ``generic [ref=e193]: July 2026``             -> text "July 2026" (calendar header)
+#   ``button "2026-07-21" [ref=e221]: "21"``      -> day-cell label "21"
+# The scalar follows the (last) bracketed attribute group + a colon. A control with NO
+# committed value simply has no colon scalar. This is the LIVE DOM value (issue #205) and
+# the single source of truth for filled-state annotation — never an intended action arg.
+# Fallback (no brackets): ``role "name": value`` / ``role: value``.
+_INLINE_VALUE_NOBRACKET_RE = re.compile(
+    r'^[A-Za-z][\w-]*(?:\s+"(?:[^"\\]|\\.)*")?\s*:\s*(?P<v>.+)$')
+
+
+def _strip_scalar_quotes(s: str) -> str:
+    """Strip a single pair of surrounding quotes from an inline scalar (e.g. ``"21"``)."""
+    s = s.strip()
+    if len(s) >= 2 and s[0] in "\"'" and s[-1] == s[0]:
+        return s[1:-1]
+    return s
+
+
+def _inline_value(content: str) -> str | None:
+    """Extract the inline ARIA scalar (the control's live value/text), or None.
+
+    ``content`` is the unwrapped bullet content with any *trailing* colon already removed
+    (container nodes). For a value-bearing node the colon is mid-string, after the closing
+    ``]`` of the attribute group; we return the scalar that follows it. Quoted names that
+    themselves contain a colon (``button "Language: English" [ref=e1]``) are unaffected
+    because we only look AFTER the final ``]``.
+    """
+    idx = content.rfind("]")
+    if idx != -1:
+        m = re.match(r"\s*:\s*(?P<v>.+)$", content[idx + 1:])
+        return _strip_scalar_quotes(m.group("v")) if m else None
+    m = _INLINE_VALUE_NOBRACKET_RE.match(content)
+    return _strip_scalar_quotes(m.group("v")) if m else None
+
 
 @dataclass
 class _Node:
@@ -98,6 +134,7 @@ class _Node:
     props: list[str] = field(default_factory=list)   # kept ARIA state, e.g. ["active", "level=2"]
     url: str | None = None                            # for links
     text: str | None = None                           # raw text leaf content
+    value: str | None = None                          # inline ARIA scalar (current control value)
     depth: int = 0
     children: list["_Node"] = field(default_factory=list)
 
@@ -171,7 +208,7 @@ def _parse_line(content: str) -> _Node | None:
     if mname:
         name = mname.group("name").replace('\\"', '"')
     ref, props = _parse_attrs(rest)
-    return _Node(role=role, name=name, ref=ref, props=props)
+    return _Node(role=role, name=name, ref=ref, props=props, value=_inline_value(content))
 
 
 def _build_tree(raw: str) -> _Node:
@@ -293,6 +330,12 @@ _ROLE_INFO: dict[str, tuple[str, str | None]] = {
 # actionable role with NO ref is targetable-in-principle but the tree gave no handle.
 _ACTIONABLE_ROLES = frozenset(r for r, (_, aff) in _ROLE_INFO.items() if aff is not None)
 
+# Input controls whose live committed value (the inline ARIA scalar) is rendered to the
+# model so it sees the REAL current value, not just whether the field is "filled" (#205).
+_VALUE_DISPLAY_ROLES = frozenset({
+    "textbox", "searchbox", "combobox", "spinbutton", "slider",
+})
+
 
 def _role_info(role: str) -> tuple[str, str | None]:
     """(label, affordance) for a role, falling back to the raw role + no affordance."""
@@ -336,6 +379,10 @@ def _render_node_line(node: _Node, depth: int) -> str:
         line += f' "{_link_hint(node.url)}"'
     if node.props:
         line += " " + " ".join(f"[{p}]" for p in node.props)
+    # Surface the live committed value of an input control (#205) so the model sees the
+    # REAL current value (which may differ from / be empty vs. what was attempted).
+    if node.value and role_l in _VALUE_DISPLAY_ROLES:
+        line += f' (current value: "{node.value}")'
     if node.url and role_l == "link":
         line += f" -> {node.url}"
 
@@ -382,6 +429,50 @@ def _walk(node: _Node, depth: int, out: list[str], recent: list[str]) -> None:
     child_depth = depth + 1 if keep else depth
     for child in node.children:
         _walk(child, child_depth, out, recent)
+
+
+# --- calendar header surfacing (#205 Defect 2) ---------------------------------------
+# An open date-picker renders its current month/year as a bare ``generic [ref]: <Month
+# YYYY>`` node, which the WebArena prune (empty generic) drops — so the model never knows
+# which month the grid shows and hallucinates it. We re-surface it as an explicit preamble
+# line whenever a calendar is actually open (a day-cell grid is present).
+_MONTHYEAR_RE = re.compile(
+    r"\b(January|February|March|April|May|June|July|August|September|October|"
+    r"November|December)\s+(\d{4})\b", re.IGNORECASE)
+_ISO_DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def _iter_nodes(root: _Node):
+    """Depth-first iteration over every node in the tree (excluding the synthetic root)."""
+    stack = list(root.children)
+    while stack:
+        node = stack.pop(0)
+        yield node
+        stack[:0] = node.children
+
+
+def _calendar_monthyear(root: _Node) -> str | None:
+    """The open calendar's '<Month YYYY>' if a day-cell grid is present, else None.
+
+    Requires BOTH a month/year label (on a node's value or name) AND at least one ISO
+    day-cell button — so a stray 'May 2016' in ordinary page text never triggers a false
+    'Calendar showing' line.
+    """
+    monthyear = None
+    has_day = False
+    for node in _iter_nodes(root):
+        if not has_day and node.role.lower() == "button":
+            if _ISO_DAY_RE.match((node.name or "").strip()):
+                has_day = True
+        if monthyear is None:
+            for field_text in (node.value, node.name):
+                m = _MONTHYEAR_RE.search(field_text or "")
+                if m:
+                    monthyear = f"{m.group(1).title()} {m.group(2)}"
+                    break
+        if has_day and monthyear:
+            return monthyear
+    return None
 
 
 # --- header parsing -------------------------------------------------------------------
@@ -460,6 +551,12 @@ def aria_yaml_to_prose(raw: str) -> str:
                 f"clear it (click its Accept/Reject/Dismiss control) before acting on "
                 f"anything behind it."
             )
+        # #205 Defect 2: always surface the open calendar's current month/year (the bare
+        # `generic: <Month YYYY>` header is otherwise pruned), so the model knows which
+        # month the day grid is showing instead of guessing.
+        cal_monthyear = _calendar_monthyear(root)
+        if cal_monthyear is not None:
+            preamble.append(f"Calendar showing: {cal_monthyear}")
         head = "\n".join(preamble)
         prose = "\n".join(out)
         return (head + "\n\n" + prose) if head else prose

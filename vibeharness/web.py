@@ -142,6 +142,11 @@ def annotate_filled_snapshot(snapshot: str, filled: dict[str, str]) -> str:
 
     Each matching line gets:  ``  [ALREADY FILLED WITH 'value' — DO NOT FILL AGAIN]``
     appended, so the model knows which elements are already handled.
+
+    ``filled`` MUST be the live per-snapshot control-value map from
+    :func:`live_control_values` (issue #205) — i.e. derived from the page's ACTUAL current
+    DOM values this turn, never a cache of intended action args. A control that holds no
+    committed value is simply absent from ``filled`` and gets no marker.
     """
     if not snapshot or not filled:
         return snapshot
@@ -154,6 +159,87 @@ def annotate_filled_snapshot(snapshot: str, filled: dict[str, str]) -> str:
                 line = f"{line}  [ALREADY FILLED WITH '{filled[ref]}' — DO NOT FILL AGAIN]"
         lines.append(line)
     return "\n".join(lines)
+
+
+# Input controls whose committed value is the inline ARIA scalar (text after the colon).
+_VALUE_INPUT_ROLES = frozenset({
+    "textbox", "searchbox", "combobox", "spinbutton", "slider",
+})
+# Option-container roles whose value is its [selected] option children (native/multi select).
+_OPTION_CONTAINER_ROLES = frozenset({"listbox", "select", "menu", "combobox"})
+# Toggle controls whose "filled" state is a checked/selected flag, not a scalar value.
+_CHECKED_ROLES = frozenset({
+    "checkbox", "radio", "switch", "menuitemcheckbox", "menuitemradio",
+})
+
+
+def _prop_is_set(props: list[str], key: str) -> bool:
+    """True when ARIA state ``key`` is present and not explicitly false (``checked`` /
+    ``checked=true`` -> True; ``checked=false`` / ``checked=mixed`` -> False)."""
+    for p in props:
+        name, _, val = p.partition("=")
+        if name.strip().lower() == key:
+            return val.strip().lower() not in ("false", "mixed")
+    return False
+
+
+def _selected_option_text(node) -> str | None:
+    """Joined accessible names of a container's ``[selected]`` option children, or None.
+
+    Handles native single-select (one selected option) and multi-select (several). Used
+    when a listbox/combobox exposes its value via selected option nodes rather than an
+    inline scalar.
+    """
+    from .snapshot_prose import _iter_nodes  # local import: avoids any import cycle
+    names = []
+    for child in _iter_nodes(node):
+        if child.role.lower() == "option" and _prop_is_set(child.props, "selected"):
+            txt = (child.name or "").strip()
+            if txt:
+                names.append(txt)
+    return ", ".join(names) if names else None
+
+
+def live_control_values(raw_aria_snapshot: str) -> dict[str, str]:
+    """Map ``{ref: committed_value}`` for controls that ACTUALLY hold a value right now.
+
+    Issue #205: the single source of truth for filled-state is the live page, read from the
+    raw Playwright ARIA snapshot captured every turn — NEVER a cache of intended action
+    args. A control is included ONLY when its current DOM value/checked-state is non-empty:
+      * text inputs / spinbuttons / sliders / native single-selects: the inline ARIA scalar
+        (``- textbox "Name" [ref=e1]: Jason``); an empty field has no scalar -> excluded.
+      * listbox / multi-select / native select: the joined ``[selected]`` option names.
+      * checkbox / radio / switch: ``"(checked)"`` when ``[checked]`` is set; unchecked -> excluded.
+    A popup that was only OPENED (no commit), a cleared field, and a ref absent from the
+    snapshot all yield NO entry, so :func:`annotate_filled_snapshot` never falsely marks them.
+    Parsing reuses the deterministic ARIA tree builder in :mod:`vibeharness.snapshot_prose`.
+    """
+    if not raw_aria_snapshot or not raw_aria_snapshot.strip():
+        return {}
+    try:
+        from .snapshot_prose import _build_tree, _iter_nodes, _split_header_and_yaml
+        _, _, body = _split_header_and_yaml(raw_aria_snapshot)
+        root = _build_tree(body)
+    except Exception:
+        return {}
+    filled: dict[str, str] = {}
+    for node in _iter_nodes(root):
+        if not node.ref:
+            continue
+        role = node.role.lower()
+        value = (node.value or "").strip()
+        if role in _CHECKED_ROLES:
+            if _prop_is_set(node.props, "checked") or _prop_is_set(node.props, "selected"):
+                filled[node.ref] = "(checked)"
+            continue
+        if role in _VALUE_INPUT_ROLES and value:
+            filled[node.ref] = value
+            continue
+        if role in _OPTION_CONTAINER_ROLES:
+            sel = _selected_option_text(node)
+            if sel:
+                filled[node.ref] = sel
+    return filled
 
 
 def parse_snapshot_refs(snapshot: str) -> set[str]:

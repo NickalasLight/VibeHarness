@@ -40,7 +40,8 @@ from .toolset import (
     default_catalog,
 )
 from .validation import LLMValidator
-from .web import annotate_filled_snapshot, make_raw_snapshot_provider, resolve_web_session
+from .web import (annotate_filled_snapshot, live_control_values,
+                  make_raw_snapshot_provider, resolve_web_session)
 from .snapshot_prose import aria_yaml_to_prose
 from .advisor import VibeThinkerAdvisor
 
@@ -797,19 +798,22 @@ def _run_locked(args, task, config, registry, codec, names, workdir, logger,
     # raw ARIA snapshot flows through exactly as before. The transform preserves the
     # native [ref=eN] inline so the discrete web subtools keep resolving targets, and
     # falls back to the raw text on any parse surprise (never blanks the page section).
-    if raw_snapshot_provider is not None and config.web_snapshot_prose:
-        _inner_snapshot_provider = raw_snapshot_provider
-        raw_snapshot_provider = lambda: aria_yaml_to_prose(_inner_snapshot_provider())
-
-    # Filled-control annotation: track which refs the agent has successfully filled this
-    # run and annotate those lines in the snapshot with "ALREADY FILLED WITH '...'".
-    # Updated by the checkpoint after each turn; read by the snapshot provider each turn.
-    filled_controls: dict[str, str] = {}
+    # Filled-control annotation (issue #205): derive filled-state from the LIVE control
+    # values on the page every snapshot — NEVER a cache of intended action args. We capture
+    # the raw ARIA once per turn, build the display view (prose A/B, see #64), compute the
+    # actual {ref: value} map from that same raw snapshot, and stamp "ALREADY FILLED WITH
+    # '...'" only on controls that genuinely hold a value/checked-state right now. A popup
+    # that was merely opened (no commit) stays empty; a cleared field flips back to empty.
     if raw_snapshot_provider is not None:
-        import json as _json
-        _inner_for_fill = raw_snapshot_provider
-        raw_snapshot_provider = lambda: annotate_filled_snapshot(
-            _inner_for_fill(), filled_controls)
+        _raw_aria_provider = raw_snapshot_provider
+        _prose_on = config.web_snapshot_prose
+
+        def _snapshot_provider() -> str:
+            raw = _raw_aria_provider()
+            display = aria_yaml_to_prose(raw) if _prose_on else raw
+            return annotate_filled_snapshot(display, live_control_values(raw))
+
+        raw_snapshot_provider = _snapshot_provider
 
     # NATIVE tool calling active? Already resolved by select_execution_codec above (#163):
     # it is the same predicate the agent uses (opted in, single-phase, codec speaks native
@@ -879,19 +883,11 @@ def _run_locked(args, task, config, registry, codec, names, workdir, logger,
 
     def checkpoint(res: RunResult) -> None:
         _live["result"] = res
-        # Update filled_controls from the latest turn's successful fill/select actions.
+        # NOTE (#205): filled-state is NO LONGER cached from intended action args here.
+        # The snapshot provider derives it from the LIVE DOM values each turn
+        # (live_control_values) so an opened-but-uncommitted control never shows as filled.
         if res.turns:
             latest = res.turns[-1]
-            for a in latest.actions:
-                if not a.ok or not a.args:
-                    continue
-                tgt = a.args.get("target")
-                if a.tool in ("fill", "type") and tgt and isinstance(a.args.get("text"), str):
-                    filled_controls[tgt] = a.args["text"]
-                elif a.tool == "select_option" and tgt and isinstance(a.args.get("value"), str):
-                    filled_controls[tgt] = a.args["value"]
-                elif a.tool == "check" and tgt:
-                    filled_controls[tgt] = "(checked)"
             # Count tool calls this turn (real calls only, not error placeholders).
             turn_tool_calls = sum(1 for a in latest.actions if a.tool is not None)
             _tool_calls_since_advisor[0] += turn_tool_calls
