@@ -30,6 +30,24 @@ from vibeharness.tools import Tool, ToolResult
 from tests._fakes import FakeLLMClient, FakeValidator
 
 
+class _NativeFakeLLMClient(FakeLLMClient):
+    """A FakeLLMClient that reports as NATIVE-capable (issue #163 gate).
+
+    The shared ``FakeLLMClient`` only scripts the single-shot ``decide``, so the base
+    default (native iff ``decide_chat`` is overridden) reports it non-native — which is
+    exactly what keeps the legacy-path loop tests in test_agent.py on the legacy path.
+    The same-turn-dedup UNIT tests, however, exercise the native trimming branches of
+    ``_suppress_same_turn_duplicates`` and only require ``agent._native`` to be active;
+    they never actually drive ``decide_chat``. Overriding it here (satisfying the
+    documented capability contract) flips those agents — and ONLY those — native, without
+    disturbing the shared default fake the other suites rely on.
+    """
+
+    def decide_chat(self, messages, tools, on_reason=None, on_action=None):  # pragma: no cover - never invoked
+        # Never called: the dedup unit tests invoke _suppress_same_turn_duplicates directly.
+        return self.decide("", "", None, on_reason=on_reason, on_action=on_action)
+
+
 def _counting_tool(tool_name: str) -> Tool:
     class _T(Tool):
         name = tool_name
@@ -63,8 +81,11 @@ def _make_agent(*, dedup_tools=(), web=True, native=False) -> RalphAgent:
     )
     codec = get_codec("hermes") if native else None
     snapshot = (lambda: "") if web else None
+    # Native mode needs a native-capable client (issue #163 capability gate); the shared
+    # legacy fake would leave _native False. Legacy mode keeps the plain shared fake.
+    client = _NativeFakeLLMClient([]) if native else FakeLLMClient([])
     agent = RalphAgent(
-        FakeLLMClient([]), _web_registry(), "SYS", cfg, FakeValidator(passed=True),
+        client, _web_registry(), "SYS", cfg, FakeValidator(passed=True),
         codec=codec, raw_snapshot_provider=snapshot,
     )
     if native:

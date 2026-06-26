@@ -1,6 +1,27 @@
 """Runtime configuration. One immutable value object passed where needed (DIP-friendly)."""
 from __future__ import annotations
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+
+
+@dataclass(frozen=True)
+class ModelSpec:
+    """Which model drives one agent role, and how to sample it (issue #163).
+
+    A role (``base`` / ``validator`` / ``advisor`` / ``escalation`` / any future role) is
+    pointed at a model by naming a registered provider plus a model id. The endpoint
+    *kind* — local Ollama/llama.cpp vs an OpenAI-compatible API — is NOT stored here; it
+    derives from the named provider (see :mod:`vibeharness.providers`), so flipping a role
+    local↔API is a single field change (``provider``) with no other edits.
+
+    The sampling fields are OPTIONAL per-role overrides. Resolution is layered
+    spec → provider-default → :class:`Config`-default (applied by the client factory), so
+    leaving them ``None`` inherits the run's global sampling exactly as before.
+    """
+    provider: str            # a registry name, e.g. "ollama" or "zhipuai"
+    model: str               # the model id at that provider, e.g. "qwen3:4b" / "glm-4.7-flash"
+    temperature: float | None = None
+    top_p: float | None = None
+    top_k: int | None = None
 
 
 @dataclass(frozen=True)
@@ -288,3 +309,50 @@ class Config:
     # Falls back to the main Ollama client when the provider key env var is absent.
     validation_provider: str = "zhipuai"
     validation_model: str = "glm-5.2"
+
+    # --- Per-role model endpoints (issue #163) ---
+    # Nested, role-keyed override of which model drives each agent role. When a role has
+    # an entry here it WINS; otherwise the role falls back to the legacy flat keys above
+    # via ``resolve_role_spec`` (so every pre-existing run/test behaves identically). Keyed
+    # by role name ("base", "validator", "advisor", "escalation"). Empty by default — the
+    # whole feature is opt-in and backward compatible.
+    models: dict[str, ModelSpec] = field(default_factory=dict)
+
+
+# Maps each role to the LEGACY flat Config keys it historically read, so a role with no
+# explicit ``models`` entry resolves to exactly the same model/provider it always used.
+# (provider-field, model-field) — provider-field is read as the registry name; for the
+# local base/advisor roles it is the backend ("ollama"/"llamacpp").
+_LEGACY_ROLE_KEYS: dict[str, tuple[str, str]] = {
+    "base": ("backend", "model"),
+    "validator": ("validation_provider", "validation_model"),
+    "advisor": ("backend", "advisor_model"),
+    "escalation": ("escalation_provider", "escalation_model"),
+}
+
+
+def resolve_role_spec(config: Config, role: str) -> ModelSpec:
+    """Resolve the :class:`ModelSpec` that drives ``role`` (issue #163).
+
+    Precedence: an explicit ``config.models[role]`` entry WINS; otherwise the role falls
+    back to its LEGACY flat keys (``model``/``backend``, ``validation_*``, ``advisor_model``,
+    ``escalation_*``) so every existing run and test keeps working unchanged. This
+    backward-compat fallback is the contract that lets the new per-role seam ship without a
+    behaviour change for any config that uses the old flat keys.
+
+    The ``advisor`` role's model falls back to the base ``model`` when ``advisor_model`` is
+    empty (the "Qwen self-advises" default), mirroring the historical advisor resolution.
+    """
+    explicit = config.models.get(role)
+    if explicit is not None:
+        return explicit
+    try:
+        provider_field, model_field = _LEGACY_ROLE_KEYS[role]
+    except KeyError:
+        raise KeyError(f"unknown agent role {role!r}; "
+                       f"known roles: {', '.join(sorted(_LEGACY_ROLE_KEYS))}") from None
+    provider = getattr(config, provider_field, "")
+    model = getattr(config, model_field, "")
+    if role == "advisor" and not model:
+        model = config.model       # empty advisor_model => self-advise on the base model
+    return ModelSpec(provider=provider, model=model)

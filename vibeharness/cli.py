@@ -19,9 +19,11 @@ from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 
+from . import providers
 from .agent import RalphAgent, RunResult
+from .clients import build_client, select_execution_codec
 from .codec import UnknownCodec, available_codecs, get_codec
-from .config import Config
+from .config import Config, ModelSpec, resolve_role_spec
 from .filesystem import FileSystem, FileSystemError
 from .llm import OllamaClient, OllamaUnavailable, ensure_single_runner_env
 from .lock import SingleInstanceLock, VibeAlreadyRunning
@@ -115,6 +117,18 @@ current effective defaults: model={effective.model}, codec={effective.codec}, ""
     p.add_argument("--top_k", type=int, default=None, metavar="K",
                    help=f"top-k sampling cutoff for this run (default: {Config.top_k}; "
                         "0 disables the top-k filter)")
+
+    # --- per-role endpoint selection (issue #163) ---
+    # A role can be driven local<->API purely by naming a provider; the matching model id
+    # pairs with it. Convenience flags over the general `--set models.<role>.<field>` keys.
+    p.add_argument("--base-provider", default=None, metavar="NAME",
+                   help="provider for the BASE agent role this run (e.g. ollama, zhipuai) (#163)")
+    p.add_argument("--base-model", default=None, metavar="ID",
+                   help="model id for the BASE agent role this run (e.g. glm-4.7-flash) (#163)")
+    p.add_argument("--validator-provider", default=None, metavar="NAME",
+                   help="provider for the VALIDATOR role this run (#163)")
+    p.add_argument("--validator-model", default=None, metavar="ID",
+                   help="model id for the VALIDATOR role this run (#163)")
 
     # --- tool-call format / agent / toolsets ---
     p.add_argument("--codec", default=None, metavar="CODEC",
@@ -351,6 +365,23 @@ def resolve_config(args: argparse.Namespace) -> Config:
         overrides["web_snapshot_prose"] = True
     if getattr(args, "advisor", False):
         overrides["advisor_enabled"] = True
+    # Per-role endpoint overrides (issue #163): fold the convenience flags into
+    # config.models, filling any unspecified field from the role's current (settings/legacy)
+    # resolution so e.g. `--base-provider zhipuai` alone keeps the existing base model.
+    models = dict(cfg.models)
+    for role, provider_arg, model_arg in (
+        ("base", "base_provider", "base_model"),
+        ("validator", "validator_provider", "validator_model"),
+    ):
+        prov = getattr(args, provider_arg, None)
+        mdl = getattr(args, model_arg, None)
+        if prov is None and mdl is None:
+            continue
+        current = resolve_role_spec(cfg, role)
+        models[role] = replace(current, provider=prov or current.provider,
+                               model=mdl or current.model)
+    if models != cfg.models:
+        overrides["models"] = models
     cfg = replace(cfg, **overrides) if overrides else cfg
     # Mint a UNIQUE per-run Playwright session name (issues #111/#112) so concurrent
     # runs never share — and tear down — one another's browser daemon. An explicitly
@@ -646,20 +677,38 @@ def _run_locked(args, task, config, registry, codec, names, workdir, logger,
     else:
         advisor = None
 
-    client = OllamaClient(config)
+    # Base agent client built from the per-role "base" spec (issue #163): config.models
+    # ["base"] if set, else the legacy model/backend keys via resolve_role_spec. For the
+    # default local config this is exactly OllamaClient(config) as before.
+    client = build_client(resolve_role_spec(config, "base"), config)
 
-    # Validator uses the API model by default (stronger, independent verdict).
-    # Falls back to the local Ollama client when the provider/key is unavailable.
+    # Capability-driven path selection (#163): if the base client is NON-native (an API
+    # client), auto-degrade to the single-shot path and a constrained-JSON codec (swapping
+    # a native-only codec like `hermes` for `json`). The chosen codec is then used
+    # everywhere this run — the system prompt, the agent loop, and the validator context —
+    # so the user only picks a model and the harness picks a compatible path.
+    codec, native_tools, _codec_note = select_execution_codec(config, client, codec, registry)
+    if _codec_note:
+        print(f" note: {_codec_note}")
+
+    # Validator client: prefer the validator role's configured model for a stronger,
+    # independent verdict. Falls back to the BASE client when the validator role is unset,
+    # resolves to the same local model as base, or its API key is unavailable (legacy
+    # behaviour — a missing key silently degrades to the local validator).
     _validator_client = client
-    if config.validation_provider:
+    _v_spec = resolve_role_spec(config, "validator")
+    if _v_spec.provider:
         try:
-            from .providers import api_key_present, get_provider, make_api_client
-            _vp = get_provider(config.validation_provider)
-            if api_key_present(_vp):
-                _validator_client = make_api_client(
-                    config.validation_provider, config.validation_model or None)
+            _v_ep = providers.get_endpoint(_v_spec.provider)
+            if providers.is_local(_v_ep):
+                _base_spec = resolve_role_spec(config, "base")
+                if (_v_spec.provider, _v_spec.model) != (_base_spec.provider, _base_spec.model):
+                    _validator_client = build_client(_v_spec, config)
+            elif providers.api_key_present(_v_ep):
+                _validator_client = build_client(_v_spec, config)
+            # API provider without a key -> keep the base client (legacy silent fallback).
         except Exception:
-            pass  # provider unknown or openai missing — use local client silently
+            pass  # unknown provider / openai missing -> use the base client silently
     validator = LLMValidator(_validator_client, logger=logger, config=config)
 
     # Refresh the system prompt every turn so its "# Workspace" section reflects
@@ -706,15 +755,11 @@ def _run_locked(args, task, config, registry, codec, names, workdir, logger,
         raw_snapshot_provider = lambda: annotate_filled_snapshot(
             _inner_for_fill(), filled_controls)
 
-    # NATIVE tool calling active? (issue #129/#130/#131) — same predicate the agent uses:
-    # opted in, single-phase, and the codec speaks native tools. When active, the live
-    # system prompt must OMIT the `# Tools` block + format instructions (Ollama injects
-    # them from the model's template via the tools: field).
-    native_tools = bool(
-        getattr(config, "native_tools", False)
-        and not config.two_phase
-        and codec.tools(registry) is not None
-    )
+    # NATIVE tool calling active? Already resolved by select_execution_codec above (#163):
+    # it is the same predicate the agent uses (opted in, single-phase, codec speaks native
+    # tools) PLUS the client capability gate — an API base client forces native off and a
+    # constrained-JSON codec. When native is active the live system prompt OMITS the
+    # `# Tools` block + format instructions (Ollama injects them via the tools: field).
 
     # Per-turn snapshot budget cache: shared by the system-prompt provider (diagnostics +
     # workspace) and the validator context provider. The post-turn snapshot (appended as
