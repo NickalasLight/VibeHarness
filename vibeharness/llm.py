@@ -94,6 +94,43 @@ class LLMClient(ABC):
         return self.decide(system, user, constraint,
                            on_reason=on_reason, on_action=on_action)
 
+    def decide_messages(self, messages: list[dict], constraint: DecodeConstraint,
+                        on_reason: TokenSink | None = None,
+                        on_action: TokenSink | None = None) -> Decision:
+        """Single-shot decide over a FULL structured message history (issue #207).
+
+        The API/json (NON-native) structured-history path sends the agent's real
+        ``[system] + chat_history + [current user]`` array — exactly the same shape the
+        native ``decide_chat`` receives, MINUS the enveloped ``tools:`` field — and the
+        constrained-JSON codec still constrains the action. Unlike :meth:`decide_chat`
+        (native ``tools:`` transport) this stays single-shot: the model's prior
+        ``assistant`` turns carry its emitted JSON actions as plain content and the
+        observations ride ``role:user`` messages.
+
+        The default implementation here flattens the messages to a system string + the
+        last user message and delegates to :meth:`decide`, so any client that implements
+        only ``decide`` (the test fakes) keeps working unchanged. :class:`~vibeharness.
+        api_llm.ApiLLMClient` overrides this with a real multi-turn request."""
+        system = "\n\n".join(m["content"] for m in messages
+                             if m.get("role") == "system" and m.get("content"))
+        non_system = [m for m in messages if m.get("role") != "system"]
+        user = non_system[-1]["content"] if non_system else ""
+        return self.decide(system, user, constraint,
+                           on_reason=on_reason, on_action=on_action)
+
+    def supports_structured_history(self) -> bool:
+        """Whether this single-shot client can replay a REAL multi-turn structured message
+        array via :meth:`decide_messages` (issue #207) instead of the lossy flattened prose
+        narrative. The agent uses this as the capability gate for the API/json structured
+        path (alongside ``config.api_stateful_chat_history`` and a JSON-constraining codec).
+
+        Default: a client supports it iff it OVERRIDES :meth:`decide_messages`. The base
+        contract / the test fakes (which implement only ``decide``) return ``False`` and stay
+        on the legacy prose path, so existing non-native behaviour is unchanged; the
+        :class:`~vibeharness.api_llm.ApiLLMClient` overrides ``decide_messages`` and reports
+        ``True``."""
+        return type(self).decide_messages is not LLMClient.decide_messages
+
     def supports_native_tools(self) -> bool:
         """Whether this client can drive Ollama-style NATIVE tool calling — i.e. the
         stateful :meth:`decide_chat` transport with an enveloped ``tools:`` field

@@ -102,6 +102,16 @@ class ApiLLMClient(LLMClient):
             "estimated_cost_usd": round(self.cost_usd(), 6),
         }
 
+    def supports_structured_history(self) -> bool:
+        """ISSUE #207: the OpenAI-compatible client CAN replay a real multi-turn structured
+        message array (``system``/``user``/``assistant``/``user`` observations) via
+        :meth:`decide_messages` — that is the standard chat-completion shape. Reported
+        ``True`` so the agent drives a GLM/DeepSeek run with the structured stateful history
+        instead of the flattened prose narrative (when ``config.api_stateful_chat_history``
+        is on and the active codec constrains JSON). Independent of native tool calling,
+        which this single-shot client does NOT speak (see :meth:`supports_native_tools`)."""
+        return True
+
     def supports_native_tools(self) -> bool:
         """The OpenAI-compatible client is SINGLE-SHOT (issue #163): it does not speak
         Ollama's native ``tools:`` /api/chat protocol, so it reports ``False``. The agent
@@ -140,19 +150,56 @@ class ApiLLMClient(LLMClient):
             {"role": "system", "content": system},
             {"role": "user", "content": instructed_user},
         ], on_token=on_action, on_reason=on_reason, stop=stop)
-        # The action is parsed ONLY from the constrained ``content`` (issue #179): the
-        # model's thinking trace is streamed to ``on_reason`` and stored in
-        # ``Decision.reasoning`` SEPARATELY, so it never reaches the tool-call parser. With
-        # a JSON-schema constraint present (the json codec for GLM) the model emits the
-        # tool-call JSON as ``content`` and its thinking as ``reasoning_content`` — the
-        # #179 root cause (thinking prose landing in the action channel) cannot recur.
+        return self._finish(text, reasoning)
+
+    def decide_messages(self, messages: list[dict],
+                        constraint: "DecodeConstraint | dict | None",
+                        on_reason: TokenSink | None = None,
+                        on_action: TokenSink | None = None) -> Decision:
+        """Single-shot decide over a FULL structured message history (issue #207).
+
+        ``messages`` is the agent's real ``[system] + chat_history + [current user]`` array
+        — the same shape :meth:`decide_chat` receives on the native path, MINUS the
+        enveloped ``tools:`` field. The constrained-JSON ``schema`` instruction is appended
+        ONLY to the LAST ``user`` message (the live turn), so the stored history keeps the
+        plain user turn while the model is still told the exact action shape — identical
+        constrained decoding to :meth:`decide`. Parsing of ``content`` vs the
+        ``reasoning_content`` trace (issue #179) is shared via :meth:`_finish`."""
+        schema, stop = _unpack_constraint(constraint)
+        msgs = self._instruct_last_user(messages, schema)
+        text, reasoning = self._chat(
+            msgs, on_token=on_action, on_reason=on_reason, stop=stop)
+        return self._finish(text, reasoning)
+
+    @staticmethod
+    def _instruct_last_user(messages: list[dict], schema: "dict | None") -> list[dict]:
+        """Return a shallow copy of ``messages`` with the JSON-schema action instruction
+        appended to the LAST ``user`` message (issue #207). When no ``user`` message is
+        present a final instruction-only user turn is added. With ``schema`` ``None`` the
+        messages are returned copied but unchanged (an unconstrained codec)."""
+        msgs = [dict(m) for m in messages]
+        if schema is None:
+            return msgs
+        instr = "\n\n" + _ACTION_INSTRUCTION.format(
+            schema=json.dumps(schema, ensure_ascii=False))
+        for m in reversed(msgs):
+            if m.get("role") == "user":
+                m["content"] = (m.get("content") or "") + instr
+                return msgs
+        msgs.append({"role": "user", "content": instr.strip()})
+        return msgs
+
+    def _finish(self, text: str, reasoning: str) -> Decision:
+        """Build the :class:`Decision` from a chat completion's ``(content, reasoning)``.
+
+        The action is parsed ONLY from the constrained ``content`` (issue #179): the model's
+        thinking trace is streamed to ``on_reason`` and stored in ``Decision.reasoning``
+        SEPARATELY, so it never reaches the tool-call parser. When ``content`` is empty (a
+        GLM reasoning model occasionally streams the WHOLE answer as ``reasoning_content``)
+        we recover the schema-shaped JSON value embedded in the reasoning, falling back to
+        the raw reasoning only if none is found (preserving the prior behaviour)."""
         action = text
         if not action.strip():
-            # GLM reasoning models occasionally stream the WHOLE answer as
-            # reasoning_content and leave content empty (e.g. the validator's verdict). To
-            # avoid losing it WITHOUT feeding free-form thinking to the parser, recover the
-            # schema-shaped JSON value embedded in the reasoning; only if none is found do
-            # we fall back to the raw reasoning (preserving the prior behaviour).
             action = _recover_json(reasoning) or reasoning
         return Decision(reasoning=reasoning, action_json=_strip_fences(action))
 

@@ -251,6 +251,37 @@ class RalphAgent:
         # native /api/chat request's ``tools:`` field so Ollama applies the model's own
         # trained tool template. None when the native path is inactive.
         self._tools = self._codec.tools(registry) if self._native else None
+        # ISSUE #207 — STRUCTURED stateful chat history for the API/json (NON-native) path
+        # (GLM, DeepSeek). Active when (a) the run opts in (config.api_stateful_chat_history,
+        # default True), (b) the path is NOT native (the native path already has its own
+        # chat_history), (c) the client can replay a structured message array
+        # (supports_structured_history() — only ApiLLMClient; the test fakes report False
+        # and stay on the legacy prose path), and (d) the active codec constrains JSON
+        # (json/tagged_json — constraint.json_schema is not None) so the assistant message
+        # is a real JSON action. Re-resolved by ``_escalate`` on a mid-run take-over.
+        self._api_structured_history = self._compute_api_structured_history()
+        # The unified gate: native OR api-structured both maintain a real chat_history and
+        # share the SAME budgeting (#193), snapshot eviction, and commit machinery. The
+        # legacy single-message prose path is taken only when this is False.
+        self._structured_history = self._native or self._api_structured_history
+
+    def _compute_api_structured_history(self) -> bool:
+        """Whether the API/json (non-native) STRUCTURED stateful-history path is active
+        (issue #207). See the ``_api_structured_history`` field comment for the gates.
+        Computed at construction AND re-resolved by ``_escalate`` on take-over (so an
+        escalation qwen-native → GLM/DeepSeek-API switches the agent onto this path)."""
+        if self._native:
+            return False
+        if not getattr(self._cfg, "api_stateful_chat_history", True):
+            return False
+        supports = getattr(self._client, "supports_structured_history", None)
+        if not (callable(supports) and supports()):
+            return False
+        try:
+            constraint = self._codec.constraint(self._registry, self._max_actions)
+        except Exception:
+            return False
+        return constraint.json_schema is not None
 
     def run(self, task: str, on_turn: Callable[["RunResult"], None] | None = None,
             advice_provider: Callable[[int], "str | None"] | None = None) -> RunResult:
@@ -314,11 +345,12 @@ class RalphAgent:
                 # context window with (issue #43 dynamic snapshot budget). Providers may
                 # be zero-arg (legacy: workspace-only refresh) or accept the user message;
                 # _build_system bridges both so older wirings keep working unchanged.
-                # In NATIVE mode the real chat_history carries past turns, so the user
-                # message omits the prose narrative (which would duplicate the history and
-                # waste the window); it keeps the task reminder + action hint. In legacy
-                # mode the narrative is embedded as before.
-                if self._native:
+                # In STRUCTURED mode (native OR the #207 api-structured path) the real
+                # chat_history carries past turns, so the user message omits the prose
+                # narrative (which would duplicate the history and waste the window); it
+                # keeps the task reminder + action hint. In legacy (prose) mode the
+                # narrative is embedded as before.
+                if self._structured_history:
                     user = build_turn_prompt(task, "", self._codec.turn_action_hint())
                 else:
                     user = build_turn_prompt(task, memory.render(),
@@ -330,13 +362,14 @@ class RalphAgent:
                         user += (f"\n\n<user_advice>The human user gives you the following "
                                  f"hint: '{hint}'</user_advice>")
                 system = self._build_system(user)
-                # NATIVE stateful budget guard (issues #170/#172/#173). BEFORE the request
-                # is assembled/logged/sent, ensure [system] + chat_history + [user] fits
-                # num_ctx: evict the OLDEST history first, and truncate the live page
+                # STRUCTURED stateful budget guard (issues #170/#172/#173, #193). BEFORE the
+                # request is assembled/logged/sent, ensure [system] + chat_history + [user]
+                # fits the window: evict the OLDEST history first, and truncate the live page
                 # snapshot ONLY as a last resort (the snapshot is the agent's eyes). Any
-                # action is logged LOUDLY (never a silent "the agent went blind"). Done
-                # here so the input dump below records the ACTUAL request that is sent.
-                if self._native:
+                # action is logged LOUDLY (never a silent "the agent went blind"). Done here
+                # so the input dump below records the ACTUAL request that is sent. Applies to
+                # BOTH the native and the #207 api-structured path (the same chat_history).
+                if self._structured_history:
                     self._fit_request_to_context(chat_history, system, user, result, i)
                 # Persist the EXACT request BEFORE the blocking model call, so a crash
                 # DURING generation still leaves this turn's full input (incl. the
@@ -345,12 +378,15 @@ class RalphAgent:
                 if self._turn_input_logger is not None:
                     try:
                         self._turn_input_logger(
-                            i, system, list(chat_history) if self._native else [], user,
+                            i, system,
+                            list(chat_history) if self._structured_history else [], user,
                             self._cfg.snapshot_chars_per_token)
                     except Exception:
                         pass
                 if self._native:
                     decision = self._decide_chat(system, chat_history, user, constraint)
+                elif self._api_structured_history:
+                    decision = self._decide_chat_api(system, chat_history, user, constraint)
                 else:
                     decision = self._decide(system, user, constraint)
                 if decision is None:
@@ -619,7 +655,10 @@ class RalphAgent:
                 # history first and truncate the live snapshot only as a last resort, and
                 # log it loudly (issues #170/#172/#173). Keeping a single budgeter there
                 # avoids two policies fighting over the history. Skipped on the legacy path.
-                if self._native:
+                # Applies to BOTH the native and the #207 api-structured path: the commit
+                # machinery is shared (the api path's ``decision.tool_calls`` is empty, so the
+                # assistant message carries the emitted constrained-JSON action as content).
+                if self._structured_history:
                     # Evict any previous page_snapshot observation before committing the
                     # new turn so only the LATEST snapshot is visible in history.
                     self._evict_old_page_snapshot(chat_history)
@@ -798,6 +837,82 @@ class RalphAgent:
         if "error" in box:
             raise box["error"]
         return box["decision"]
+
+    def _decide_chat_api(self, system: str, chat_history: list[dict], user: str,
+                         constraint) -> Decision | None:
+        """Run one turn's API/json STRUCTURED stateful decide (issue #207).
+
+        Assembles ``[system] + chat_history + [current user]`` — the same shape as the
+        native :meth:`_decide_chat`, MINUS the enveloped ``tools:`` field — and calls the
+        single-shot client's :meth:`~vibeharness.llm.LLMClient.decide_messages`, which
+        appends the json-schema action instruction to the live user turn and keeps
+        constrained decoding. The prior assistant turns carry the model's emitted JSON
+        actions; observations ride ``role:user`` <tool_response> messages.
+
+        The history is SANITIZED for an OpenAI-compatible provider first (see
+        :meth:`_sanitize_history_for_api`): an escalation qwen-native → GLM/DeepSeek-API
+        leaves native-shaped assistant messages (empty content + structured ``tool_calls``)
+        in the history; those are flattened to plain JSON content so the request stays valid
+        across the swap. Mirrors :meth:`_decide` / :meth:`_decide_chat` for the wall-clock
+        budget: inline when ``turn_timeout_seconds <= 0``, else a joined daemon worker that
+        returns ``None`` on overrun. The system message is rebuilt EACH turn (it carries the
+        live page snapshot) and is never stored in ``chat_history``."""
+        messages = ([{"role": "system", "content": system}]
+                    + self._sanitize_history_for_api(chat_history)
+                    + [{"role": "user", "content": user}])
+
+        def call() -> Decision:
+            return self._client.decide_messages(
+                messages, constraint,
+                on_reason=self._reporter.reasoning_token,
+                on_action=self._reporter.action_token,
+            )
+
+        budget = self._cfg.turn_timeout_seconds
+        if budget <= 0:
+            return call()
+        box: dict = {}
+
+        def work() -> None:
+            try:
+                box["decision"] = call()
+            except BaseException as exc:
+                box["error"] = exc
+
+        worker = threading.Thread(target=work, name="vibe-turn-decide", daemon=True)
+        worker.start()
+        worker.join(budget)
+        if worker.is_alive():
+            return None
+        if "error" in box:
+            raise box["error"]
+        return box["decision"]
+
+    @staticmethod
+    def _sanitize_history_for_api(chat_history: list[dict]) -> list[dict]:
+        """Return a copy of ``chat_history`` valid for an OpenAI-compatible API (issue #207).
+
+        The api-structured path commits assistant messages as plain JSON content, so an
+        api-only history needs no change (this is a no-op copy). But a mid-run escalation
+        from the NATIVE path (qwen3 → GLM/DeepSeek) leaves earlier assistant turns in the
+        native shape ``{"role":"assistant","content":"","tool_calls":[…]}``; an OpenAI
+        provider rejects ``assistant.tool_calls`` without matching ``role:tool`` replies
+        (which the constrained-JSON path never produced). We FLATTEN such a message to plain
+        content — its emitted call serialised as JSON — so the history stays coherent across
+        the swap. Idempotent for an already-api-shaped history."""
+        out: list[dict] = []
+        for m in chat_history:
+            if m.get("role") == "assistant" and m.get("tool_calls"):
+                content = m.get("content") or ""
+                if not content.strip():
+                    try:
+                        content = json.dumps(list(m["tool_calls"]), ensure_ascii=False)
+                    except (TypeError, ValueError):
+                        content = str(m["tool_calls"])
+                out.append({"role": "assistant", "content": content})
+            else:
+                out.append(dict(m))
+        return out
 
     # ---- native stateful chat history (issue #129/#130/#131) ----
     def _commit_turn_to_history(self, chat_history: list[dict], user: str,
@@ -1022,6 +1137,14 @@ class RalphAgent:
         self._native = native
         self._tools = exec_codec.tools(self._registry) if native else None
         self._max_actions = resolve_model_limit(self._cfg, spec)
+        # ISSUE #207 — re-resolve the structured-history path for the NEW active model now
+        # that the codec/client/cap are swapped. Escalating qwen3-native → a GLM/DeepSeek API
+        # model (json codec, single-shot, structured-capable) switches the agent onto the
+        # api-structured path; the shared ``chat_history`` accumulated so far is preserved and
+        # sanitized for the API at send time (``_decide_chat_api``), keeping it coherent
+        # across the swap. With the flag off (prose A/B) escalation stays on the legacy path.
+        self._api_structured_history = self._compute_api_structured_history()
+        self._structured_history = self._native or self._api_structured_history
         # Swap to the escalation system-prompt provider (native-OFF: the `# Tools` block +
         # JSON format instructions ARE present) so the single-shot API model is actually
         # told the tools + wire format. None on the fs/test path (static prompt kept).

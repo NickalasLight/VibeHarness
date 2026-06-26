@@ -163,6 +163,19 @@ class Config:
     # messages, a coarse belt-and-braces limit on top of the token budget.
     chat_history_max_turns: int = 0
 
+    # ISSUE #207 — structured stateful chat history for the API/json (NON-native) path
+    # (GLM, DeepSeek). True (default) = the model receives a REAL multi-turn message array
+    # (system + per-turn user/snapshot, the model's emitted constrained-JSON action as an
+    # ``assistant`` message, and each observation as the following ``role:user``
+    # <tool_response> batch), mirroring the native ``chat_history`` machinery but over the
+    # single-shot ``ApiLLMClient`` + the constrained-JSON codec. False = the LEGACY
+    # ``memory.render()`` prose-narrative path (a flat third-person summary in one
+    # ``[system, user]`` message), kept fully selectable for A/B testing — do NOT delete it.
+    # Gated additionally on the client supporting structured history (only ``ApiLLMClient``)
+    # and the active codec constraining JSON (``json``/``tagged_json``), so the native path
+    # and every legacy/test single-shot client are unaffected.
+    api_stateful_chat_history: bool = True
+
     # context + per-turn token budgets.
     # num_ctx is the whole window (system prompt + history + generation share it).
     #
