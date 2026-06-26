@@ -87,11 +87,15 @@ class CaptureRawSnapshotTest(unittest.TestCase):
     char cap — ground truth on its true size — but stays exception-safe."""
 
     def test_returns_full_text_uncapped(self):
-        cli = _FakeSnapshotCli(["w" * 50000])
+        # A real (non-blank) snapshot: capture_page_snapshot_raw now retries ONCE when
+        # the first capture looks blank (about:blank / no refs), so the body must carry
+        # a ref to count as a single, non-retried capture.
+        body = "### Page\n- button \"x\" [ref=e1]\n" + "w" * 50000
+        cli = _FakeSnapshotCli([body])
         text = capture_page_snapshot_raw(cli)
-        self.assertEqual(text, "w" * 50000)      # whole thing, no truncation marker
+        self.assertEqual(text, body)             # whole thing, no truncation marker
         self.assertNotIn("truncated", text)
-        self.assertEqual(cli.calls, [["snapshot"]])  # same session, `snapshot` command
+        self.assertEqual(cli.calls, [["snapshot"]])  # non-blank -> single capture, no retry
 
     def test_failed_snapshot_returns_empty(self):
         self.assertEqual(capture_page_snapshot_raw(_FakeSnapshotCli(["boom"], ok=False)), "")
@@ -126,20 +130,11 @@ class PerTurnSnapshotInjectionTest(unittest.TestCase):
         self.assertNotIn("# Current page (live snapshot", sp)
         self.assertNotIn("FIRST-SNAP consent dialog", sp)
 
-    def test_snapshot_appended_to_user_turn_at_the_end(self):
-        # The snapshot lands at the very END of the user turn (recency slot).
-        from vibeharness.prompt import append_snapshot_to_user, SNAPSHOT_USER_MARKER
-        user = build_turn_prompt("T", "did stuff")
-        out = append_snapshot_to_user(user, "### Page\nNEW-SNAP consent dialog")
-        self.assertTrue(out.startswith(user))               # user text preserved, first
-        self.assertIn(SNAPSHOT_USER_MARKER, out)
-        self.assertIn("NEW-SNAP consent dialog", out)
-        self.assertTrue(out.rstrip().endswith("NEW-SNAP consent dialog"))  # at the END
-
-    def test_no_snapshot_leaves_user_unchanged(self):
-        from vibeharness.prompt import append_snapshot_to_user
-        user = build_turn_prompt("T", "did stuff")
-        self.assertEqual(append_snapshot_to_user(user, ""), user)
+    # NOTE: the standalone ``append_snapshot_to_user`` / ``SNAPSHOT_USER_MARKER`` helper
+    # was removed when the snapshot moved to a per-turn ``page_snapshot`` observation
+    # committed by ``RalphAgent`` as a ``<tool_response>`` block (issue #151). That
+    # behaviour — snapshot rides the END of the user turn, only the latest kept — is now
+    # covered end-to-end by ``test_native_ollama_chat.SnapshotOnUserTurnTest``.
 
     def test_snapshot_not_in_narrative_memory(self):
         # The snapshot must never be recorded into narrative memory (which would
@@ -215,19 +210,19 @@ class CliSnapshotProviderGatingTest(unittest.TestCase):
         self.assertNotIn("# Current page (live snapshot", sp)
 
     def test_web_render_page_feeds_snapshot_into_user_turn(self):
-        # Issue #146: web active -> the captured snapshot rides the END of the USER turn,
-        # NOT the system prompt. Confirm the data flow into append_snapshot_to_user.
-        from vibeharness.prompt import append_snapshot_to_user, SNAPSHOT_USER_MARKER
+        # Issue #146/#151: web active -> the captured snapshot rides the USER turn (as a
+        # page_snapshot observation committed by RalphAgent, covered by
+        # test_native_ollama_chat.SnapshotOnUserTurnTest), NOT the system prompt. Here we
+        # confirm the wiring seam: build() carries no page section, and the web-gated
+        # provider yields the captured snapshot text for the agent to append.
         _, render_page = self._wire(["web"])
         cli = _FakeSnapshotCli(["### Page\nWIRED-SNAP consent banner"])
         render_page = lambda: capture_page_snapshot(cli, 6000)
         # The system prompt carries no page section anymore:
         sp = SystemPromptBuilder(_registry(["web"])).build("T", page=render_page())
         self.assertNotIn("# Current page (live snapshot", sp)
-        # The user turn does, at its end:
-        user = append_snapshot_to_user(build_turn_prompt("T", ""), render_page())
-        self.assertIn(SNAPSHOT_USER_MARKER, user)
-        self.assertIn("WIRED-SNAP consent banner", user)
+        # The provider yields the live snapshot text the agent appends to the user turn:
+        self.assertIn("WIRED-SNAP consent banner", render_page())
 
 
 class ValidatorContextProviderTest(unittest.TestCase):

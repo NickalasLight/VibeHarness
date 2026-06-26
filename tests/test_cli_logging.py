@@ -93,7 +93,7 @@ class PerAgentTypePromptDumpTest(unittest.TestCase):
 
     def test_web_agent_prompt_describes_web_tools_and_guidance(self):
         dumped = self._dumped_prompt(["web"])
-        self.assertIn("# Working with your tools", dumped)
+        self.assertIn("# Web Agent", dumped)                  # web's per-toolset guidance
         self.assertIn("goto", dumped)                         # a discrete web subtool (#51)
         self.assertIn("click", dumped)                        # another discrete web subtool
         self.assertNotIn("### `browse`", dumped)              # monolith gone (#51)
@@ -103,7 +103,8 @@ class PerAgentTypePromptDumpTest(unittest.TestCase):
 
     def test_fs_agent_prompt_describes_fs_tools_and_guidance(self):
         dumped = self._dumped_prompt(["fs"])
-        self.assertIn("# Working with your tools", dumped)
+        # The per-toolset guidance is inlined ahead of "# Guidance" (no heading).
+        self.assertIn("Use create_file for a new file", dumped)
         self.assertIn("create_file", dumped)                  # an fs tool
         self.assertIn("write_file", dumped)                   # fs guidance mentions it
         self.assertNotIn("### `goto`", dumped)                # NOT the web subtools (#51)

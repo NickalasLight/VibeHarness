@@ -22,10 +22,12 @@ from tests._fakes import FakeCli, FakeLLMClient, FakeValidator
 
 
 # The discrete subtools we expect the web toolset to expose (issue #51).
+# screenshot / navigate_back / navigate_forward were later trimmed from the
+# registered set (see ``_WEB_TOOL_CLASSES``: the model is not visual and the
+# navigate tools are unused), so they are no longer expected here.
 EXPECTED_SUBTOOLS = {
     "goto", "click", "fill", "type", "press_key", "select_option", "check",
-    "uncheck", "hover", "drag", "upload", "screenshot",
-    "navigate_back", "navigate_forward", "reload",
+    "uncheck", "hover", "drag", "upload", "reload",
 }
 
 
@@ -100,10 +102,7 @@ class SubtoolsRegisteredAndCallableTest(unittest.TestCase):
             "uncheck": {"target": "e1"},
             "hover": {"target": "e1"},
             "drag": {"target": "e1", "end": "e2"},
-            "upload": {"file": "/tmp/f"},
-            "screenshot": {},
-            "navigate_back": {},
-            "navigate_forward": {},
+            "upload": {"target": "e1", "file": "/tmp/f"},
             "reload": {},
         }
         for name in EXPECTED_SUBTOOLS:

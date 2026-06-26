@@ -65,8 +65,9 @@ class MappingTest(IsolatedSettings):
         # fs keeps the GLOBAL (multiple) default — the single source of truth.
         self.assertEqual(mapping["fs"], Config.max_actions_per_turn)
         self.assertGreater(mapping["fs"], 1)  # "multiple"
-        # web raised 4 -> 12 (iter-1): the model batches a whole page of fills in one turn.
-        self.assertEqual(mapping["web"], 12)
+        # web now tracks the GLOBAL default too (the per-agent web override was
+        # dropped — see toolset.agent_default_max_actions); only validator differs.
+        self.assertEqual(mapping["web"], Config.max_actions_per_turn)
         self.assertEqual(mapping["validator"], 1)
 
     def test_fs_default_tracks_supplied_global_default(self):
@@ -76,7 +77,8 @@ class MappingTest(IsolatedSettings):
 
 class ResolutionPrecedenceTest(IsolatedSettings):
     def test_agent_web_resolves_to_twelve(self):
-        self.assertEqual(_resolved_cap(["task", "--agent", "web"]), 12)
+        self.assertEqual(
+            _resolved_cap(["task", "--agent", "web"]), Config.max_actions_per_turn)
 
     def test_agent_validator_resolves_to_one(self):
         self.assertEqual(_resolved_cap(["task", "--agent", "validator"]), 1)
@@ -119,7 +121,8 @@ class PromptStatesResolvedCapTest(IsolatedSettings):
         self.assertIn(f"at most {cap} actions per turn", prompt)
 
     def test_web_prompt_states_twelve(self):
-        self._assert_prompt_states(["task", "--agent", "web"], 12)
+        self._assert_prompt_states(
+            ["task", "--agent", "web"], Config.max_actions_per_turn)
 
     def test_validator_prompt_states_one(self):
         self._assert_prompt_states(["task", "--agent", "validator"], 1)
@@ -167,10 +170,12 @@ class LoopEnforcesResolvedCapTest(IsolatedSettings):
         # Only the first write happened.
         self.assertTrue(os.path.exists(self._p("f0.txt")))
         self.assertFalse(os.path.exists(self._p("f1.txt")))
-        # And the model was told it was capped.
+        # Excess actions are now silently dropped (no "you were capped" note added
+        # to the context) — only the first `cap` action is recorded/executed.
         first_turn = result.turns[0]
+        self.assertEqual(len(first_turn.actions), 1)
         notes = " ".join(a.observation for a in first_turn.actions)
-        self.assertIn("per-turn limit is 1", notes)
+        self.assertNotIn("per-turn limit", notes)
 
     def test_fs_cap_runs_up_to_cap(self):
         cap = Config.max_actions_per_turn
@@ -186,9 +191,11 @@ class LoopEnforcesResolvedCapTest(IsolatedSettings):
         self.assertTrue(os.path.exists(self._p("f0.txt")))
         self.assertTrue(os.path.exists(self._p("f1.txt")))
         self.assertFalse(os.path.exists(self._p("f2.txt")))
+        # The excess (3 of the 5) is silently dropped: only `cap` actions run, and
+        # no capped/"NOT executed" note is surfaced to the model.
+        self.assertEqual(len(result.turns[0].actions), 2)
         notes = " ".join(a.observation for a in result.turns[0].actions)
-        self.assertIn("per-turn limit is 2", notes)
-        self.assertIn("3 action(s) were NOT executed", notes)
+        self.assertNotIn("per-turn limit", notes)
 
 
 if __name__ == "__main__":

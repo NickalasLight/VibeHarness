@@ -62,7 +62,11 @@ class AgentLoopTest(unittest.TestCase):
 
     def _agent(self, actions, validator=None, max_steps=10, reporter=None):
         client = FakeLLMClient(actions)
-        return RalphAgent(client, self.registry, "SYSTEM", Config(max_steps=max_steps),
+        # Escalation (swap to the API model on stuck / premature-validate) is enabled by
+        # default in Config but is exercised in test_escalation_agent.py — disable it here
+        # so these local-loop tests stay hermetic and never reach for an API client.
+        return RalphAgent(client, self.registry, "SYSTEM",
+                          Config(max_steps=max_steps, escalation_enabled=False),
                           validator or FakeValidator(passed=True), reporter=reporter)
 
     def test_anti_loop_skips_repeated_successful_action(self):
@@ -186,7 +190,8 @@ class AgentLoopTest(unittest.TestCase):
         actions = [{"tool": "click", "args": {"target": "e35"}} for _ in range(n)]
         actions.append(VALIDATE)
         client = FakeLLMClient(actions)
-        agent = RalphAgent(client, registry, "SYS", Config(max_steps=n + 2),
+        agent = RalphAgent(client, registry, "SYS",
+                           Config(max_steps=n + 2, escalation_enabled=False),
                            FakeValidator(passed=True))
         agent.run("loop heading")
         self.assertEqual(tool.calls, 1 + RalphAgent._SOFT_REPEAT_LIMIT)
@@ -237,15 +242,17 @@ class AgentLoopTest(unittest.TestCase):
                   "args": {"path": self.p(f"f{n}.txt"), "content": "x"}} for n in range(5)]
         client = FakeLLMClient([batch])
         agent = RalphAgent(client, self.registry, "SYSTEM",
-                           Config(max_steps=1, max_actions_per_turn=2),
+                           Config(max_steps=1, max_actions_per_turn=2,
+                                  escalation_enabled=False),
                            FakeValidator(passed=True))
         result = agent.run("over limit")
         self.assertTrue(os.path.exists(self.p("f0.txt")))
         self.assertTrue(os.path.exists(self.p("f1.txt")))
         self.assertFalse(os.path.exists(self.p("f2.txt")))
-        # one note action + two executed writes
+        # Excess actions are now silently dropped: only the first 2 run and are
+        # recorded; no "per-turn limit" note is surfaced to the model.
         obs = [a.observation for a in result.turns[0].actions]
-        self.assertTrue(any("per-turn limit" in o for o in obs))
+        self.assertFalse(any("per-turn limit" in o for o in obs))
         executed = [a for a in result.turns[0].actions if a.tool == "create_file"]
         self.assertEqual(len(executed), 2)
 

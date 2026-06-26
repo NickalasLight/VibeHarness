@@ -31,7 +31,8 @@ class ConsoleReporterTest(unittest.TestCase):
         self.assertIn('{"verdict":"pass"}', out)
 
     def test_action_result_truncates_long_preview(self):
-        action = SimpleNamespace(ok=True, observation="z" * 600, tool="read_file")
+        # The console preview cap is 2000 chars; exceed it so truncation kicks in.
+        action = SimpleNamespace(ok=True, observation="z" * 2500, tool="read_file")
         out = self._render(lambda r: r.action_result(action))
         self.assertIn("more chars", out)
         self.assertIn("✓", out)  # success mark
