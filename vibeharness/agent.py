@@ -360,6 +360,13 @@ class RalphAgent:
                                         action_json=(decision.action_json[:_tc_start]
                                                      + "\n".join(_tc_kept)
                                                      + decision.action_json[_tc_end:]))
+                    # SAME-TURN duplicate suppression (#162): generalise the consecutive
+                    # filter above to NON-adjacent repeats, but only for web tools the run
+                    # explicitly opted in via config.web_dedup_same_turn_tools. No-op when
+                    # that set is empty (the default) or off the web flow, so existing
+                    # behaviour is unchanged. Both `actions` (what runs) and `decision`
+                    # (the assistant block committed to history) are trimmed together.
+                    actions, decision = self._suppress_same_turn_duplicates(actions, decision)
                     for _ti, (tool_name, args) in enumerate(actions):
                         if _ti > 0:
                             time.sleep(1)  # 1-second safety gap between batched calls
@@ -849,6 +856,81 @@ class RalphAgent:
         except (TypeError, ValueError):
             payload = repr(args)
         return f"{tool_name}|{payload}"
+
+    # ---- same-turn duplicate suppression (#162) ----
+    def _suppress_same_turn_duplicates(
+        self, actions: "list[tuple[str, dict]]", decision: Decision,
+    ) -> "tuple[list[tuple[str, dict]], Decision]":
+        """Drop EXACT duplicate calls within this one turn for opted-in web tools (#162).
+
+        A call is a duplicate when an EARLIER call in the SAME ``actions`` batch had the
+        same ``(tool, args)`` signature — at any position, not only back-to-back (the
+        consecutive filter upstream already covers adjacency). Only tools named in
+        ``config.web_dedup_same_turn_tools`` participate, and only on the web-agent flow
+        (a live snapshot provider is wired). The dropped call is removed from BOTH the
+        executed ``actions`` and the ``decision`` assistant block, so it never runs and
+        leaves no trace in the replayed history.
+
+        Returns ``(actions, decision)`` UNCHANGED when: the opt-in set is empty, this is
+        not the web flow, nothing duplicates, or the assistant block cannot be trimmed to
+        match the survivors (see :meth:`_trim_decision_to_kept`). The last case is the
+        consistency guarantee: we never drop a result while leaving its call in the
+        assistant block (or vice versa) — if we cannot do both cleanly, we do neither.
+        """
+        dedup_tools = set(getattr(self._cfg, "web_dedup_same_turn_tools", ()) or ())
+        if not dedup_tools or self._raw_snapshot_provider is None:
+            return actions, decision
+        seen: set[str] = set()
+        kept: list[int] = []
+        for idx, (name, args) in enumerate(actions):
+            if name in dedup_tools:
+                sig = self._action_signature(name, args)
+                if sig is not None and sig in seen:
+                    self._reporter.note(
+                        f"[DEDUP] dropping same-turn duplicate {name}")
+                    continue
+                if sig is not None:
+                    seen.add(sig)
+            kept.append(idx)
+        if len(kept) == len(actions):
+            return actions, decision
+        trimmed_decision, ok = self._trim_decision_to_kept(decision, len(actions), kept)
+        if not ok:
+            # Could not safely realign the assistant block with the survivors — abandon
+            # the suppression entirely so calls and results stay consistent.
+            return actions, decision
+        return [actions[j] for j in kept], trimmed_decision
+
+    def _trim_decision_to_kept(
+        self, decision: Decision, n_before: int, kept: "list[int]",
+    ) -> "tuple[Decision, bool]":
+        """Return ``(decision, ok)`` with the assistant tool-call block trimmed to ``kept``
+        (indices into the ``n_before``-length action list).
+
+        ``ok`` is ``False`` when the block could not be trimmed to match — the caller must
+        then drop NOTHING, keeping calls and results aligned (#162). In LEGACY (non-native)
+        mode there is no committed assistant block at all, so trimming is unnecessary and
+        always safe (``ok=True``, decision returned untouched). In NATIVE mode the call may
+        live in structured ``decision.tool_calls`` OR as ``<tool_call>`` text blocks in
+        ``decision.action_json``; either is trimmed by index, but ONLY when its count
+        matches ``n_before`` (otherwise some calls were skipped during parse and an
+        index-based trim would misalign — so we report ``ok=False`` and bail)."""
+        if not self._native:
+            return decision, True
+        if decision.tool_calls:
+            if len(decision.tool_calls) != n_before:
+                return decision, False
+            return _dc_replace(
+                decision, tool_calls=[decision.tool_calls[j] for j in kept]), True
+        blocks = re.findall(r"<tool_call>[\s\S]*?</tool_call>", decision.action_json or "")
+        if not blocks or len(blocks) != n_before:
+            return decision, False
+        kept_blocks = [blocks[j] for j in kept]
+        start = decision.action_json.index(blocks[0])
+        end = decision.action_json.rindex(blocks[-1]) + len(blocks[-1])
+        trimmed = (decision.action_json[:start] + "\n".join(kept_blocks)
+                   + decision.action_json[end:])
+        return _dc_replace(decision, action_json=trimmed), True
 
     # ---- helpers ----
     def _execute(self, tool_name: str | None, args: dict) -> Action:

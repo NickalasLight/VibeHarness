@@ -18,8 +18,20 @@ from pathlib import Path
 
 from .config import Config
 
+def _csv_set(raw: str) -> list:
+    """Parse a comma-separated tool-name list into a de-duplicated, JSON-serialisable
+    list (the Config field is a frozenset; the agent coerces whatever is stored with
+    ``set()``). Blank entries are dropped; an empty string clears the list."""
+    seen: list = []
+    for token in raw.split(","):
+        name = token.strip()
+        if name and name not in seen:
+            seen.append(name)
+    return seen
+
+
 # Friendly CLI key -> (Config field name, value parser). Only these are settable.
-_SETTABLE: dict[str, tuple[str, type]] = {
+_SETTABLE: dict[str, tuple[str, object]] = {
     "temp": ("temperature", float),
     "temperature": ("temperature", float),
     "model": ("model", str),
@@ -36,13 +48,17 @@ _SETTABLE: dict[str, tuple[str, type]] = {
     "reason_tokens": ("reason_tokens", int),
     "action-tokens": ("action_tokens", int),
     "action_tokens": ("action_tokens", int),
+    # #162: comma-separated web tool names that opt into same-turn duplicate suppression.
+    "web-dedup-same-turn-tools": ("web_dedup_same_turn_tools", _csv_set),
+    "web_dedup_same_turn_tools": ("web_dedup_same_turn_tools", _csv_set),
 }
 
 
 def settable_keys() -> list[str]:
     """Canonical, de-duplicated list of user-facing settable keys."""
     return ["temp", "model", "codec", "max-steps", "max-actions-per-turn", "top-p",
-            "top_k", "num-ctx", "reason-tokens", "action-tokens"]
+            "top_k", "num-ctx", "reason-tokens", "action-tokens",
+            "web-dedup-same-turn-tools"]
 
 
 def _home() -> Path:
