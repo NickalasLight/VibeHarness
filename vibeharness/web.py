@@ -1027,6 +1027,15 @@ class FillTool(_WebTool):
         return ["fill", args["target"], args["text"]]
 
     def run(self, args: dict) -> ToolResult:
+        # Validate required params BEFORE touching the browser: a missing-param call
+        # is rejected without ever snapshotting (don't capture a DOM state for an
+        # invalid call — issue #166). The base _run_impl re-checks, so valid calls
+        # behave identically; only the wasteful pre-snapshot on an invalid call is
+        # avoided. DOM-delta detection stays intact for valid fills below.
+        missing = [p for p in self._required if not args.get(p)]
+        if missing:
+            return ToolResult(False, f"you called `{self.name}` but did not provide: "
+                              f"{', '.join(missing)}.")
         # Capture the DOM before calling the action so we can detect new elements.
         before = capture_page_snapshot_raw(self._cli) or ""
         result = self._run_impl(args)
