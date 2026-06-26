@@ -69,7 +69,7 @@ cd VibeHarness
 pip install -e .
 
 # 3. Confirm you're running the source you think you are, then run a task
-vibe --version           # -> vibe <version> (build <git-short-sha>)
+vibe --version           # version + build sha + the ABSOLUTE source path it loaded from
 vibe "Create notes.txt containing 'hello hello hello', then read it back to verify."
 ```
 
@@ -141,7 +141,7 @@ See [The web agent](#the-web-agent) for details.
 git clone https://github.com/NickalasLight/VibeHarness.git
 cd VibeHarness
 pip install -e .          # EDITABLE install: creates the `vibe` console command
-vibe --version           # -> vibe <version> (build <git-short-sha>)
+vibe --version           # version + build sha + the source path it loaded from
 vibe "list this folder and tell me what's here"
 ```
 
@@ -149,12 +149,21 @@ vibe "list this folder and tell me what's here"
 > from the checkout you are editing — then the `vibe` command imports *this* working tree, so
 > source changes take effect immediately with no reinstall. Confirm it any time with:
 > ```bash
-> vibe --version            # prints the package version + the git short-sha it was built from
+> vibe --version            # prints version, git short-sha, AND the absolute source path
 > pip show vibeharness      # "Editable project location" must point at your checkout
 > ```
-> If `vibe --version` shows an unexpected sha, you are on a stale build — re-run `pip install -e .`
-> from the right directory. On Windows, if the console script can't be written to a system
-> `Scripts\` folder (Access denied), install into your user site with `pip install -e . --user`.
+> `vibe --version` prints, for example:
+> ```
+> vibe 0.1.0 (build 8b8cc48)
+> source:  C:\path\to\VibeHarness\vibeharness
+> repo:    C:\path\to\VibeHarness
+> ```
+> The **source path** is the on-disk location of the package actually loaded — the reliable
+> tell when a `vibe` was installed editable from a *different* clone (the exact issue #175
+> guards against). If that path is not the checkout you are editing, or `--version` warns the
+> source is not a git checkout, re-run `pip install -e .` from the right directory. On Windows,
+> if the console script can't be written to a system `Scripts\` folder (Access denied), install
+> into your user site with `pip install -e . --user`.
 
 ### Option B — no install
 ```bash
@@ -207,6 +216,46 @@ vibe --reset-config         # restore built-in defaults
 
 `--print-system` honours `--agent` / `--toolset`, so `vibe --agent web --print-system`
 prints the exact web-agent system prompt the model would receive (no model required).
+
+### Tuning sampling and the context window per run
+The model, sampling, and context window can all be overridden for a single run (or persisted
+with `--set`):
+
+```powershell
+vibe --model qwen3:4b "..."                  # different Ollama model for one run
+vibe --temp 0.7 --top-p 0.9 --top_k 40 "..." # sampling knobs for one run
+vibe --num-ctx 16384 "..."                   # smaller context window for one run
+```
+
+`--num-ctx` is the whole token window shared by the system prompt, chat history, the live
+page snapshot, and generation. The output reservation (`reason-tokens` + `action-tokens`,
+both settable via `--set`) is subtracted first, and the live page snapshot is then sized to
+fit whatever input budget remains.
+
+### Local ⇄ API model endpoints (per-role)
+The harness can mix a **local** Ollama model with a **hosted API** model for specific roles.
+Today the **validator** (and the stuck-run **escalation** path) can run on a hosted
+OpenAI-compatible endpoint — by default ZhipuAI's **GLM** (`glm-5.2`) — while the base agent
+stays on the local Ollama model. The provider holds endpoint coordinates only; the API key is
+read from an environment variable at call time and is never stored in the repo or config:
+
+```powershell
+# Run the base agent locally, but VALIDATE with a hosted GLM model:
+$env:ZHIPUAI_API_KEY = "your-key"            # PowerShell  (bash: export ZHIPUAI_API_KEY=...)
+vibe --agent web "fill in the signup form and submit it"
+# The local model drives the browser; when it calls `validate`, GLM-5.2 renders the verdict.
+```
+
+If `ZHIPUAI_API_KEY` is unset, the validator silently falls back to the local Ollama model,
+so nothing breaks offline. The provider/model used for each role lives in
+[`config.py`](./vibeharness/config.py) (`validation_provider` / `validation_model`,
+`escalation_provider` / `escalation_model`); providers are registered one line at a time in
+[`vibeharness/providers.py`](./vibeharness/providers.py).
+
+> **Coming with #163 (PR #168):** dedicated per-role CLI flags
+> `--base-provider` / `--base-model` / `--validator-provider` / `--validator-model` to set each
+> role's endpoint directly on the command line. This README and `vibe --help` will document
+> them once that change lands on this branch.
 
 Persistent defaults live in `~/.vibeharness/settings.json` (override the location with the
 `VIBEHARNESS_HOME` env var). Resolution order is **built-in defaults < saved settings <
