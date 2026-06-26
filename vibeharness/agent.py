@@ -92,6 +92,12 @@ class RunResult:
     # live page snapshot to fit. Persisted in the run log so an agent that "went blind"
     # is never a silent budgeting event. Each entry mirrors the loud stdout line.
     context_events: list[dict] = field(default_factory=list)
+    # Escalation events (issue #191): one entry every time mid-run escalation is
+    # ATTEMPTED — success (the stronger API model took over) OR failure (the escalation
+    # provider key is missing/unreachable). Persisted in the run JSON/.md, reusing the
+    # #180 ``context_events`` mechanism, so a non-functional escalation can never
+    # masquerade as "the model just looped" (the #191 root cause).
+    escalation_events: list[dict] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -111,6 +117,11 @@ class RunResult:
             for v in self.validations:
                 out.append(f"  turn {v['turn']}: "
                            f"{'PASS' if v['passed'] else 'FAIL'} — {v['reason']}")
+            out.append("")
+        if self.escalation_events:
+            out.append("ESCALATION:")
+            for e in self.escalation_events:
+                out.append(f"  {e.get('message', '')}")
             out.append("")
         out.append(f"FINISHED: {self.finished}")
         if self.final_summary:
@@ -147,7 +158,8 @@ class RalphAgent:
                  validator_context_provider: Callable[[str], str] | None = None,
                  raw_snapshot_provider: Callable[[], str] | None = None,
                  turn_input_logger: "Callable[[int, str, list, str, float], None] | None" = None,
-                 turn_output_logger: "Callable[[int, str, str], None] | None" = None):
+                 turn_output_logger: "Callable[[int, str, str], None] | None" = None,
+                 escalation_system_prompt_provider: Callable[[str], str] | None = None):
         self._client = client
         self._registry = registry
         self._system = system_prompt
@@ -179,6 +191,15 @@ class RalphAgent:
         # The tool-call codec owns the action wire format: the decode constraint
         # and how the raw payload is parsed back into (tool, args) pairs.
         self._codec = codec or get_codec("json")
+        # The per-turn tool-call cap actually in force. Starts at the run's configured
+        # cap (the BASE model's, resolved by the CLI) and is re-pointed at the ESCALATOR
+        # model's cap on take-over (issue #191) via ``resolve_model_limit``.
+        self._max_actions = config.max_actions_per_turn
+        # Optional escalation-only system-prompt provider (issue #191). Built native-OFF
+        # (so the `# Tools` block + JSON format instructions ARE present) and bound to the
+        # escalator's json codec, it is swapped in by ``_escalate`` when escalating to a
+        # single-shot API model. None on the fs/test path (a static system prompt is used).
+        self._escalation_system_provider = escalation_system_prompt_provider
         # NATIVE stateful tool calling (issue #129/#130/#131). Active only when (a) the
         # run opts in (config.native_tools), (b) the model is single-phase (the native
         # path is for the non-thinking base agent, not VibeThinker's two-phase <think>
@@ -213,8 +234,6 @@ class RalphAgent:
         # transcript read its prose; this list is the model's transport-level memory.
         chat_history: list[dict] = []
         result = RunResult(task=task)
-        limit = self._cfg.max_actions_per_turn
-        constraint = self._codec.constraint(self._registry, limit)
         # Anti-loop guard (#125): every action ATTEMPTED this run, mapped to whether it
         # succeeded. A small model (esp. single-phase + greedy over a near-static page
         # snapshot) re-emits the exact same action forever — re-filling an already-filled
@@ -248,6 +267,13 @@ class RalphAgent:
                  else range(1, self._cfg.max_steps + 1))
         for i in turns:
             self._reporter.turn_start(i)
+            # Recompute the per-turn cap + decode constraint from the LIVE codec/cap each
+            # turn: mid-run escalation (issue #191) re-points self._codec and
+            # self._max_actions at the ESCALATOR model's per-model policy, and that switch
+            # must take effect on the turns AFTER the swap. On a run with no escalation this
+            # is identical to computing them once up front.
+            limit = self._max_actions
+            constraint = self._codec.constraint(self._registry, limit)
             # The turn's Turn object is created as soon as we have a decision, but a
             # mid-turn crash can strike before/after that. Track it so the failsafe
             # below can attach the failure to the right (possibly already-appended)
@@ -430,8 +456,9 @@ class RalphAgent:
                         if detector.record(tool_name, args):
                             self._escalate(
                                 detector,
-                                f"stuck after {self._cfg.escalation_stuck_threshold} "
-                                f"identical '{tool_name}' calls",
+                                f"stuck: no-progress loop involving '{tool_name}' "
+                                f"(threshold {self._cfg.escalation_stuck_threshold})",
+                                result,
                             )
                         # SOFT-REPEAT (iter-1 fix): click/upload are not value-sets. A repeat
                         # is legitimate (re-click Continue after a validation block; re-open a
@@ -883,37 +910,100 @@ class RalphAgent:
             self._record(turn, Action("validate", args, obs, ok=False), memory)
             if (detector is not None and self._cfg.escalation_on_premature_validate
                     and detector.record_premature_validate()):
-                self._escalate(detector, "premature validate (validator rejected the claim)")
+                self._escalate(detector, "premature validate (validator rejected the claim)",
+                               result)
 
     # ---- escalation ----
-    def _escalate(self, detector: StuckDetector, why: str) -> None:
-        """Swap self._client to the configured API model — same browser, same session.
+    def _escalate(self, detector: StuckDetector, why: str,
+                  result: "RunResult | None" = None) -> None:
+        """Hand the run over to the ESCALATOR model — same browser, same session (#191).
 
-        At most once per run (detector.escalated guards re-entry). A no-op with a
-        warning log when escalation is disabled or the provider key is absent, so the
-        run degrades gracefully rather than crashing.
+        At most once per run (``detector.escalated`` guards re-entry). On take-over the
+        agent's ACTIVE codec + call PATH + per-turn cap are re-pointed at the ESCALATOR
+        model's per-model policy (issues #163/#179): escalating from the local qwen3:4b
+        (hermes, native ``decide_chat``) to a z.ai/GLM API model flips the agent to the
+        ``json`` codec + the single-shot ``_decide`` path + the escalator's tool-call cap —
+        otherwise the API client would run under the native-only ``hermes`` codec and emit
+        un-parseable free prose (the #179 failure). Both SUCCESS and FAILURE (missing /
+        unreachable provider key) are RECORDED to the run JSON/.md via ``result`` so a
+        non-functional escalation can never masquerade as "the model just looped" (#191).
         """
         if detector.escalated or not self._cfg.escalation_enabled:
             return
         detector.escalated = True
+        from .clients import build_client, select_execution_codec
+        from .config import (resolve_role_spec, resolve_model_codec,
+                             resolve_model_limit)
+        spec = resolve_role_spec(self._cfg, "escalation")
         try:
             # Build the escalation client through the unified factory + the escalation role
             # spec (issue #163), so escalation honours config.models["escalation"] (or the
-            # legacy escalation_provider/escalation_model keys via resolve_role_spec) exactly
-            # like every other role. For the default zhipuai/glm config this resolves to the
-            # same make_api_client("zhipuai", "glm-5.2") call as before.
-            from .clients import build_client
-            from .config import resolve_role_spec
-            spec = resolve_role_spec(self._cfg, "escalation")
+            # legacy escalation_provider/escalation_model keys) and its model + sampling
+            # come from its ModelSpec/MODEL_TOOL_POLICIES. A missing key raises here.
             new_client = build_client(spec, self._cfg)
-            self._client = new_client
-            self._reporter.note(
-                f"[ESCALATION] {why} — switching to {spec.provider}:{spec.model}"
-            )
         except Exception as exc:
+            # LOUD + RECORDED failure (#191): the key is missing/unreachable. Record a
+            # DISTINCT observable event so the artifact shows escalation was attempted and
+            # could not take over — never a silent terminal-only degrade.
+            self._record_escalation_event(
+                result, success=False, why=why, spec=spec, error=str(exc))
             self._reporter.note(
-                f"[ESCALATION] {why} — escalation disabled: {exc}"
-            )
+                f"[ESCALATION] {why} — FAILED, could NOT take over: {exc}")
+            return
+        self._client = new_client
+        # Switch the ACTIVE codec + call path + cap to the escalator model's (#179/#178).
+        codec_name = resolve_model_codec(self._cfg, spec)
+        escalator_codec = get_codec(codec_name)
+        exec_codec, native, _note = select_execution_codec(
+            self._cfg, new_client, escalator_codec, self._registry)
+        self._codec = exec_codec
+        self._native = native
+        self._tools = exec_codec.tools(self._registry) if native else None
+        self._max_actions = resolve_model_limit(self._cfg, spec)
+        # Swap to the escalation system-prompt provider (native-OFF: the `# Tools` block +
+        # JSON format instructions ARE present) so the single-shot API model is actually
+        # told the tools + wire format. None on the fs/test path (static prompt kept).
+        if self._escalation_system_provider is not None:
+            self._system_provider = self._escalation_system_provider
+            self._provider_wants_user = None   # re-resolve the new provider's arity
+        self._record_escalation_event(
+            result, success=True, why=why, spec=spec,
+            codec=exec_codec.name, native=native, max_actions=self._max_actions)
+        self._reporter.note(
+            f"[ESCALATION] {why} — TAKING OVER with {spec.provider}:{spec.model} "
+            f"(codec={exec_codec.name}, path={'native' if native else 'single-shot'}, "
+            f"max_actions={self._max_actions})")
+
+    def _record_escalation_event(self, result: "RunResult | None", *, success: bool,
+                                 why: str, spec, error: str | None = None,
+                                 codec: str | None = None, native: bool | None = None,
+                                 max_actions: int | None = None) -> None:
+        """Append a single escalation event to the run log (issue #191).
+
+        Mirrors the #180 ``context_events`` mechanism: a grep-able ``[ESCALATION]`` line is
+        recorded in ``result.escalation_events`` (persisted to the run JSON/.md) so both a
+        successful take-over and a failed one (missing/unreachable key) are on the permanent
+        record, not just a transient terminal note. ``result`` is None only on legacy call
+        paths that pass no run result; the event is then dropped (stdout note still fires)."""
+        if success:
+            message = (f"[ESCALATION] TOOK OVER ({why}) — {spec.provider}:{spec.model} "
+                       f"codec={codec} path={'native' if native else 'single-shot'} "
+                       f"max_actions={max_actions}")
+        else:
+            message = (f"[ESCALATION] FAILED to take over ({why}) — "
+                       f"{spec.provider}:{spec.model}: {error}")
+        if result is not None:
+            result.escalation_events.append({
+                "success": success,
+                "why": why,
+                "provider": spec.provider,
+                "model": spec.model,
+                "codec": codec,
+                "native": native,
+                "max_actions": max_actions,
+                "error": error,
+                "message": message,
+            })
 
     # Only tools whose identical repeat ADVANCES state (each call goes one step further)
     # are EXEMPT from the anti-loop guard.

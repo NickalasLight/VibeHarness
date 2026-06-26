@@ -233,6 +233,10 @@ class RunLogger:
             # eviction / snapshot truncation that kept the request within num_ctx, so a
             # budgeting event is on the permanent record, not just the live stdout.
             "context_events": getattr(result, "context_events", []),
+            # Escalation take-over / failed-take-over events (issue #191): a successful
+            # mid-run hand-off to the stronger model AND a failed one (missing/unreachable
+            # provider key) are on the permanent record, never just a terminal note.
+            "escalation_events": getattr(result, "escalation_events", []),
             "turns": result.to_dict()["turns"],   # includes per-turn reasoning traces
         }
         # Encode defensively: model/browser-snapshot text can contain lone

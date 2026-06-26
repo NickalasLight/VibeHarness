@@ -105,6 +105,47 @@ class EscalationAgentTest(unittest.TestCase):
         self.assertIs(agent._client, original)        # fell back, no crash
         self.assertEqual(len(result.turns), 4)
 
+    # ---- issue #191: per-model codec/path switch + recorded events ----
+    def test_takeover_switches_codec_to_json_single_shot(self):
+        # Escalating to a GLM model (json policy) MUST flip the agent to the json codec
+        # + single-shot path + the escalator's per-turn cap (glm-5.2 -> 8), not leave it
+        # on the local native/hermes path (the #179 failure).
+        action = {"tool": "list_directory", "args": {"path": self.tmp.name}}
+        cfg = Config(max_steps=5, escalation_enabled=True, escalation_stuck_threshold=3,
+                     escalation_provider="zhipuai", escalation_model="glm-5.2",
+                     max_actions_per_turn=3,   # the local/base cap, BEFORE take-over
+                     validation_provider="")
+        client, agent = self._agent([action], cfg)
+        self.assertEqual(agent._max_actions, 3)         # base cap before escalation
+        swapped = FakeLLMClient([action])   # non-native single-shot fake (API stand-in)
+        with mock.patch.object(providers, "make_api_client", return_value=swapped):
+            result = agent.run("loop")
+        self.assertIs(agent._client, swapped)
+        self.assertEqual(agent._codec.name, "json")     # codec = json for the API path
+        self.assertFalse(agent._native)                 # single-shot path
+        self.assertEqual(agent._max_actions, 8)         # flipped to glm-5.2 policy cap (8)
+        # a VISIBLE success event is recorded in the run log
+        evs = [e for e in result.escalation_events if e["success"]]
+        self.assertEqual(len(evs), 1)
+        self.assertEqual(evs[0]["codec"], "json")
+        self.assertFalse(evs[0]["native"])
+        self.assertEqual(evs[0]["model"], "glm-5.2")
+
+    def test_failed_escalation_records_distinct_event(self):
+        # A missing provider key must produce a DISTINCT, observable failure event in the
+        # run log (not a silent terminal-only degrade) — the #191 acceptance criterion.
+        action = {"tool": "list_directory", "args": {"path": self.tmp.name}}
+        cfg = Config(max_steps=4, escalation_enabled=True,
+                     escalation_stuck_threshold=3, validation_provider="")
+        original, agent = self._agent([action], cfg)
+        with mock.patch.dict(os.environ, {}, clear=True):
+            result = agent.run("loop")
+        fails = [e for e in result.escalation_events if not e["success"]]
+        self.assertEqual(len(fails), 1)
+        self.assertIsNotNone(fails[0]["error"])
+        self.assertIn("[ESCALATION] FAILED", fails[0]["message"])
+        self.assertEqual(len(result.escalation_events), 1)   # recorded once, no spam
+
 
 if __name__ == "__main__":
     unittest.main()

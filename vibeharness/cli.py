@@ -24,7 +24,7 @@ from .agent import RalphAgent, RunResult
 from .clients import build_client, select_execution_codec
 from .codec import UnknownCodec, available_codecs, get_codec
 from .config import (Config, ModelSpec, model_tool_policy, resolve_model_codec,
-                     resolve_role_spec)
+                     resolve_model_limit, resolve_role_spec)
 from .filesystem import FileSystem, FileSystemError
 from .llm import OllamaClient, OllamaUnavailable, ensure_single_runner_env
 from .lock import SingleInstanceLock, VibeAlreadyRunning
@@ -835,12 +835,37 @@ def _run_locked(args, task, config, registry, codec, names, workdir, logger,
     validator_context_provider = make_system_prompt_provider(
         builder, config, task, render_workspace, raw_snapshot_provider,
         logger=None, include_tool_guidance=False, cache={})
+    # ESCALATION system-prompt provider (issue #191). On take-over to a single-shot API
+    # model (e.g. zhipuai/glm) the agent flips to the json codec + single-shot path; that
+    # path needs the `# Tools` block + JSON format instructions in the system prompt
+    # (native mode omits them — Ollama injects via the tools: field). We pre-resolve the
+    # escalator's per-model codec/cap (pure, no API key) and build a native-OFF provider
+    # bound to that codec so the take-over turns are driven correctly. Built only when the
+    # web snapshot path is active (matches the main provider's wiring).
+    escalation_system_prompt_provider = None
+    if raw_snapshot_provider is not None:
+        try:
+            _esc_spec = resolve_role_spec(config, "escalation")
+            _esc_codec = get_codec(resolve_model_codec(config, _esc_spec))
+            _esc_limit = resolve_model_limit(config, _esc_spec)
+            _esc_builder = SystemPromptBuilder(
+                registry, _esc_limit, _esc_codec,
+                guidance=SystemPromptBuilder.assemble_guidance(toolsets))
+            # native_tools=False so the `# Tools` block + format instructions are present
+            # for the single-shot API path (the #179 root cause when omitted).
+            escalation_system_prompt_provider = make_system_prompt_provider(
+                _esc_builder, config, task, render_workspace, raw_snapshot_provider,
+                logger=None, native_tools=False, cache={})
+        except Exception:
+            escalation_system_prompt_provider = None  # never block the run on this aid
+
     agent = RalphAgent(client, registry, system_prompt, config, validator,
                        reporter=reporter, system_prompt_provider=system_prompt_provider,
                        codec=codec, validator_context_provider=validator_context_provider,
                        raw_snapshot_provider=raw_snapshot_provider,
                        turn_input_logger=logger.dump_turn_input,
-                       turn_output_logger=logger.dump_turn_output)
+                       turn_output_logger=logger.dump_turn_output,
+                       escalation_system_prompt_provider=escalation_system_prompt_provider)
 
     # Advisor advice buffer: the checkpoint populates it after N accumulated tool calls;
     # advice_provider drains it once at the start of the next turn.
