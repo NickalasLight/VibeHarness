@@ -30,6 +30,22 @@ _TOOL_BLOCK_RE = re.compile(
     re.DOTALL,
 )
 
+# ISSUE #183: a <think>…</think> reasoning trace (closed, or budget-truncated and left
+# open) must never be persisted into the stateful chat history — only the action is.
+_THINK_BLOCK_RE = re.compile(r"<think\b[^>]*>.*?</think\s*>", re.DOTALL | re.IGNORECASE)
+_THINK_OPEN_RE = re.compile(r"<think\b[^>]*>", re.IGNORECASE)
+
+
+def _strip_think(text: str) -> str:
+    """Remove any <think>…</think> reasoning trace from assistant content so it is not
+    replayed into the model's stateful history. Handles a budget-truncated trace with an
+    unclosed <think> by dropping everything from that tag onward."""
+    out = _THINK_BLOCK_RE.sub("", text or "")
+    m = _THINK_OPEN_RE.search(out)
+    if m and not re.search(r"</think\s*>", out, re.IGNORECASE):
+        out = out[:m.start()]
+    return out.strip()
+
 from .codec import ToolCallCodec, get_codec
 from .config import Config
 from .escalation import StuckDetector
@@ -747,7 +763,13 @@ class RalphAgent:
             assistant["tool_calls"] = [
                 tc for tc in decision.tool_calls if isinstance(tc, dict)]
         else:
-            assistant["content"] = decision.action_json or ""
+            # ISSUE #183: the REASONING trace must NEVER be persisted into the stateful
+            # history — only the assistant's action belongs there. On the native
+            # think-then-act path the thinking arrives in a SEPARATE channel
+            # (Decision.reasoning) and is already excluded, but a thinking model can leak
+            # a <think>…</think> block into the content; strip it so the stored assistant
+            # turn is the tool call alone (the trace is kept for logs/display, not replayed).
+            assistant["content"] = _strip_think(decision.action_json or "")
         chat_history.append(assistant)
         # Qwen3 training format: batch ALL tool responses into ONE user message,
         # each wrapped in <tool_response>...</tool_response>. The HF chat template

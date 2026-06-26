@@ -164,6 +164,51 @@ class RequestShapeTest(unittest.TestCase):
                                           DecodeConstraint())
         self.assertEqual(list(d.tool_calls), calls)
 
+    def test_decide_chat_reason_then_act_sends_think_true(self):
+        # ISSUE #183: a reasoning model (reason_then_act=True, default) drives ONE native
+        # /api/chat call with think:True so Ollama routes the trace into message.thinking
+        # and constrains only the action. num_predict covers thinking_budget + action_tokens.
+        cfg = Config(ollama_url="http://test:11434")  # reason_then_act defaults True
+        self.assertTrue(cfg.reason_then_act)
+        chat = _FakeResponse([
+            _line({"message": {"thinking": "I should navigate. ",
+                               "content": ""}}),
+            _line({"message": {"content": "",
+                               "tool_calls": [{"function": {"name": "goto",
+                                                            "arguments": {"url": "u"}}}]}}),
+            _line({"done": True})])
+        fake = self._install([chat])
+        reasoned, acted = [], []
+        d = OllamaClient(cfg).decide_chat(
+            [{"role": "user", "content": "go"}],
+            [{"type": "function", "function": {"name": "goto", "parameters": {}}}],
+            DecodeConstraint(), on_reason=reasoned.append, on_action=acted.append)
+        self.assertEqual(len(fake.bodies), 1)            # single native call
+        self.assertIs(fake.bodies[0]["think"], True)     # thinking enabled
+        self.assertEqual(fake.bodies[0]["options"]["num_predict"],
+                         cfg.thinking_budget + cfg.action_tokens)
+        # thinking captured into reasoning (streamed to on_reason), NOT into the action
+        self.assertIn("I should navigate.", d.reasoning)
+        self.assertEqual(d.action_json, "")             # no action text; call is structured
+        self.assertEqual(list(d.tool_calls),
+                         [{"function": {"name": "goto", "arguments": {"url": "u"}}}])
+        self.assertIn("I should navigate. ", "".join(reasoned))
+
+    def test_decide_chat_non_thinking_model_sends_think_false(self):
+        # A non-thinking model (reason_then_act=False) keeps think:False — think:True 400s
+        # on such a model. One call, action_tokens budget, no extra thinking allowance.
+        from dataclasses import replace
+        cfg = replace(Config(ollama_url="http://test:11434"), reason_then_act=False)
+        chat = _FakeResponse([
+            _line({"message": {"content": '{"name":"x","arguments":{}}'}}),
+            _line({"done": True})])
+        fake = self._install([chat])
+        OllamaClient(cfg).decide_chat([{"role": "user", "content": "go"}], None,
+                                      DecodeConstraint())
+        self.assertEqual(len(fake.bodies), 1)
+        self.assertIs(fake.bodies[0]["think"], False)
+        self.assertEqual(fake.bodies[0]["options"]["num_predict"], cfg.action_tokens)
+
     def test_decide_chat_omits_tools_when_none(self):
         cfg = Config(ollama_url="http://test:11434")
         chat = _FakeResponse([_line({"message": {"content": "hi"}}), _line({"done": True})])

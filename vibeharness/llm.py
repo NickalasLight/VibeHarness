@@ -154,70 +154,57 @@ class OllamaClient(LLMClient):
                     constraint: DecodeConstraint,
                     on_reason: TokenSink | None = None,
                     on_action: TokenSink | None = None) -> Decision:
-        """Native /api/chat with optional thinking cap.
+        """Native /api/chat — Ollama's native THINK-THEN-ACT in a single request (#183).
 
-        When ``config.two_phase`` is False (the default on ``beta_qwen3coder``): sends a
-        single /api/chat request with ``tools:`` and ``think:False``. The model's thinking
-        — if any, since qwen3:4b ignores ``think:False`` in some Ollama versions (issue
-        #12917) — flows through ``message.thinking`` to ``on_reason`` and is stored in
-        ``Decision.reasoning`` for display, but is never replayed as a prefill. This is
-        the reliable path: no assistant-prefill bug (Ollama #14493), no truncated-thinking
-        confusion, turn-1 always produces tool calls.
+        When ``config.reason_then_act`` is True (the default on ``beta_qwen3coder``,
+        qwen3:4b — a REASONING model): ONE /api/chat call with ``think:True`` + ``tools:``.
+        Ollama does the think-then-act internally: it routes qwen3's reasoning into the
+        SEPARATE ``message.thinking`` channel and constrains ONLY the action (to the
+        ``tools:`` schema), returning the tool call as a STRUCTURED ``message.tool_calls``
+        entry. The thinking is captured as ``Decision.reasoning`` (streamed to
+        ``on_reason``) and is NEVER parsed as the action; the call is taken from
+        ``tool_calls`` (or, if the model emits it as text, the codec's tolerant
+        ``parse()`` of the content, which also strips any leaked ``<think>`` block).
 
-        When ``config.two_phase`` is True (VibeThinker / future use): two-phase thinking
-        cap. Phase 1 caps thinking at ``thinking_budget`` tokens; Phase 2 replays the
-        capped thinking as ``{"role":"assistant","content":"<think>…</think>"}`` so the
-        model sees its reasoning complete and proceeds to the tool call. Only use for
-        models whose thinking MUST be bounded before the tool call, AND where Ollama's
-        assistant-prefill rendering does not close the turn prematurely. NOT used by
-        default on this branch because: (a) ``Config.two_phase = False`` and (b) the
-        prefill approach produced empty Phase 2 output on the first turn when thinking
-        was truncated mid-sentence at the budget (Ollama #14493-class bug)."""
-        if not self._cfg.two_phase:
-            # Single-phase: one native /api/chat call with tools. Thinking tokens from
-            # message.thinking are forwarded to on_reason for display.
-            payload: dict = {
-                "model": self._cfg.model,
-                "messages": messages,
-                "think": False,
-                "options": {**self._options(),
-                            "temperature": self._cfg.action_temperature,
-                            "num_predict": self._cfg.action_tokens,
-                            "stop": list(constraint.stop)},
-            }
-            if tools:
-                payload["tools"] = tools
-            if constraint.json_schema is not None:
-                payload["format"] = constraint.json_schema
-            content, tool_calls, thinking = self._stream_chat(payload, on_action, on_reason)
-            return Decision(reasoning=thinking, action_json=content.strip(),
-                            tool_calls=tuple(tool_calls))
+        Ground-truthed live (Ollama 0.30.10, qwen3:4b): with ``think:True`` + ``tools:`` a
+        single call returns ``thinking`` populated, ``content`` empty, and
+        ``tool_calls=[{"function":{"name":"click","arguments":{"target":"Accept all"}}}]``
+        even on a heavy snapshot turn. This is exactly the scenario issue #183 needs and
+        it is NATIVE: no two-phase prefill, no assistant-prefill bug. The PRIOR behaviour
+        (``think:False``) did NOT stop qwen3:4b (Ollama #12917) — it reasoned anyway, the
+        trace flooded ``message.content`` UNtagged, and on a non-trivial turn devoured the
+        whole budget before any ``<tool_call>`` (live run 20260626_210514: 12/12 turns
+        failed to parse). qwen3:4b ignores the ``"low"/"medium"`` think LEVELS (verified:
+        same trace length), so there is no native thinking-token budget; ``num_predict``
+        is sized to ``thinking_budget + action_tokens`` to give the trace its budget AND
+        leave the action its own headroom in the single generation.
 
-        # Two-phase: cap thinking then replay as prefill (two_phase=True only).
-        _, _, thinking = self._stream_chat({
+        When ``config.reason_then_act`` is False (a NON-thinking model, e.g.
+        qwen2.5-coder): one native call with ``tools:`` and ``think:False`` — the call is
+        emitted directly. (``think:True`` 400s on a non-thinking model, so the flag gates
+        it.)
+
+        Independent of ``config.two_phase`` (which stays False so the native path remains
+        enabled — see ``RalphAgent._native``)."""
+        thinking_model = self._cfg.reason_then_act
+        # A reasoning model needs room for the thinking trace AND the action in the one
+        # generation; a non-thinking model only emits the action.
+        num_predict = (self._cfg.thinking_budget + self._cfg.action_tokens
+                       if thinking_model else self._cfg.action_tokens)
+        payload: dict = {
             "model": self._cfg.model,
             "messages": messages,
-            "options": {**self._options(),
-                        "num_predict": self._cfg.thinking_budget,
-                        "stop": ["</think>"]},
-        }, on_token=None, on_reason=on_reason)
-
-        prefill = f"<think>\n{thinking}\n</think>" if thinking.strip() else ""
-        convo = list(messages) + [{"role": "assistant", "content": prefill}] if prefill else list(messages)
-        phase2: dict = {
-            "model": self._cfg.model,
-            "messages": convo,
-            "think": False,
+            "think": bool(thinking_model),
             "options": {**self._options(),
                         "temperature": self._cfg.action_temperature,
-                        "num_predict": self._cfg.action_tokens,
+                        "num_predict": num_predict,
                         "stop": list(constraint.stop)},
         }
         if tools:
-            phase2["tools"] = tools
+            payload["tools"] = tools
         if constraint.json_schema is not None:
-            phase2["format"] = constraint.json_schema
-        content, tool_calls, _ = self._stream_chat(phase2, on_action)
+            payload["format"] = constraint.json_schema
+        content, tool_calls, thinking = self._stream_chat(payload, on_action, on_reason)
         return Decision(reasoning=thinking, action_json=content.strip(),
                         tool_calls=tuple(tool_calls))
 
