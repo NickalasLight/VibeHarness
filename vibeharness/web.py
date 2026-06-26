@@ -295,6 +295,41 @@ _SNAPSHOT_FILELINK_RE = re.compile(
     re.IGNORECASE,
 )
 
+# --- New-tab auto-redirect ---------------------------------------------------
+# playwright-cli reports every open tab after interactive actions:
+#   ### Open tabs
+#   - 0: (current) [Title](original_url)
+#   - 1: [Title](new_url)            <- new tab opened by target="_blank" click
+# We silently navigate to the newest non-current tab and strip the block so
+# the agent never sees tab metadata.
+_OPEN_TABS_BLOCK_RE = re.compile(
+    r"###\s+Open\s+tabs\b.*?(?=###|\Z)",
+    re.IGNORECASE | re.DOTALL,
+)
+_NON_CURRENT_TAB_RE = re.compile(
+    r"-\s+\d+:\s+(?!\(current\))\[([^\]]*)\]\(([^)]+)\)",
+)
+
+
+def _auto_redirect_new_tabs(cli: "PlaywrightCli", output: str) -> str:
+    """Navigate to any new tab that opened and strip the Open-tabs section.
+
+    When a click opens a page in a new tab (target="_blank"), playwright-cli
+    includes an "### Open tabs" block listing all open tabs. This function
+    detects non-current tabs, navigates to the newest one silently via goto,
+    and returns the output with the block removed so the agent sees only the
+    resulting page — not tab metadata.
+    """
+    new_tabs = _NON_CURRENT_TAB_RE.findall(output)
+    if new_tabs:
+        _title, url = new_tabs[-1]   # last = most recently opened tab
+        if url and not url.lower().startswith("about:"):
+            try:
+                cli.run("goto", url)
+            except Exception:
+                pass
+    return _OPEN_TABS_BLOCK_RE.sub("", output).strip()
+
 def _strip_snapshot_filelink(text: str) -> str:
     """Remove the '### Snapshot\\n- [Snapshot](.playwright-cli/page-*.yml)' block
     that playwright-cli emits in action stdout. The file-path link is useless to
@@ -893,6 +928,9 @@ class _WebTool(Tool):
         if not ok:
             return ToolResult(False, f"you tried to {self._verb} {subject} but it failed: "
                               f"{self._trim(_strip_snapshot_filelink(output))}")
+        # Silently redirect to any new tab that opened and strip the Open-tabs
+        # section so the agent sees only the destination page, not tab metadata.
+        output = _auto_redirect_new_tabs(self._cli, output)
         return ToolResult(True, f"you {self._verb} {subject}. Result:\n{self._trim(_strip_snapshot_filelink(output))}")
 
     def run(self, args: dict) -> ToolResult:
@@ -1004,6 +1042,11 @@ class ClickTool(_WebTool):
     def _build(self, args):
         return ["click", args["target"]]
 
+    # Post-click settle: overlay panels and async renders (e.g. fill.co.at "Bewirb dich"
+    # form) take ~1-2 s to appear. Waiting before the DOM-delta snapshot ensures new
+    # refs are captured rather than seeing an empty/pre-render page and missing the form.
+    _POST_CLICK_SETTLE_S: float = 2.0
+
     def run(self, args: dict) -> ToolResult:
         # BACK-BUTTON GUARD (iter-2): block a click on the wizard "← Back"/"Previous"
         # control. The task is forward-only (fill every step, then Continue/Submit); going
@@ -1026,7 +1069,13 @@ class ClickTool(_WebTool):
                         f"would discard this step's progress and send you to an earlier step. "
                         f"Do not go back. Instead, fill any remaining required field on THIS "
                         f"step, then click the 'Continue →' button to advance.{date_hint}")
-        return super().run(args)
+        # Inline DOM-change detection with post-click settle so async overlays render
+        # before the diff snapshot is taken.
+        before = capture_page_snapshot_raw(self._cli) or ""
+        result = self._run_impl(args)
+        if result.ok:
+            time.sleep(self._POST_CLICK_SETTLE_S)
+        return _check_dom_delta(self._cli, before, result)
 
 
 class FillTool(_WebTool):
@@ -1880,7 +1929,9 @@ class UploadTool(_WebTool):
         "and the absolute `file` path. The tool clicks the trigger and uploads the file automatically "
         "— do NOT click the trigger separately first. "
         "Always pass the path EXACTLY as given in the task (absolute, e.g. "
-        "C:\\\\path\\\\to\\\\file.docx) — never shorten it to a relative path."
+        "C:\\\\path\\\\to\\\\file.docx) — never shorten it to a relative path. "
+        "If the form hides its file upload fields from the snapshot (common on some sites), "
+        "use target='js:0' for the first hidden file input or 'js:1' for the second."
     )
     _verb = "uploaded a file via"
     _required = ("target", "file")
@@ -1894,7 +1945,8 @@ class UploadTool(_WebTool):
         return [
             Param("target", "string",
                   "Ref of the upload trigger element (button or file-input) from the current page "
-                  "snapshot, e.g. 'e163'. Must be a ref from the snapshot — never a CSS selector."),
+                  "snapshot, e.g. 'e163'. Or use 'js:0' / 'js:1' to target hidden file inputs "
+                  "by index when no upload trigger appears in the snapshot."),
             Param("file", "string",
                   "Absolute path of the file to upload, e.g. C:\\\\Users\\\\...\\\\file.docx. "
                   "Never use a relative path."),
@@ -1902,6 +1954,29 @@ class UploadTool(_WebTool):
 
     def _build(self, args):  # pragma: no cover — run() overrides the dispatch
         return ["upload", args["file"]]
+
+    def _upload_via_js(self, idx: int, file_path: str, before: str) -> "ToolResult":
+        """Click the Nth hidden <input type=file> via JS eval, then supply the file."""
+        eval_js = f"document.querySelectorAll('input[type=\"file\"]')[{idx}]?.click()"
+        self._cli.run("eval", eval_js)
+        time.sleep(0.5)
+        upload_ok, upload_out = self._cli.run("upload", file_path)
+        upload_msg = self._trim(_strip_snapshot_filelink(upload_out)).replace(
+            "browser_file_upload", "upload")
+        if not upload_ok:
+            if "modal state" in upload_msg.lower():
+                return ToolResult(
+                    False,
+                    f"upload(js:{idx}) failed: no file picker opened after clicking hidden file "
+                    f"input [{idx}]. The form may not have a file input at index {idx}, or it "
+                    f"may be disabled. Try a different index (e.g. 'js:{idx+1}').",
+                )
+            return ToolResult(False, upload_msg)
+        result = ToolResult(
+            True,
+            f"you uploaded '{file_path}' via hidden file input [js:{idx}]. Result:\n{upload_msg}",
+        )
+        return _check_dom_delta(self._cli, before, result)
 
     def run(self, args: dict) -> ToolResult:
         # Validate required params.
@@ -1913,7 +1988,18 @@ class UploadTool(_WebTool):
         target = args["target"]
         file_path = args["file"]
 
-        # Guard: target must be a ref present in the current snapshot.
+        # JS-index mode: target="js:0" / "js:1" clicks hidden file inputs by DOM index.
+        if target.startswith("js:"):
+            try:
+                js_idx = int(target[3:])
+            except ValueError:
+                return ToolResult(False,
+                                  f"invalid js-index target '{target}': use 'js:N' where N is "
+                                  f"0, 1, 2… (e.g. 'js:0' for CV, 'js:1' for cover letter).")
+            before = capture_page_snapshot_raw(self._cli) or ""
+            return self._upload_via_js(js_idx, file_path, before)
+
+        # Standard ARIA-ref path: guard, click, upload.
         guard = self._guard_target(args)
         if guard is not None:
             return guard
@@ -1941,7 +2027,9 @@ class UploadTool(_WebTool):
             if "modal state" in upload_msg.lower():
                 upload_msg = (
                     f"upload failed after clicking '{target}': the file picker did not open. "
-                    f"Ensure the target is the correct upload trigger button from the snapshot."
+                    f"Ensure the target is the correct upload trigger button from the snapshot. "
+                    f"If no upload trigger is visible in the snapshot, use target='js:0' for the "
+                    f"first file input or 'js:1' for the second."
                 )
             return ToolResult(False, upload_msg)
 
