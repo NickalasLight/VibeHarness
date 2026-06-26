@@ -86,11 +86,18 @@ class Config:
     num_gpu: int = 99                 # force full GPU offload (NVIDIA via CUDA)
 
     # loop
-    max_steps: int = 15               # <= 0 means unlimited
-    # arXiv:2602.07359 (W&D): 3 calls/turn is the empirical accuracy peak for web agents
-    # (68% vs 60% at 5, despite 5 needing fewer turns). For sub-7B models (qwen3:4b),
-    # parallel-call reliability is weaker than frontier models — 3 is the safer ceiling.
-    max_actions_per_turn: int = 3     # cap tool calls per turn; 0 = unlimited
+    # ISSUE #210: max_steps is max TURNS PER SESSION (the agent loop bound; --max-steps;
+    # agent.py:287) — a DIFFERENT knob from max_actions_per_turn (tool calls per TURN).
+    # #197 conflated them by blanket-lifting max_actions_per_turn to 99; that 99 belongs
+    # HERE. Raised 15 -> 99 so a long multi-page form is not cut off mid-session.
+    max_steps: int = 99               # <= 0 means unlimited; max TURNS per session (#210)
+    # GLOBAL fallback cap on tool calls PER TURN (codec.constraint), used for any model
+    # without an explicit MODEL_TOOL_POLICIES entry. ISSUE #210: 3 -> 10. 10 is the standard
+    # batch cap for the capable API models (GLM/DeepSeek, #209); an unknown/unconfigured
+    # model gets that standard. qwen3:4b is explicitly carved out to 3 (its ground-truthed
+    # reliable batch size, arXiv:2602.07359 W&D) via its own policy below. [Maintainer
+    # accepted lifting the unknown-model fallback to 10 rather than keeping it conservative.]
+    max_actions_per_turn: int = 10    # cap tool calls per turn; 0 = unlimited (#210)
 
     # Per-turn wall-clock budget (seconds). 0 (default) disables the guard,
     # preserving the original behaviour exactly: decide() is called inline with no
@@ -541,17 +548,18 @@ class ModelToolPolicy:
 #   glm-5.2       → 1M (1048576): z.ai release notes — "GLM-5.2 supports 1M lossless context"
 #                   (https://docs.z.ai/release-notes/new-released).
 MODEL_TOOL_POLICIES: dict[str, ModelToolPolicy] = {
-    # ISSUE #197 ("simple fixes for now"): max_actions_per_turn=99 on EVERY policy below
-    # (and both family fallbacks) — a deliberate, temporary lift of the per-turn batching
-    # cap while we evaluate. This intentionally SUPERSEDES the #178-ground-truthed per-model
-    # caps (3/5/8/6/4 etc.) for now; the documented per-model rationales are retained for
-    # when we re-tighten. codec + context_window are unchanged from #178/#182/#193.
+    # ISSUE #210 (disentangle the two limits): #197 had blanket-set max_actions_per_turn=99
+    # on EVERY policy, conflating it with max_steps (turns/session — now 99, see Config).
+    # FINAL STATE: max_actions_per_turn = 3 for qwen3:4b (its ground-truthed reliable batch
+    # size) and 10 for every other (GLM/DeepSeek) policy + both family fallbacks (#209).
+    # codec + context_window are unchanged from #178/#182/#193.
     "qwen3:4b": ModelToolPolicy(
-        codec="hermes", max_actions_per_turn=99, context_window=32768,
+        codec="hermes", max_actions_per_turn=3, context_window=32768,
         collapse_consecutive_dup_tool_calls=True,  # #201: small local model repeats itself
         rationale="native Hermes dialect; sub-7B 3-call accuracy peak (arXiv:2602.07359); "
                   "ctx 32768 = GPU-pinned num_ctx (#77/#140), NOT a model limit; "
-                  "cap lifted to 99 for now (#197)"),
+                  "cap restored to 3 — #197 wrongly conflated this per-turn batch cap with "
+                  "max_steps (turns/session) and lifted it to 99 (#210)"),
     "glm-4.7-flash": ModelToolPolicy(
         codec="json", max_actions_per_turn=10, context_window=131072,
         collapse_consecutive_dup_tool_calls=False,  # #201: capable model; keep legit repeats

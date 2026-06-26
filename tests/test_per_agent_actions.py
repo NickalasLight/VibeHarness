@@ -17,9 +17,10 @@ from vibeharness import cli
 from vibeharness.agent import RalphAgent
 from vibeharness.config import Config, model_tool_policy
 
-# ISSUE #197: the per-MODEL policy for the default base model (qwen3:4b) now supersedes the
-# global Config.max_actions_per_turn during CLI resolution (cap lifted to 99 "for now").
-# Non-validator agents therefore resolve to this policy cap, not Config.max_actions_per_turn.
+# ISSUE #210: the per-MODEL policy for the default base model (qwen3:4b) supersedes the
+# global Config.max_actions_per_turn during CLI resolution (qwen cap = 3, its reliable batch
+# size; #197 had wrongly lifted it to 99, conflating it with max_steps). Non-validator agents
+# therefore resolve to this policy cap (3), not Config.max_actions_per_turn (10).
 _DEFAULT_RESOLVED_CAP = model_tool_policy(Config.model).max_actions_per_turn
 from vibeharness.filesystem import FileSystem
 from vibeharness.fs_tools import build_default_tools

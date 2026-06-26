@@ -29,11 +29,12 @@ from vibeharness.providers import get_endpoint
 # Per-model policy registry.
 # --------------------------------------------------------------------------- #
 class ModelPolicyTest(unittest.TestCase):
-    # ISSUE #206: GLM + DeepSeek per-turn caps set to 10 (steady state, superseding the
-    # temporary #197 lift to 99); qwen3:4b stays at 99. Codecs are unchanged.
-    def test_qwen_is_hermes_99(self):
+    # ISSUE #210: disentangled limits — qwen3:4b per-turn cap restored to 3 (its reliable
+    # batch size; #197 had wrongly lifted it to 99, conflating it with max_steps); GLM +
+    # DeepSeek caps stay 10 (#206/#209). Codecs are unchanged.
+    def test_qwen_is_hermes_3(self):
         p = model_tool_policy("qwen3:4b")
-        self.assertEqual((p.codec, p.max_actions_per_turn), ("hermes", 99))
+        self.assertEqual((p.codec, p.max_actions_per_turn), ("hermes", 3))
 
     def test_glm_flash_is_json_10(self):
         p = model_tool_policy("glm-4.7-flash")
@@ -87,6 +88,36 @@ class ModelPolicyTest(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------- #
+# ISSUE #210 — the two limits are disentangled:
+#   max_steps          = max TURNS per session (agent loop bound) → default 99
+#   max_actions_per_turn = max tool CALLS per turn (batch cap)    → default 10,
+#                          except qwen3:4b = 3 (its reliable batch size).
+# --------------------------------------------------------------------------- #
+class DisentangledLimitsTest(unittest.TestCase):
+    def test_max_steps_default_is_99(self):
+        # max TURNS per session — the agent loop bound (#210; was 15, #197 had meant 99 here).
+        self.assertEqual(Config().max_steps, 99)
+
+    def test_global_max_actions_per_turn_default_is_10(self):
+        # Standard per-turn batch cap for an unconfigured/unknown model (#210; was 3).
+        self.assertEqual(Config().max_actions_per_turn, 10)
+
+    def test_qwen_carved_out_to_3(self):
+        # qwen3:4b is the explicit exception — its ground-truthed reliable batch size.
+        self.assertEqual(model_tool_policy("qwen3:4b").max_actions_per_turn, 3)
+
+    def test_unknown_local_model_uses_global_10(self):
+        # No policy for this id → resolve falls back to the global default (now 10).
+        spec = ModelSpec(provider="ollama", model="mystery:1b")
+        self.assertEqual(resolve_model_limit(Config(), spec), 10)
+
+    def test_glm_and_deepseek_resolve_10(self):
+        for provider, model in (("zhipuai", "glm-4.7"), ("deepseek", "deepseek-chat")):
+            spec = ModelSpec(provider=provider, model=model)
+            self.assertEqual(resolve_model_limit(Config(), spec), 10, model)
+
+
+# --------------------------------------------------------------------------- #
 # resolve_model_codec / resolve_model_limit precedence.
 # --------------------------------------------------------------------------- #
 class ResolveCodecLimitTest(unittest.TestCase):
@@ -110,7 +141,7 @@ class ResolveCodecLimitTest(unittest.TestCase):
     def test_qwen_resolves_to_hermes(self):
         spec = ModelSpec(provider="ollama", model="qwen3:4b")
         self.assertEqual(resolve_model_codec(Config(), spec), "hermes")
-        self.assertEqual(resolve_model_limit(Config(), spec), 99)  # #206: qwen stays at 99
+        self.assertEqual(resolve_model_limit(Config(), spec), 3)  # #210: qwen cap restored to 3
 
 
 # --------------------------------------------------------------------------- #
@@ -135,7 +166,7 @@ class CliResolutionTest(unittest.TestCase):
     def test_default_qwen_base_is_hermes(self):
         cfg = self._cfg("task")
         self.assertEqual(cfg.codec, "hermes")
-        self.assertEqual(cfg.max_actions_per_turn, 99)  # #197: cap lifted to 99
+        self.assertEqual(cfg.max_actions_per_turn, 3)  # #210: qwen cap restored to 3
 
     def test_glm_base_provider_switches_to_json_and_cap(self):
         cfg = self._cfg("task", "--base-provider", "zhipuai",
@@ -181,7 +212,7 @@ class CliResolutionTest(unittest.TestCase):
         # --model sets the local base model; an unknown local model keeps Config defaults.
         cfg = self._cfg("task", "--model", "qwen3:4b")
         self.assertEqual(cfg.codec, "hermes")
-        self.assertEqual(cfg.max_actions_per_turn, 99)  # #197: cap lifted to 99
+        self.assertEqual(cfg.max_actions_per_turn, 3)  # #210: qwen cap restored to 3
 
 
 # --------------------------------------------------------------------------- #
