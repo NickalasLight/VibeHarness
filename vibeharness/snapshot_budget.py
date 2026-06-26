@@ -37,7 +37,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 
-from .config import Config
+from .config import Config, effective_context_window
 
 # The header the agent stamps on the post-turn live page snapshot it commits to the
 # stateful chat history (see ``RalphAgent._record`` / the page_snapshot observation).
@@ -88,15 +88,25 @@ def estimate_tokens(text: str, chars_per_token: float) -> int:
     return _ceil_div_chars(len(text), chars_per_token)
 
 
-def input_budget_tokens(config: Config) -> int:
+def input_budget_tokens(config: Config, window: int | None = None) -> int:
     """The usable input window in tokens: the whole context minus the output
-    reservation (reason + action tokens) minus the safety margin. Never negative."""
+    reservation (reason + action tokens) minus the safety margin. Never negative.
+
+    ISSUE #193 — the "whole context" is the ACTIVE base model's PER-MODEL context window
+    (``effective_context_window``), NOT a flat ``config.num_ctx``. For the local Ollama
+    model that resolves back to ``config.num_ctx`` (qwen3:4b stays 32768 — a GPU limit,
+    #77/#140); for a DeepSeek/GLM API model it is that model's much larger documented
+    window, so the input/snapshot budget is no longer needlessly capped at qwen3:4b's 32768.
+    ``window`` lets a caller that has already escalated to a different model (the agent) pass
+    that model's window directly; when None the base role's window is resolved."""
+    win = window if window is not None else effective_context_window(config)
     reserved = config.reason_tokens + config.action_tokens + \
         config.snapshot_safety_margin_tokens
-    return max(0, config.num_ctx - reserved)
+    return max(0, win - reserved)
 
 
-def compute_snapshot_budget(config: Config, rest_text: str) -> SnapshotBudget:
+def compute_snapshot_budget(config: Config, rest_text: str,
+                            window: int | None = None) -> SnapshotBudget:
     """Size the snapshot for one turn given ``rest_text`` — the FULL model message
     WITHOUT the snapshot (system prompt minus its page section, plus the per-turn
     user/history message). Returns a :class:`SnapshotBudget`.
@@ -107,7 +117,7 @@ def compute_snapshot_budget(config: Config, rest_text: str) -> SnapshotBudget:
     misconfiguration can never request an unbounded snapshot.
     """
     cpt = config.snapshot_chars_per_token
-    in_budget = input_budget_tokens(config)
+    in_budget = input_budget_tokens(config, window)
     rest_tokens = _ceil_div_chars(len(rest_text), cpt)
 
     snapshot_tokens = in_budget - rest_tokens
@@ -232,16 +242,22 @@ def _latest_snapshot_index(chat_history: list[dict]) -> int | None:
 
 
 def fit_chat_history(chat_history: list[dict], system: str, user: str,
-                     config: Config) -> BudgetFitReport:
+                     config: Config, window: int | None = None) -> BudgetFitReport:
     """Trim ``chat_history`` IN PLACE so ``[system] + chat_history + [user]`` fits the
     input window, evicting OLDEST history first and truncating the latest snapshot only
     as a last resort (issue #173). Returns a :class:`BudgetFitReport`.
+
+    ISSUE #193 — the input window derives from the ACTIVE base model's PER-MODEL context
+    window (``window`` when the caller has escalated to a specific model, else the base
+    role's window). The report's ``num_ctx`` field carries that EFFECTIVE window so the
+    loud CONTEXT-OVERRUN line reflects the model actually in use, not a flat 32768.
 
     Pure except for the in-place mutation of ``chat_history`` (and the snapshot message's
     ``content`` when truncation is the last resort), so it is unit-testable without a
     model or a browser."""
     cpt = config.snapshot_chars_per_token
-    in_budget = input_budget_tokens(config)
+    eff_window = window if window is not None else effective_context_window(config)
+    in_budget = input_budget_tokens(config, eff_window)
     fixed = estimate_tokens(system, cpt) + estimate_tokens(user, cpt)
 
     def hist_tokens() -> int:
@@ -337,7 +353,7 @@ def fit_chat_history(chat_history: list[dict], system: str, user: str,
         request_tokens_before=req_before,
         request_tokens_after=request_tokens(),
         input_budget_tokens=in_budget,
-        num_ctx=config.num_ctx,
+        num_ctx=eff_window,
         history_msgs_after=len(chat_history),
         history_tokens_after=hist_tokens(),
     )
