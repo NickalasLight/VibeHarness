@@ -330,8 +330,14 @@ class Config:
     # times in a row), the run escalates mid-session to an external API model — same
     # browser, same session, just a stronger LLM answering the next turn.
     escalation_enabled: bool = True
-    escalation_provider: str = "zhipuai"           # key into providers.PROVIDERS
-    escalation_model: str = "glm-5.2"              # empty = use provider default
+    # ISSUE #197: default escalator → DeepSeek. The previous default (zhipuai/glm-5.2)
+    # is unreachable in the standard setup — the shared ZHIPUAI_API_KEY is account
+    # rate-limited (HTTP 429 {"code":"1302","message":"Rate limit reached for requests"}),
+    # so the escalation machinery (#191/PR #195) silently no-ops out of the box. DeepSeek
+    # answers (proven live: a full qwen3:4b → deepseek-v4-flash take-over ran to FINISHED),
+    # which is what makes escalation_enabled=True meaningful by default (#191 acceptance).
+    escalation_provider: str = "deepseek"          # key into providers.PROVIDERS
+    escalation_model: str = "deepseek-v4-flash"    # empty = use provider default
     escalation_stuck_threshold: int = 3            # consecutive identical calls → stuck
     escalation_on_premature_validate: bool = True  # escalate on first premature validate
 
@@ -507,32 +513,54 @@ class ModelToolPolicy:
 #   glm-5.2       → 1M (1048576): z.ai release notes — "GLM-5.2 supports 1M lossless context"
 #                   (https://docs.z.ai/release-notes/new-released).
 MODEL_TOOL_POLICIES: dict[str, ModelToolPolicy] = {
+    # ISSUE #197 ("simple fixes for now"): max_actions_per_turn=99 on EVERY policy below
+    # (and both family fallbacks) — a deliberate, temporary lift of the per-turn batching
+    # cap while we evaluate. This intentionally SUPERSEDES the #178-ground-truthed per-model
+    # caps (3/5/8/6/4 etc.) for now; the documented per-model rationales are retained for
+    # when we re-tighten. codec + context_window are unchanged from #178/#182/#193.
     "qwen3:4b": ModelToolPolicy(
-        codec="hermes", max_actions_per_turn=3, context_window=32768,
+        codec="hermes", max_actions_per_turn=99, context_window=32768,
         rationale="native Hermes dialect; sub-7B 3-call accuracy peak (arXiv:2602.07359); "
-                  "ctx 32768 = GPU-pinned num_ctx (#77/#140), NOT a model limit"),
+                  "ctx 32768 = GPU-pinned num_ctx (#77/#140), NOT a model limit; "
+                  "cap lifted to 99 for now (#197)"),
     "glm-4.7-flash": ModelToolPolicy(
-        codec="json", max_actions_per_turn=5, context_window=131072,
-        rationale="API reasoning model; schema-constrained JSON; lighter flash tier (cap 5); "
-                  "128K ctx (GLM-4.5-Flash documented 128K)"),
+        codec="json", max_actions_per_turn=99, context_window=131072,
+        rationale="API reasoning model; schema-constrained JSON; lighter flash tier; "
+                  "128K ctx (GLM-4.5-Flash documented 128K); cap lifted to 99 for now (#197)"),
     "glm-4.7": ModelToolPolicy(
-        codec="json", max_actions_per_turn=8, context_window=204800,
+        codec="json", max_actions_per_turn=99, context_window=204800,
         rationale="flagship agentic-coding; 200K ctx (GLM-4.6 documented 200K) + native "
-                  "parallel_tool_calls (cap 8)"),
+                  "parallel_tool_calls; cap lifted to 99 for now (#197)"),
     "glm-5.2": ModelToolPolicy(
-        codec="json", max_actions_per_turn=8, context_window=1048576,
-        rationale="newest flagship long-horizon agentic line (cap 8); 1M lossless ctx "
-                  "(z.ai release notes)"),
+        codec="json", max_actions_per_turn=99, context_window=1048576,
+        rationale="newest flagship long-horizon agentic line; 1M lossless ctx "
+                  "(z.ai release notes); cap lifted to 99 for now (#197)"),
     "deepseek-chat": ModelToolPolicy(
-        codec="json", max_actions_per_turn=6, context_window=131072,
+        codec="json", max_actions_per_turn=99, context_window=131072,
         rationale="DeepSeek-V3.1 non-thinking; OpenAI-compat function calling; "
-                  "no documented per-request tool cap → conservative json cap 6; "
-                  "128K ctx (V3.1 documented baseline)"),
+                  "128K ctx (V3.1 documented baseline); cap lifted to 99 for now (#197)"),
     "deepseek-reasoner": ModelToolPolicy(
-        codec="json", max_actions_per_turn=4, context_window=131072,
+        codec="json", max_actions_per_turn=99, context_window=131072,
         rationale="DeepSeek-V3.1 thinking; tool calls supported since V3.1 (was unsupported "
-                  "on legacy R1); reasoning_content consumed as reasoning; cap 4 (reasons "
-                  "between calls); 128K ctx (V3.1 documented baseline)"),
+                  "on legacy R1); reasoning_content consumed as reasoning; 128K ctx (V3.1 "
+                  "documented baseline); cap lifted to 99 for now (#197)"),
+    # ISSUE #197: explicit DeepSeek-V4 entries (the V4 successors the deepseek-chat /
+    # deepseek-reasoner aliases now route to, and the default escalator model). Both natively
+    # support a 1M-token context window and tool/function calling — pinning explicit entries
+    # (instead of the 128K _DEEPSEEK_FAMILY_POLICY fallback) lets the #193 budget-follows-
+    # escalation track the true 1M window rather than under-sizing it.
+    # Sources: https://api-docs.deepseek.com/news/news260424 (V4-Pro 1.6T/49B + V4-Flash
+    #   284B/13B; "1M context is now the default across all official DeepSeek services";
+    #   Tool Calls guide + enhanced agentic capabilities) ,
+    #   https://openrouter.ai/deepseek/deepseek-v4-flash .
+    "deepseek-v4-flash": ModelToolPolicy(
+        codec="json", max_actions_per_turn=99, context_window=1_000_000,
+        rationale="DeepSeek-V4-Flash (284B/13B-active); OpenAI-compat tool calling; native 1M "
+                  "context (news260424); json single-shot codec; cap lifted to 99 for now (#197)"),
+    "deepseek-v4-pro": ModelToolPolicy(
+        codec="json", max_actions_per_turn=99, context_window=1_000_000,
+        rationale="DeepSeek-V4-Pro (1.6T/49B-active); OpenAI-compat tool calling; native 1M "
+                  "context (news260424); json single-shot codec; cap lifted to 99 for now (#197)"),
 }
 
 # Family fallback for any other z.ai/GLM API model id (e.g. a future glm-4.7-air): the API
@@ -540,8 +568,9 @@ MODEL_TOOL_POLICIES: dict[str, ModelToolPolicy] = {
 # unrecognised GLM model resolves to the conservative `json` + 5 policy rather than silently
 # inheriting the local `hermes` default. The qwen-local default is the global Config codec.
 _GLM_FAMILY_POLICY = ModelToolPolicy(
-    codec="json", max_actions_per_turn=5, context_window=131072,
-    rationale="unrecognised GLM/z.ai model: API JSON codec + conservative cap + 128K ctx")
+    codec="json", max_actions_per_turn=99, context_window=131072,
+    rationale="unrecognised GLM/z.ai model: API JSON codec + 128K ctx; "
+              "cap lifted to 99 for now (#197)")
 
 # Family fallback for any other DeepSeek API model id (issue #182) — e.g. a future
 # `deepseek-v4-flash` (the V4 successor the deepseek-chat/deepseek-reasoner aliases now point
@@ -549,8 +578,9 @@ _GLM_FAMILY_POLICY = ModelToolPolicy(
 # (never the native-only hermes), so an unrecognised DeepSeek model resolves to the
 # conservative `json` + 5 policy rather than silently inheriting the local `hermes` default.
 _DEEPSEEK_FAMILY_POLICY = ModelToolPolicy(
-    codec="json", max_actions_per_turn=5, context_window=131072,
-    rationale="unrecognised DeepSeek model: API JSON codec + conservative cap + 128K ctx")
+    codec="json", max_actions_per_turn=99, context_window=131072,
+    rationale="unrecognised DeepSeek model: API JSON codec + 128K ctx; "
+              "cap lifted to 99 for now (#197)")
 
 
 def model_tool_policy(model: str | None) -> ModelToolPolicy | None:

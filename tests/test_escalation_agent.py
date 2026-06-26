@@ -59,7 +59,9 @@ class EscalationAgentTest(unittest.TestCase):
         with mock.patch.object(providers, "make_api_client",
                                return_value=swapped) as mk:
             agent.run("loop")
-        mk.assert_called_once_with("zhipuai", "glm-5.2")
+        # ISSUE #197: default escalator is now deepseek / deepseek-v4-flash (zhipuai key
+        # is account rate-limited → 429, so the old default silently no-oped).
+        mk.assert_called_once_with("deepseek", "deepseek-v4-flash")
         self.assertIs(agent._client, swapped)        # client replaced in-place
 
     def test_escalation_disabled_does_not_swap(self):
@@ -108,7 +110,7 @@ class EscalationAgentTest(unittest.TestCase):
     # ---- issue #191: per-model codec/path switch + recorded events ----
     def test_takeover_switches_codec_to_json_single_shot(self):
         # Escalating to a GLM model (json policy) MUST flip the agent to the json codec
-        # + single-shot path + the escalator's per-turn cap (glm-5.2 -> 8), not leave it
+        # + single-shot path + the escalator's per-turn cap (glm-5.2 -> 99 since #197), not leave it
         # on the local native/hermes path (the #179 failure).
         action = {"tool": "list_directory", "args": {"path": self.tmp.name}}
         cfg = Config(max_steps=5, escalation_enabled=True, escalation_stuck_threshold=3,
@@ -123,7 +125,7 @@ class EscalationAgentTest(unittest.TestCase):
         self.assertIs(agent._client, swapped)
         self.assertEqual(agent._codec.name, "json")     # codec = json for the API path
         self.assertFalse(agent._native)                 # single-shot path
-        self.assertEqual(agent._max_actions, 8)         # flipped to glm-5.2 policy cap (8)
+        self.assertEqual(agent._max_actions, 99)        # flipped to glm-5.2 policy cap (99 since #197)
         # a VISIBLE success event is recorded in the run log
         evs = [e for e in result.escalation_events if e["success"]]
         self.assertEqual(len(evs), 1)

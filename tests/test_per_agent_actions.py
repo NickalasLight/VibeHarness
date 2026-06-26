@@ -15,7 +15,12 @@ import unittest
 
 from vibeharness import cli
 from vibeharness.agent import RalphAgent
-from vibeharness.config import Config
+from vibeharness.config import Config, model_tool_policy
+
+# ISSUE #197: the per-MODEL policy for the default base model (qwen3:4b) now supersedes the
+# global Config.max_actions_per_turn during CLI resolution (cap lifted to 99 "for now").
+# Non-validator agents therefore resolve to this policy cap, not Config.max_actions_per_turn.
+_DEFAULT_RESOLVED_CAP = model_tool_policy(Config.model).max_actions_per_turn
 from vibeharness.filesystem import FileSystem
 from vibeharness.fs_tools import build_default_tools
 from vibeharness.prompt import SystemPromptBuilder
@@ -78,17 +83,17 @@ class MappingTest(IsolatedSettings):
 class ResolutionPrecedenceTest(IsolatedSettings):
     def test_agent_web_resolves_to_twelve(self):
         self.assertEqual(
-            _resolved_cap(["task", "--agent", "web"]), Config.max_actions_per_turn)
+            _resolved_cap(["task", "--agent", "web"]), _DEFAULT_RESOLVED_CAP)
 
     def test_agent_validator_resolves_to_one(self):
         self.assertEqual(_resolved_cap(["task", "--agent", "validator"]), 1)
 
     def test_agent_fs_resolves_to_multiple_default(self):
         self.assertEqual(
-            _resolved_cap(["task", "--agent", "fs"]), Config.max_actions_per_turn)
+            _resolved_cap(["task", "--agent", "fs"]), _DEFAULT_RESOLVED_CAP)
 
     def test_no_agent_resolves_to_global_default(self):
-        self.assertEqual(_resolved_cap(["task"]), Config.max_actions_per_turn)
+        self.assertEqual(_resolved_cap(["task"]), _DEFAULT_RESOLVED_CAP)
 
     def test_explicit_flag_overrides_agent_default_for_web(self):
         # Explicit --max-actions-per-turn beats the agent's web=1 default.
@@ -122,13 +127,13 @@ class PromptStatesResolvedCapTest(IsolatedSettings):
 
     def test_web_prompt_states_twelve(self):
         self._assert_prompt_states(
-            ["task", "--agent", "web"], Config.max_actions_per_turn)
+            ["task", "--agent", "web"], _DEFAULT_RESOLVED_CAP)
 
     def test_validator_prompt_states_one(self):
         self._assert_prompt_states(["task", "--agent", "validator"], 1)
 
     def test_fs_prompt_states_multiple_default(self):
-        self._assert_prompt_states(["task", "--agent", "fs"], Config.max_actions_per_turn)
+        self._assert_prompt_states(["task", "--agent", "fs"], _DEFAULT_RESOLVED_CAP)
 
     def test_explicit_flag_prompt_states_that_cap(self):
         self._assert_prompt_states(

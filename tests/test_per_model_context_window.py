@@ -36,6 +36,12 @@ class RegistryWindowTest(unittest.TestCase):
         self.assertEqual(model_tool_policy("deepseek-chat").context_window, 131072)
         self.assertEqual(model_tool_policy("deepseek-reasoner").context_window, 131072)
 
+    def test_deepseek_v4_windows_are_1m(self):
+        # Issue #197: explicit V4 entries pin the native 1M window (news260424), so the
+        # #193 budget tracks 1M instead of the 128K family fallback.
+        self.assertEqual(model_tool_policy("deepseek-v4-flash").context_window, 1_000_000)
+        self.assertEqual(model_tool_policy("deepseek-v4-pro").context_window, 1_000_000)
+
     def test_glm_documented_windows(self):
         self.assertEqual(model_tool_policy("glm-4.7-flash").context_window, 131072)  # 128K
         self.assertEqual(model_tool_policy("glm-4.7").context_window, 204800)        # 200K
