@@ -95,8 +95,10 @@ class ResolveRoleSpecTest(unittest.TestCase):
         cfg = Config()
         v = resolve_role_spec(cfg, "validator")
         self.assertEqual((v.provider, v.model), ("zhipuai", "glm-5.2"))
+        # ISSUE #197: escalation default moved to deepseek/deepseek-v4-flash (zhipuai key
+        # is account rate-limited → 429, so the old default silently no-oped).
         e = resolve_role_spec(cfg, "escalation")
-        self.assertEqual((e.provider, e.model), ("zhipuai", "glm-5.2"))
+        self.assertEqual((e.provider, e.model), ("deepseek", "deepseek-v4-flash"))
 
     def test_advisor_empty_model_falls_back_to_base_model(self):
         cfg = replace(Config(), advisor_model="")
