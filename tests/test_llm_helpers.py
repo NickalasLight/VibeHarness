@@ -131,10 +131,11 @@ class RequestShapeTest(unittest.TestCase):
         self.assertEqual(fake.bodies[0]["options"]["num_ctx"], 32768)
 
     def test_decide_chat_sends_messages_and_tools(self):
-        # NATIVE path (#129/#130/#131): decide_chat issues ONE /api/chat request carrying
-        # the FULL messages history and the enveloped tools: field, still stamped with the
-        # runner-shape options.
-        cfg = Config(ollama_url="http://test:11434")
+        # NATIVE path (#129/#130/#131) for a NON-thinking model (reason_then_act=False):
+        # decide_chat issues ONE /api/chat request carrying the FULL messages history and
+        # the enveloped tools: field, still stamped with the runner-shape options.
+        from dataclasses import replace
+        cfg = replace(Config(ollama_url="http://test:11434"), reason_then_act=False)
         chat = _FakeResponse([_line({"message": {"content": '{"name":"x","arguments":{}}'}}),
                               _line({"done": True})])
         fake = self._install([chat])
@@ -164,35 +165,54 @@ class RequestShapeTest(unittest.TestCase):
                                           DecodeConstraint())
         self.assertEqual(list(d.tool_calls), calls)
 
-    def test_decide_chat_reason_then_act_sends_think_true(self):
-        # ISSUE #183: a reasoning model (reason_then_act=True, default) drives ONE native
-        # /api/chat call with think:True so Ollama routes the trace into message.thinking
-        # and constrains only the action. num_predict covers thinking_budget + action_tokens.
+    def test_decide_chat_reason_then_act_is_two_phase_no_tools_in_think(self):
+        # ISSUE #183: a reasoning model (reason_then_act=True, default) drives a TWO-PHASE
+        # split. PHASE 1 thinks with think:True and NO tools: (so Ollama can't promote the
+        # <tool_call> drafts in the trace to structured calls). PHASE 2 acts with tools: +
+        # think:False, replaying the thinking as a CLOSED <think> assistant prefill.
         cfg = Config(ollama_url="http://test:11434")  # reason_then_act defaults True
         self.assertTrue(cfg.reason_then_act)
-        chat = _FakeResponse([
-            _line({"message": {"thinking": "I should navigate. ",
-                               "content": ""}}),
+        tools = [{"type": "function", "function": {"name": "goto", "parameters": {}}}]
+        # PHASE 1 response: the trace DRAFTS a tool call (must NOT be executed).
+        phase1 = _FakeResponse([
+            _line({"message": {"thinking": "I should navigate. Maybe "
+                               "<tool_call>{\"name\":\"goto\",\"arguments\":{\"url\":\"DRAFT\"}}"
+                               "</tool_call>", "content": ""}}),
+            _line({"done": True})])
+        # PHASE 2 response: the COMMITTED structured call.
+        phase2 = _FakeResponse([
             _line({"message": {"content": "",
                                "tool_calls": [{"function": {"name": "goto",
-                                                            "arguments": {"url": "u"}}}]}}),
+                                                            "arguments": {"url": "real"}}}]}}),
             _line({"done": True})])
-        fake = self._install([chat])
-        reasoned, acted = [], []
-        d = OllamaClient(cfg).decide_chat(
-            [{"role": "user", "content": "go"}],
-            [{"type": "function", "function": {"name": "goto", "parameters": {}}}],
-            DecodeConstraint(), on_reason=reasoned.append, on_action=acted.append)
-        self.assertEqual(len(fake.bodies), 1)            # single native call
-        self.assertIs(fake.bodies[0]["think"], True)     # thinking enabled
-        self.assertEqual(fake.bodies[0]["options"]["num_predict"],
-                         cfg.thinking_budget + cfg.action_tokens)
-        # thinking captured into reasoning (streamed to on_reason), NOT into the action
+        fake = self._install([phase1, phase2])
+        reasoned = []
+        msgs = [{"role": "user", "content": "go"}]
+        d = OllamaClient(cfg).decide_chat(msgs, tools, DecodeConstraint(),
+                                          on_reason=reasoned.append)
+        self.assertEqual(len(fake.bodies), 2)            # two phases
+        think_body, act_body = fake.bodies
+        # PHASE 1: think on, NO tools, thinking_budget, original messages.
+        self.assertIs(think_body["think"], True)
+        self.assertNotIn("tools", think_body)
+        self.assertEqual(think_body["options"]["num_predict"], cfg.thinking_budget)
+        self.assertEqual(think_body["messages"], msgs)
+        # PHASE 2: think off, tools present, action_tokens, history + a closed-<think>
+        # assistant prefill appended.
+        self.assertIs(act_body["think"], False)
+        self.assertEqual(act_body["tools"], tools)
+        self.assertEqual(act_body["options"]["num_predict"], cfg.action_tokens)
+        self.assertEqual(act_body["messages"][-1]["role"], "assistant")
+        self.assertIn("<think>", act_body["messages"][-1]["content"])
+        self.assertIn("</think>", act_body["messages"][-1]["content"])
+        # Thinking captured into reasoning (streamed); the DRAFT call is NOT executed —
+        # only the committed phase-2 structured call is returned.
         self.assertIn("I should navigate.", d.reasoning)
-        self.assertEqual(d.action_json, "")             # no action text; call is structured
+        self.assertIn("I should navigate.", "".join(reasoned))
+        self.assertEqual(d.action_json, "")
         self.assertEqual(list(d.tool_calls),
-                         [{"function": {"name": "goto", "arguments": {"url": "u"}}}])
-        self.assertIn("I should navigate. ", "".join(reasoned))
+                         [{"function": {"name": "goto", "arguments": {"url": "real"}}}])
+        self.assertNotIn("DRAFT", str(d.tool_calls))
 
     def test_decide_chat_non_thinking_model_sends_think_false(self):
         # A non-thinking model (reason_then_act=False) keeps think:False — think:True 400s

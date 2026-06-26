@@ -197,22 +197,23 @@ class Config:
     # Ollama versions (issue #12917); this two-phase cap is the reliable alternative.
     thinking_budget: int = 1024       # max thinking tokens (native decide_chat path)
 
-    # ISSUE #183 (beta_qwen3coder): native THINK-THEN-ACT for the decide_chat path.
-    # qwen3:4b is a REASONING model. Sending ``think:False`` does NOT stop it (it ignores
-    # the flag — Ollama #12917): it reasons anyway, the trace lands UNTAGGED in
-    # ``message.content`` (no <think> wrapper, so ``message.thinking`` stays empty), and on
-    # a non-trivial turn the reasoning DEVOURS the whole action budget before any
-    # <tool_call> is emitted — every turn fails with "could not parse a tool call" (live
-    # run 20260626_210514: 12/12 turns wasted). Ground-truthed fix (live /api/chat,
-    # Ollama 0.30.10): one ``think:True`` + ``tools:`` call lets OLLAMA do think-then-act
-    # natively — it routes qwen3's reasoning into the SEPARATE ``message.thinking`` channel
-    # (captured as ``Decision.reasoning``, NEVER parsed as the action) and constrains ONLY
-    # the action to the tools schema, returning the call as a STRUCTURED
-    # ``message.tool_calls`` entry (verified on a heavy snapshot turn:
-    # ``click({"target":"Accept all"})``). qwen3:4b ignores the ``"low"/"medium"`` think
-    # LEVELS (no native token budget), so ``num_predict`` is sized to
-    # ``thinking_budget + action_tokens`` to bound the single generation.
-    # When True (default on this branch) ``decide_chat`` sends ``think:True``; set False
+    # ISSUE #183 (beta_qwen3coder): bounded REASON-THEN-ACT for the decide_chat path.
+    # qwen3:4b is a REASONING model. Two failure modes were ground-truthed live:
+    #   1. ``think:False`` does NOT stop it (Ollama #12917): it reasons anyway, the trace
+    #      lands UNTAGGED in ``message.content`` and DEVOURS the action budget before any
+    #      <tool_call> — every turn "could not parse a tool call" (run 20260626_210514:
+    #      12/12 wasted).
+    #   2. A single ``think:True`` + ``tools:`` call LEAKS: Ollama PROMOTES the <tool_call>
+    #      drafts the model writes WHILE thinking into structured ``message.tool_calls``, so
+    #      a call it was only CONSIDERING gets executed (run 20260626_222714 turn 1: 3
+    #      drafts in the trace, EMPTY action, yet ``goto`` ran — parsed from the thinking).
+    # Fix = a real two-phase split (see OllamaClient._decide_chat_reason_then_act): phase 1
+    # thinks with ``think:True`` and NO ``tools:`` (so Ollama has no schema to promote
+    # drafts against — verified: 4 drafts → tool_calls=[]); phase 2 replays the thinking as
+    # a CLOSED <think> prefill and emits the COMMITTED call with ``tools:`` + ``think:False``
+    # (verified: phase 2 → goto(...)). The thinking is captured as ``Decision.reasoning``
+    # (shown to the user) and NEVER executed; only phase 2 can produce an action.
+    # When True (default on this branch) ``decide_chat`` uses the two-phase split; set False
     # for a NON-thinking model (qwen2.5-coder) — ``think:True`` 400s on such a model.
     # Independent of ``two_phase`` (which must stay False so the native path stays enabled —
     # see RalphAgent._native).
