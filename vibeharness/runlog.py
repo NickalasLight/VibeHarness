@@ -20,6 +20,7 @@ from pathlib import Path
 
 from .config import Config
 from .agent import RunResult
+from .snapshot_budget import estimate_tokens
 
 
 def _hide(path: Path) -> None:
@@ -85,14 +86,22 @@ class RunLogger:
             # Diagnostics are a best-effort aid; never let a dump failure break the run.
             pass
 
-    def dump_full_turn_io(self, turn: int, *, system: str,
-                          messages: list, user: str,
-                          reasoning: str, action: str) -> None:
-        """Write the complete LLM input + output for one turn to ``<stamp>-diagnostics/``.
+    def dump_turn_input(self, turn: int, system: str, messages: list, user: str,
+                        chars_per_token: float = 4.0) -> None:
+        """Persist the EXACT request sent to the model for one turn — BEFORE generation.
 
-        Saves everything sent to and received from the model:
-          - ``turn-<NNN>-input-<ts>.txt``  — system prompt + full message history + user turn
-          - ``turn-<NNN>-output-<ts>.txt`` — model reasoning + raw action/tool-call output
+        Written up-front (before the blocking model call) so a crash *during* generation
+        still leaves this turn's full input on disk. That gap — the request payload of the
+        crashing turn being lost — is exactly what made #170 hard to diagnose. Writes
+        ``turn-<NNN>-input-<ts>.txt`` with the system prompt + full message history +
+        current user message (the native path's ``[system] + history + [user]`` request),
+        prefixed with an ESTIMATED request token size — the key signal for context overrun
+        (compare against ``num_ctx``).
+
+        NOTE (issue #171): this REPLACES the previously-dead ``dump_full_turn_io`` whose
+        keyword-only signature mismatched the positional call site, so every call threw a
+        swallowed ``TypeError`` and no IO file was ever written. The call is split into
+        input (here, pre-generation) and :meth:`dump_turn_output` (post-generation).
 
         Best-effort and exception-safe — a failure here never aborts the agent loop.
         """
@@ -101,14 +110,18 @@ class RunLogger:
             _hide(self.dir)
             ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
             tag = f"turn-{turn:03d}"
-
-            import json as _json
-
-            # Input: system prompt + message history + this turn's user message
-            history_text = _json.dumps(messages, indent=2, ensure_ascii=False)
+            # ``default=str`` so an unexpected non-JSON value in a message never throws
+            # (which would silently lose the dump, the very failure mode we are fixing).
+            history_text = json.dumps(messages, indent=2, ensure_ascii=False, default=str)
+            req_tokens = (estimate_tokens(system, chars_per_token)
+                          + estimate_tokens(history_text, chars_per_token)
+                          + estimate_tokens(user, chars_per_token))
+            req_chars = len(system) + len(history_text) + len(user)
             input_body = (
-                f"# turn {turn} — FULL LLM INPUT\n"
-                f"# captured at: {ts}\n\n"
+                f"# turn {turn} — FULL LLM INPUT (captured BEFORE generation)\n"
+                f"# captured at: {ts}\n"
+                f"# estimated request size: ~{req_tokens} tokens / {req_chars} chars "
+                f"across {len(messages)} history message(s)\n\n"
                 f"## SYSTEM PROMPT ({len(system)} chars)\n\n"
                 f"{system}\n\n"
                 f"---\n\n"
@@ -120,8 +133,21 @@ class RunLogger:
             )
             (self.diagnostics_dir / f"{tag}-input-{ts}.txt").write_text(
                 input_body, encoding="utf-8", errors="backslashreplace")
+        except Exception:
+            pass
 
-            # Output: reasoning + action
+    def dump_turn_output(self, turn: int, reasoning: str, action: str) -> None:
+        """Persist the model's raw output (reasoning + action/tool-call) for one turn.
+
+        Written AFTER generation returns; pairs with :meth:`dump_turn_input` so the two
+        together capture the complete unedited turn IO under ``<stamp>-diagnostics/`` as
+        ``turn-<NNN>-output-<ts>.txt``. Best-effort and exception-safe.
+        """
+        try:
+            self.diagnostics_dir.mkdir(parents=True, exist_ok=True)
+            _hide(self.dir)
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            tag = f"turn-{turn:03d}"
             output_body = (
                 f"# turn {turn} — FULL LLM OUTPUT\n"
                 f"# captured at: {ts}\n\n"

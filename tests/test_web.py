@@ -119,10 +119,39 @@ class SubtoolMappingTest(unittest.TestCase):
         tool.run({"target": "e1", "end": "e2"})
         self.assertEqual(cli.calls[-1], ["drag", "e1", "e2"])
 
-    def test_upload_maps_to_upload_file(self):
+    def test_upload_clicks_trigger_then_uploads_file(self):
+        # The current upload contract requires a `target` ref AND a `file`, and
+        # performs a click-then-upload sequence on that ref. Use a CLI whose
+        # snapshot lists the target so the issue-#73 target guard lets it through.
+        cli = _SnapshotThenResultCli(
+            snapshot="Page: \"X\"\n[e163] button \"Upload CV\"\n",
+            result_ok=True, result_output="### Page\nuploaded")
+        tool = UploadTool(cli, observation_limit=1000)
+        res = tool.run({"target": "e163", "file": "/tmp/cv.pdf"})
+        self.assertTrue(res.ok)
+        # The action commands (ignoring the snapshot reads the guard/delta take) are
+        # a click on the trigger followed by the upload of the file.
+        action_calls = [c for c in cli.calls if c and c[0] != "snapshot"]
+        self.assertEqual(action_calls, [["click", "e163"], ["upload", "/tmp/cv.pdf"]])
+
+    def test_upload_requires_target(self):
+        # Without a target ref the tool must refuse and never touch the CLI.
         tool, cli = self._make(UploadTool)
-        tool.run({"file": "/tmp/cv.pdf"})
-        self.assertEqual(cli.calls, [["upload", "/tmp/cv.pdf"]])
+        res = tool.run({"file": "/tmp/cv.pdf"})       # missing target
+        self.assertFalse(res.ok)
+        self.assertIn("target", res.observation)
+        self.assertEqual(cli.calls, [])
+
+    def test_upload_js_index_path(self):
+        # target='js:0' clicks the first hidden <input type=file> via an eval, then
+        # uploads — no ARIA target guard, so no snapshot ref is required.
+        cli = FakeCli(ok=True, output="### Page\nuploaded")
+        tool = UploadTool(cli, observation_limit=1000)
+        res = tool.run({"target": "js:0", "file": "/tmp/cv.pdf"})
+        self.assertTrue(res.ok)
+        action_calls = [c for c in cli.calls if c and c[0] != "snapshot"]
+        self.assertEqual(action_calls[0][0], "eval")          # clicks hidden input 0
+        self.assertEqual(action_calls[-1], ["upload", "/tmp/cv.pdf"])
 
     def test_navigate_back_forward_reload_map_through(self):
         for cls, expect in ((NavigateBackTool, ["go-back"]),
@@ -141,11 +170,24 @@ class SubtoolMappingTest(unittest.TestCase):
         self.assertEqual(c2.calls, [["screenshot", "e7"]])
 
     def test_fill_requires_target_and_text(self):
+        # Issue #166: a missing-required-param fill is rejected BEFORE any browser
+        # contact — FillTool.run validates required params before capturing its
+        # DOM-delta before-snapshot, so an invalid call never touches the CLI.
         tool, cli = self._make(FillTool)
         res = tool.run({"target": "e3"})         # missing text
         self.assertFalse(res.ok)
         self.assertIn("text", res.observation)
-        self.assertEqual(cli.calls, [])          # never reached the CLI
+        self.assertEqual(cli.calls, [])          # never reached the CLI (no snapshot either)
+
+    def test_fill_valid_call_still_captures_dom_delta_snapshot(self):
+        # The validate-before-snapshot reorder must NOT break DOM-delta detection for
+        # a VALID fill: it still snapshots (before + delta) around the fill action.
+        tool, cli = self._make(FillTool)
+        res = tool.run({"target": "e3", "text": "John"})
+        self.assertTrue(res.ok)
+        verbs = [c[0] for c in cli.calls]
+        self.assertIn("snapshot", verbs)         # before/after DOM-delta snapshot taken
+        self.assertIn(["fill", "e3", "John"], cli.calls)
 
     def test_goto_requires_url(self):
         tool, cli = self._make(GotoTool)
@@ -960,12 +1002,17 @@ class RootCauseDaemonSurvivesTimeoutTest(unittest.TestCase):
 class OpenBrowserToolTest(unittest.TestCase):
     """Issue #75: an agent-callable open_browser tool that (re)opens the session."""
 
-    def test_open_browser_is_registered(self):
+    def test_open_browser_is_not_registered_and_goto_is_first(self):
+        # Simplified tool interface (issue #166): open_browser is NOT agent-callable —
+        # `goto` opens a session automatically when none is open, and navigates an
+        # existing one otherwise, so it is the FIRST / opening tool. OpenBrowserTool
+        # the class still exists for internal session recovery (tests below).
         from vibeharness.web import OpenBrowserTool
         names = [c.name for c in _WEB_TOOL_CLASSES]
-        self.assertIn("open_browser", names)
-        # And it is the FIRST tool, so it's prominent / always available.
-        self.assertIs(_WEB_TOOL_CLASSES[0], OpenBrowserTool)
+        self.assertNotIn("open_browser", names)
+        self.assertNotIn(OpenBrowserTool, _WEB_TOOL_CLASSES)
+        self.assertIs(_WEB_TOOL_CLASSES[0], GotoTool)
+        self.assertEqual(_WEB_TOOL_CLASSES[0].name, "goto")
 
     def test_open_browser_opens_the_session(self):
         from vibeharness.web import OpenBrowserTool
@@ -1085,13 +1132,18 @@ class AutoRecoveryTest(unittest.TestCase):
 
 
 class WebToolsetGuidanceRecoveryTest(unittest.TestCase):
-    """Issue #75: system guidance must tell the agent to open the browser when there
-    is no current page / the session was closed."""
+    """Issue #166 / PR #167: system guidance must steer the agent to open a page with
+    `goto` (which starts the browser automatically) — it must NOT reference the
+    removed agent-callable `open_browser` tool."""
 
-    def test_guidance_mentions_open_browser_when_no_page(self):
+    def test_guidance_directs_goto_to_open_and_omits_open_browser(self):
         guidance = WebToolset().system_guidance().lower()
-        self.assertIn("open_browser", guidance)
-        self.assertIn("not open", guidance)
+        self.assertIn("goto", guidance)
+        # Guidance tells the agent goto opens/starts the browser automatically.
+        self.assertIn("goto <url>", guidance)
+        self.assertIn("automatically", guidance)
+        # The simplified interface has no agent-callable open_browser tool.
+        self.assertNotIn("open_browser", guidance)
 
 
 class FindOptionRefTest(unittest.TestCase):

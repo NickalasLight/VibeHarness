@@ -1027,6 +1027,15 @@ class FillTool(_WebTool):
         return ["fill", args["target"], args["text"]]
 
     def run(self, args: dict) -> ToolResult:
+        # Validate required params BEFORE touching the browser: a missing-param call
+        # is rejected without ever snapshotting (don't capture a DOM state for an
+        # invalid call — issue #166). The base _run_impl re-checks, so valid calls
+        # behave identically; only the wasteful pre-snapshot on an invalid call is
+        # avoided. DOM-delta detection stays intact for valid fills below.
+        missing = [p for p in self._required if not args.get(p)]
+        if missing:
+            return ToolResult(False, f"you called `{self.name}` but did not provide: "
+                              f"{', '.join(missing)}.")
         # Capture the DOM before calling the action so we can detect new elements.
         before = capture_page_snapshot_raw(self._cli) or ""
         result = self._run_impl(args)
@@ -2323,142 +2332,29 @@ class WebToolset(Toolset):
 
     def system_guidance(self) -> str | None:
         return """\
-# Job Application Agent
+# Web Agent
 
-## Browser Rules
+## Reading the page
+Each turn the current page is shown to you automatically under '# Current page (live snapshot — provided automatically)'. Read it before every action — there is no tool to request it.
 
-Each turn the current page is shown to you automatically under \
-'# Current page (live snapshot — provided automatically)'. \
-Read it before every action. Do not request it — there is no tool for that.
+SNAPSHOT IS GROUND TRUTH. Only refs (e.g. `e12`) listed in the latest snapshot exist. Never guess, invent, or increment a ref, and never use CSS selectors or class names.
 
-SNAPSHOT IS GROUND TRUTH. Only refs listed in the latest snapshot exist. \
-Never guess, invent, or increment refs. Never use CSS selectors or class names.
+## Acting on the page
+- Open a page with `goto <url>` — it starts the browser automatically if needed.
+- Identify a control by its visible label, placeholder, aria-label, role, or nearby text, then act on that control's ref.
+- Use the most specific tool for the control: `fill` for text fields, `select_option` for dropdowns/comboboxes, `check`/`uncheck` for checkboxes and radios, `set_spinbutton` for numeric steppers, `upload` (pass the trigger ref AND the absolute file path in one call) for file inputs, and `click` for buttons and links.
+- Batch independent actions in one turn (e.g. fill several fields, then click the control that advances); use a single action when you must see its result before deciding the next step.
 
-If there is no current page or the browser session is closed, call `open_browser` \
-then `goto` the target URL before continuing.
+## Recovering from problems
+- If a cookie or consent banner blocks the page, click its Accept/Agree/Dismiss control first.
+- Never repeat the exact same failing call — change the ref or the approach.
+- If an action does not change the page (still the same view, or fields marked [invalid]), do not retry it blindly: fix the flagged fields, then try once more.
+- If the page shows a CAPTCHA or other human-verification challenge, do not attempt to bypass it — call `validate` and describe the blocker.
 
-If a cookie or consent banner blocks the page, locate its Accept/Agree/Dismiss \
-control in the snapshot and click it first.
-
-FAILED TOOL CALLS — never repeat the exact same failing call. \
-Change your approach: use a different ref or action.
-
-FORM VALIDATION ERRORS — if clicking Next/Submit does not advance the form \
-(page unchanged, or fields marked [invalid]), do NOT click again. \
-Find and fix the invalid fields, then click once more.
-
-FILE UPLOADS — call `upload` with both the trigger ref AND the absolute file path \
-in one step. Do not click the trigger separately first.
-
-## General Application Flow
-
-1. Navigate to the job URL.
-2. Accept any cookie or consent banner.
-3. Find the primary apply button and click it.
-4. If a new tab or external page opens, continue there.
-5. Prefer guest / no-registration application. If unavailable, create an account \
-using the candidate email and password from the task.
-6. Fill all visible required fields using the candidate profile.
-7. Upload CV and cover letter when upload fields appear.
-8. Answer questionnaire fields using the candidate profile.
-9. Check required consent checkboxes (privacy policy, data processing, terms).
-10. Advance one page at a time using Next/Weiter/Continue.
-11. Submit only when on the final review or submission step.
-12. After submitting, wait for a confirmation page or message.
-13. When confirmation is visible, call `validate` with success.
-
-## Field Filling
-
-Fill all visible required fields before clicking Next or Submit.
-Match fields by label, placeholder, aria-label, nearby text, or section heading.
-
-Common mappings:
-- first name → first_name from task
-- last name → last_name from task
-- full name → full_name from task
-- email → email from task
-- phone / mobile → phone from task
-- date of birth → date_of_birth_local from task (DD.MM.YYYY) or date_of_birth_iso (YYYY-MM-DD)
-- gender → gender from task
-- nationality / citizenship → nationality from task
-- street → street from task
-- house number → house_number from task
-- postal code / zip → postal_code from task
-- city → city from task
-- country → country from task
-- salary / expected salary → salary_expectation_annual_gross_eur from task
-- start date / availability → earliest_start_date from task
-- source / how did you hear → application_source from task
-- cover letter / motivation text → cover_letter_text from task
-
-If a field is optional and the value is known, fill it.
-If a required field cannot be answered from the candidate profile, \
-choose the closest truthful generic option.
-Do not invent degrees, certifications, work history, or legal status.
-
-## Dropdowns, Radio Buttons, Checkboxes
-
-For dropdowns and radio buttons, choose the closest matching option.
-For required consent checkboxes (privacy, data processing, terms, application), check them.
-Do not check marketing or newsletter checkboxes unless required to continue.
-
-## Document Upload
-
-Upload before leaving any document upload step.
-- CV/resume field → cv_file from task
-- Cover letter/motivation field → cover_letter_file from task
-- If only one upload field, upload the CV first.
-
-If upload fails and the document is optional, continue.
-If upload fails and the document is required, call `validate` with blocker.
-If an uploaded CV auto-fills fields incorrectly, overwrite with candidate profile values.
-
-## Login and Registration
-
-Prefer in order:
-1. Apply as guest
-2. Continue without account
-3. Register / create account (use candidate email and password)
-4. Login (only if page clearly requires an existing account)
-
-If email verification, SMS verification, or manual account approval is required, \
-call `validate` with blocker.
-If login or registration fails twice, call `validate` with blocker.
-
-## Captcha and Verification
-
-If the page shows CAPTCHA, reCAPTCHA, hCaptcha, phone verification, SMS code, \
-or email verification, do not attempt to bypass it.
-Call `validate` and describe the blocker.
-
-## Submission
-
-Submit only when ALL are true:
-- all required visible fields are filled
-- required documents are uploaded (or optional / unavailable)
-- required consent boxes are checked
-- the page is a final submit or review step
-- the button is not just the first apply button on a job listing
-
-After submitting, wait for confirmation before calling `validate`.
-
-## Success
-
-Call `validate` with success when the page shows a clear confirmation:
-thank-you message, application submitted message, confirmation page, success modal.
-
-## Failure / Blocker
-
-Call `validate` with blocker if:
-- CAPTCHA or bot challenge appears
-- phone/SMS/email verification is required
-- required login cannot be completed
-- required document upload cannot be completed
-- required info is unavailable and cannot be skipped
-- no progress is possible after three attempts on the same step
-
-When calling `validate` for a blocker, include the current page type, URL, \
-blocker text, last attempted action, and what is needed to continue.\
+## Finishing
+- Use only the information the task provides; do not invent values, credentials, or facts.
+- Work step by step and confirm each action from the next snapshot before assuming it worked.
+- Call `validate` only when the task's stated goal is actually met (the page shows the expected result or confirmation), or when a genuine blocker prevents further progress — including the current URL, what is blocking you, and what you already tried.\
 """
 
     def create_tools(self, config: Config) -> list[Tool]:

@@ -14,6 +14,7 @@ import json
 import os
 import re
 import sys
+import traceback
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
@@ -665,14 +666,21 @@ def _run_locked(args, task, config, registry, codec, names, workdir, logger,
                        reporter=reporter, system_prompt_provider=system_prompt_provider,
                        codec=codec, validator_context_provider=validator_context_provider,
                        raw_snapshot_provider=raw_snapshot_provider,
-                       turn_io_logger=logger.dump_full_turn_io)
+                       turn_input_logger=logger.dump_turn_input,
+                       turn_output_logger=logger.dump_turn_output)
 
     # Advisor advice buffer: the checkpoint populates it after N accumulated tool calls;
     # advice_provider drains it once at the start of the next turn.
     _advice_buffer: list[str] = []
     _tool_calls_since_advisor = [0]  # mutable int via list so closure can write it
 
+    # cli keeps a live handle on the agent's RunResult (the SAME object the agent mutates
+    # and hands to on_turn each turn) so ANY abnormal exit can still persist the real
+    # partial state with a clear reason — never a silent exit-0 (#170).
+    _live: dict = {"result": RunResult(task=task)}
+
     def checkpoint(res: RunResult) -> None:
+        _live["result"] = res
         # Update filled_controls from the latest turn's successful fill/select actions.
         if res.turns:
             latest = res.turns[-1]
@@ -718,10 +726,33 @@ def _run_locked(args, task, config, registry, codec, names, workdir, logger,
             ts.setup(config)
         result = agent.run(task, on_turn=checkpoint,
                            advice_provider=advice_provider if advisor else None)
+        _live["result"] = result
     except OllamaUnavailable as e:
+        result = _live["result"]
+        result.stop_reason = result.stop_reason or f"Ollama unavailable: {e}"
         print(f"\nerror: {e}", file=sys.stderr)
+        sys.stderr.flush()
+        _safe_log(logger, task, config, result)
         _save_run_score(logger, task, config, result)
         return 1   # the start/streamed log on disk already holds the last known state
+    except BaseException as e:
+        # NO SILENT DEATH (#170): surface ANY abnormal end loudly (full traceback +
+        # a one-line reason), persist the agent's partial result with that reason, and
+        # exit non-zero. The agent already checkpointed the last completed turn; here we
+        # record WHY the run ended so a `.vibe` log never shows a bare, unexplained stop.
+        result = _live["result"]
+        reason = f"run aborted mid-turn: {type(e).__name__}: {e}"
+        result.stop_reason = result.stop_reason or reason
+        print(f"\n!!! RUN ABORTED — {reason}", file=sys.stderr)
+        traceback.print_exc()
+        sys.stderr.flush()
+        _safe_log(logger, task, config, result)
+        _save_run_score(logger, task, config, result)
+        # Ctrl-C should still surface as an interrupt; ordinary errors exit with a clear
+        # non-zero code rather than propagating a bare traceback past the caller.
+        if isinstance(e, KeyboardInterrupt):
+            raise
+        return 3
     finally:
         # Reap every toolset, swallowing per-toolset errors, so one failing teardown
         # never prevents the others (e.g. the web browser) from being torn down.

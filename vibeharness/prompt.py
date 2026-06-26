@@ -63,7 +63,6 @@ is required.
 # and waste the window) — it keeps only the loop description, the per-toolset guidance, and
 # the general guidance. It still tells the model that tools are provided to it natively.
 _SYSTEM_TEMPLATE_NATIVE = """\
-/no_think
 You are a capable task-execution agent operating a computer through a small set \
 of tools. Work in a loop: each turn, look at the current state and the result of \
 your previous actions, then call one or more of the tools available to you to make \
