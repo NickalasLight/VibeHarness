@@ -46,7 +46,7 @@ def build_client(spec: ModelSpec, config: Config) -> LLMClient:
         from .llamacpp import LlamaCppClient   # local import: keep llamacpp optional
         return LlamaCppClient(_local_config(config, spec, provider))
     if provider.kind == OPENAI_COMPATIBLE:
-        return _build_api_client(spec, provider)
+        return _build_api_client(spec, provider, config)
     raise ValueError(f"provider {provider.name!r} has unknown kind {provider.kind!r}")
 
 
@@ -76,7 +76,8 @@ def _local_config(config: Config, spec: ModelSpec, provider: Provider) -> Config
     return replace(config, **overrides)
 
 
-def _build_api_client(spec: ModelSpec, provider: Provider) -> LLMClient:
+def _build_api_client(spec: ModelSpec, provider: Provider,
+                      config: "Config | None" = None) -> LLMClient:
     """Build an OpenAI-compatible API client via :func:`providers.make_api_client`.
 
     Routing through ``make_api_client`` keeps ONE place constructing the API client (key
@@ -89,6 +90,11 @@ def _build_api_client(spec: ModelSpec, provider: Provider) -> LLMClient:
     # ``make_api_client(name, model)`` — preserving the historical call shape (and the
     # escalation path's mock contract).
     extra = {"temperature": temperature} if temperature is not None else {}
+    # ISSUE #198: forward the run's browser User-Agent so API requests carry it (reduces
+    # provider 429 rate-limiting). Forwarded only when a Config is supplied, so the
+    # escalation path's two-argument mock contract (name, model) is preserved.
+    if config is not None:
+        extra["user_agent"] = config.request_user_agent
     return _providers.make_api_client(spec.provider, spec.model or None, **extra)
 
 

@@ -24,8 +24,10 @@ import json
 from dataclasses import dataclass
 
 from .codec import DecodeConstraint
+from .config import BROWSER_USER_AGENT
 from .llm import Decision, LLMClient, TokenSink
 from .providers import ApiProviderConfig
+from .retry import RetryPolicy, TRANSIENT_STATUS, parse_retry_after, retry_request
 
 
 class ApiUnavailable(RuntimeError):
@@ -62,13 +64,18 @@ class ApiLLMClient(LLMClient):
     def __init__(self, provider: ApiProviderConfig, api_key: str, model: str,
                  temperature: float = 0.3, timeout: int = 600,
                  price_per_1k_in: float = 0.00015,
-                 price_per_1k_out: float = 0.00015):
+                 price_per_1k_out: float = 0.00015,
+                 user_agent: str | None = None,
+                 retry_policy: "RetryPolicy | None" = None):
         self._provider = provider
         self._model = model
         self._temperature = temperature
         self._timeout = timeout
         self._price_per_1k_in = price_per_1k_in
         self._price_per_1k_out = price_per_1k_out
+        # ISSUE #198: browser-like UA (reduces z.ai 429s) + universal transient-error retry.
+        self._user_agent = user_agent or BROWSER_USER_AGENT
+        self._retry_policy = retry_policy or RetryPolicy()
         # cumulative token counters (updated after each call)
         self.tokens_in: int = 0
         self.tokens_out: int = 0
@@ -80,7 +87,8 @@ class ApiLLMClient(LLMClient):
                 "install it with `pip install openai` (or `pip install vibeharness[api]`)."
             ) from e
         self._client = OpenAI(api_key=api_key, base_url=provider.base_url,
-                              timeout=timeout)
+                              timeout=timeout,
+                              default_headers={"User-Agent": self._user_agent})
 
     def cost_usd(self) -> float:
         """Estimated USD cost for all API calls made via this client so far."""
@@ -164,8 +172,16 @@ class ApiLLMClient(LLMClient):
         if stop:
             kwargs["stop"] = list(stop)
         try:
-            stream = self._client.chat.completions.create(
-                stream=True, stream_options={"include_usage": True}, **kwargs)
+            # ISSUE #198: retry the request on transient failures (429/5xx/408 + transport
+            # errors) with exponential backoff + jitter, honoring Retry-After. We retry the
+            # *create* call (where the provider returns a 429/5xx status, before any tokens
+            # stream) so the token tally is never double-counted on a retry.
+            stream = retry_request(
+                lambda: self._client.chat.completions.create(
+                    stream=True, stream_options={"include_usage": True}, **kwargs),
+                is_retryable=_is_retryable, retry_after=_retry_after_of,
+                status_of=_status_of, policy=self._retry_policy,
+                description=f"{self._provider.name} chat (stream, model={self._model})")
             parts: list[str] = []
             reasoning_parts: list[str] = []
             usage_seen = False
@@ -221,7 +237,11 @@ class ApiLLMClient(LLMClient):
         if stop:
             kwargs["stop"] = list(stop)
         try:
-            resp = self._client.chat.completions.create(**kwargs)
+            resp = retry_request(
+                lambda: self._client.chat.completions.create(**kwargs),
+                is_retryable=_is_retryable, retry_after=_retry_after_of,
+                status_of=_status_of, policy=self._retry_policy,
+                description=f"{self._provider.name} chat (model={self._model})")
         except Exception as e:
             raise ApiUnavailable(
                 f"{self._provider.name} API call failed "
@@ -302,6 +322,40 @@ def _recover_json(text: str) -> str:
                         break
                     return candidate
     return ""
+
+
+# --- openai-SDK exception classification for retry.retry_request (issue #198) ----------
+# Ground-truthed against the installed openai==1.63.2: APIStatusError carries
+# ``.status_code`` and ``.response`` (an httpx.Response with ``.headers``); RateLimitError
+# (429), InternalServerError (5xx) and the 4xx errors are its subclasses. APIConnectionError
+# / APITimeoutError are transport failures with no status. We retry transient statuses
+# (TRANSIENT_STATUS) + transport errors and surface real 4xx client errors immediately.
+def _status_of(exc: Exception) -> "int | None":
+    return getattr(exc, "status_code", None)
+
+
+def _is_retryable(exc: Exception) -> bool:
+    try:
+        import openai
+    except ImportError:   # pragma: no cover - openai always present where this runs
+        return False
+    if isinstance(exc, (openai.APITimeoutError, openai.APIConnectionError)):
+        return True   # transport: read timeout / connection reset
+    if isinstance(exc, openai.APIStatusError):
+        return exc.status_code in TRANSIENT_STATUS
+    return False
+
+
+def _retry_after_of(exc: Exception) -> "float | None":
+    resp = getattr(exc, "response", None)
+    headers = getattr(resp, "headers", None)
+    if not headers:
+        return None
+    try:
+        value = headers.get("retry-after")
+    except Exception:
+        return None
+    return parse_retry_after(value)
 
 
 def _is_streaming_unsupported(exc: Exception) -> bool:

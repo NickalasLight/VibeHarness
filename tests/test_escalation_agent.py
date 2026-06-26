@@ -61,7 +61,9 @@ class EscalationAgentTest(unittest.TestCase):
             agent.run("loop")
         # ISSUE #197: default escalator is now deepseek / deepseek-v4-flash (zhipuai key
         # is account rate-limited → 429, so the old default silently no-oped).
-        mk.assert_called_once_with("deepseek", "deepseek-v4-flash")
+        # ISSUE #198: the escalation client also carries the run's browser User-Agent.
+        mk.assert_called_once_with("deepseek", "deepseek-v4-flash",
+                                   user_agent=cfg.request_user_agent)
         self.assertIs(agent._client, swapped)        # client replaced in-place
 
     def test_escalation_disabled_does_not_swap(self):

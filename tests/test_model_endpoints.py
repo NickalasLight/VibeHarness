@@ -148,13 +148,16 @@ class BuildClientTest(unittest.TestCase):
         with mock.patch.object(providers, "make_api_client", return_value=sentinel) as mk:
             client = build_client(spec, Config())
         self.assertIs(client, sentinel)
-        mk.assert_called_once_with("zhipuai", "glm-4.7-flash")
+        # issue #198: build_client now forwards the run's browser User-Agent.
+        mk.assert_called_once_with("zhipuai", "glm-4.7-flash",
+                                   user_agent=Config().request_user_agent)
 
     def test_openai_compatible_forwards_temperature_override(self):
         spec = ModelSpec(provider="zhipuai", model="glm-4.7-flash", temperature=0.2)
         with mock.patch.object(providers, "make_api_client") as mk:
             build_client(spec, Config())
-        mk.assert_called_once_with("zhipuai", "glm-4.7-flash", temperature=0.2)
+        mk.assert_called_once_with("zhipuai", "glm-4.7-flash", temperature=0.2,
+                                   user_agent=Config().request_user_agent)
 
     def test_openai_compatible_missing_key_raises(self):
         spec = ModelSpec(provider="zhipuai", model="glm-4.7-flash")
