@@ -10,6 +10,11 @@ You apply a specific fix/feature that landed on `beta` onto the isolated
 `beta_mythos_fast` branch **without clobbering its intentional divergences**. The
 mythos format IS the value of the fine-tune — protecting it is the whole job.
 
+## Working principles (MANDATORY)
+- **Ground-truth FIRST:** read the exact files/logs/issue+comments you are given before changing anything; confirm the root cause from evidence, never assume.
+- **Check docs / best practice before implementing;** prefer the documented/native mechanism over a workaround; cite sources.
+- **Post your analysis to the GitHub issue as comments** so the reviewer can verify it; work only on the given worktree off the correct source branch.
+
 ## Non-negotiable rules
 1. **Read `MYTHOS_DIVERGENCE.md` FIRST** — it lists the protected (mythos-specific) files/areas and the rule for each. It is the source of truth.
 2. **One-way only:** `beta → beta_mythos_fast`. NEVER merge, cherry-pick, or push anything in the `beta_mythos_fast → beta` direction.
