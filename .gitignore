@@ -14,3 +14,13 @@ build/
 dist/
 .playwright-mcp/
 
+# Runtime state / scratch artifacts (do not commit)
+loop_state.json
+multi_job_state.json
+metrics_*.json
+run_iter*.ps1
+
+# Saved system-prompt snapshots — keep these .txt files (override the *.txt ignore above)
+!system_prompts/
+!system_prompts/*.txt
+
