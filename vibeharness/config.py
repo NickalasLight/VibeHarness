@@ -414,6 +414,36 @@ class ModelToolPolicy:
 # Sources (cited in the PR): https://docs.z.ai/guides/capabilities/function-calling ,
 #   https://docs.aimlapi.com/api-references/text-models-llm/zhipu/glm-4.7 ,
 #   https://z.ai/blog/glm-4.6 , arXiv:2602.07359.
+#
+# DeepSeek API models — `json` (schema-constrained) + ground-truthed caps (issue #182):
+#   DeepSeek is OpenAI-compatible (base_url https://api.deepseek.com). As of DeepSeek-V3.1
+#   (release 2025-08-21) BOTH exposed model ids map to V3.1: `deepseek-chat` is the
+#   non-thinking mode, `deepseek-reasoner` is the thinking mode, 128K context for both.
+#     deepseek-chat (V3.1 non-thinking) — supports function/tool calling (the official
+#       function-calling guide's example uses exactly model="deepseek-chat"). Single-shot
+#       OpenAI-compatible path → the `json` schema-constrained codec (the native-only hermes
+#       codec emits free prose on this path — the #179 root cause), NOT hermes.
+#     deepseek-reasoner (V3.1 thinking) — TOOL-CALLING GROUND TRUTH (issue #182): the LEGACY
+#       R1 reasoning model did NOT support function calling (old reasoning_model guide listed
+#       Function Calling as UNSUPPORTED), but V3.1 CHANGED this — the current Thinking-Mode
+#       guide states: "The DeepSeek model's thinking mode supports tool calls. Before
+#       outputting the final answer, the model can perform multiple turns of reasoning and
+#       tool calls." It streams its chain-of-thought SEPARATELY as `reasoning_content`
+#       (consumed as REASONING by ApiLLMClient, never fed to the tool-call parser — exactly
+#       the GLM path), so it gets the same `json` codec. CAVEAT (documented, sidestepped): in
+#       NATIVE multi-turn tool calling the assistant's `reasoning_content` MUST be replayed in
+#       every subsequent request or the API returns 400; the harness uses the SINGLE-SHOT
+#       constrained-JSON protocol (it never sends `tools` and never replays an assistant
+#       reasoning_content — it re-derives state from the live page snapshot each turn), so the
+#       400 condition cannot arise. Reasoner is given a slightly more conservative cap because
+#       it reasons BETWEEN calls (parallel batching helps a thinking model less).
+#   Caps are HARNESS-side policy: DeepSeek documents NO hard per-request tool-count limit, so
+#   we stay conservative (best practice: parallelise only truly independent calls), modestly
+#   above the local-model default and below GLM's flagship cap given the single-shot path.
+# Sources (cited in the PR): https://api-docs.deepseek.com/guides/function_calling ,
+#   https://api-docs.deepseek.com/guides/thinking_mode (reasoner tool-call support) ,
+#   https://api-docs.deepseek.com/guides/reasoning_model (legacy R1: FC unsupported) ,
+#   https://api-docs.deepseek.com/news/news250821 (V3.1 release: 128K ctx, chat/reasoner modes).
 MODEL_TOOL_POLICIES: dict[str, ModelToolPolicy] = {
     "qwen3:4b": ModelToolPolicy(
         codec="hermes", max_actions_per_turn=3,
@@ -427,6 +457,15 @@ MODEL_TOOL_POLICIES: dict[str, ModelToolPolicy] = {
     "glm-5.2": ModelToolPolicy(
         codec="json", max_actions_per_turn=8,
         rationale="newest flagship long-horizon agentic line (cap 8)"),
+    "deepseek-chat": ModelToolPolicy(
+        codec="json", max_actions_per_turn=6,
+        rationale="DeepSeek-V3.1 non-thinking; OpenAI-compat function calling; "
+                  "no documented per-request tool cap → conservative json cap 6"),
+    "deepseek-reasoner": ModelToolPolicy(
+        codec="json", max_actions_per_turn=4,
+        rationale="DeepSeek-V3.1 thinking; tool calls supported since V3.1 (was unsupported "
+                  "on legacy R1); reasoning_content consumed as reasoning; cap 4 (reasons "
+                  "between calls)"),
 }
 
 # Family fallback for any other z.ai/GLM API model id (e.g. a future glm-4.7-air): the API
@@ -437,13 +476,23 @@ _GLM_FAMILY_POLICY = ModelToolPolicy(
     codec="json", max_actions_per_turn=5,
     rationale="unrecognised GLM/z.ai model: API JSON codec + conservative cap")
 
+# Family fallback for any other DeepSeek API model id (issue #182) — e.g. a future
+# `deepseek-v4-flash` (the V4 successor the deepseek-chat/deepseek-reasoner aliases now point
+# at). The OpenAI-compatible single-shot path always needs a JSON-schema-constrained codec
+# (never the native-only hermes), so an unrecognised DeepSeek model resolves to the
+# conservative `json` + 5 policy rather than silently inheriting the local `hermes` default.
+_DEEPSEEK_FAMILY_POLICY = ModelToolPolicy(
+    codec="json", max_actions_per_turn=5,
+    rationale="unrecognised DeepSeek model: API JSON codec + conservative cap")
+
 
 def model_tool_policy(model: str | None) -> ModelToolPolicy | None:
-    """Return the :class:`ModelToolPolicy` for ``model`` (issues #179/#178), or ``None``.
+    """Return the :class:`ModelToolPolicy` for ``model`` (issues #179/#178/#182), or ``None``.
 
-    Exact (case-insensitive) match in :data:`MODEL_TOOL_POLICIES` wins; otherwise any GLM /
-    z.ai family id (``glm`` prefix) falls back to the conservative API policy so a new GLM
-    variant is still driven with a schema-constrained codec. Everything else returns
+    Exact (case-insensitive) match in :data:`MODEL_TOOL_POLICIES` wins; otherwise an API
+    family id falls back to a conservative schema-constrained policy so a new variant is still
+    driven with the `json` codec (never the native-only hermes): a ``glm`` prefix → the GLM
+    family policy, a ``deepseek`` prefix → the DeepSeek family policy. Everything else returns
     ``None`` → the caller uses the :class:`Config` fallback (no behaviour change)."""
     if not model:
         return None
@@ -453,6 +502,8 @@ def model_tool_policy(model: str | None) -> ModelToolPolicy | None:
             return policy
     if key.startswith("glm"):
         return _GLM_FAMILY_POLICY
+    if key.startswith("deepseek"):
+        return _DEEPSEEK_FAMILY_POLICY
     return None
 
 

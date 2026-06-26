@@ -77,6 +77,22 @@ REGISTRY: dict[str, Provider] = {
         api_key_env="ZHIPUAI_API_KEY",
         model="glm-5.2",
     ),
+    # OpenAI-compatible API: DeepSeek (issue #182). Coordinates only, NO key.
+    # base_url is the official root the DeepSeek docs use; the OpenAI SDK appends
+    # ``/chat/completions`` to it. ``/v1`` is an OPTIONAL alias DeepSeek accepts for OpenAI
+    # compatibility and is unrelated to the model version — the bare root is what the
+    # official examples show, so we use it. Default model is the non-thinking V3.1
+    # ``deepseek-chat`` (full function-calling support). Ground truth (cited in the PR):
+    #   https://api-docs.deepseek.com/                       (base_url + "Your First API Call")
+    #   https://api-docs.deepseek.com/guides/function_calling (deepseek-chat tool calling)
+    #   https://api-docs.deepseek.com/news/news250821         (V3.1: 128K ctx; chat=non-think)
+    "deepseek": Provider(
+        name="deepseek",
+        kind=OPENAI_COMPATIBLE,
+        base_url="https://api.deepseek.com",
+        api_key_env="DEEPSEEK_API_KEY",
+        model="deepseek-chat",
+    ),
 }
 
 

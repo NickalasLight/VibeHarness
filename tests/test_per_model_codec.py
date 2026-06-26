@@ -42,6 +42,21 @@ class ModelPolicyTest(unittest.TestCase):
             p = model_tool_policy(m)
             self.assertEqual((p.codec, p.max_actions_per_turn), ("json", 8), m)
 
+    def test_deepseek_chat_is_json_6(self):
+        # Issue #182: DeepSeek-V3.1 non-thinking; OpenAI-compat function calling → json codec.
+        p = model_tool_policy("deepseek-chat")
+        self.assertEqual((p.codec, p.max_actions_per_turn), ("json", 6))
+
+    def test_deepseek_reasoner_is_json_4(self):
+        # Issue #182: V3.1 thinking mode supports tool calls; reasoning_content as reasoning.
+        p = model_tool_policy("deepseek-reasoner")
+        self.assertEqual((p.codec, p.max_actions_per_turn), ("json", 4))
+
+    def test_unknown_deepseek_family_falls_back_to_json(self):
+        # A future DeepSeek id (e.g. deepseek-v4-flash) still gets the schema-constrained codec.
+        p = model_tool_policy("deepseek-v4-flash")
+        self.assertEqual(p.codec, "json")
+
     def test_case_insensitive_exact_match(self):
         self.assertIs(model_tool_policy("QWEN3:4B"), model_tool_policy("qwen3:4b"))
 
@@ -117,6 +132,19 @@ class CliResolutionTest(unittest.TestCase):
         cfg = self._cfg("task", "--base-provider", "zhipuai", "--base-model", "glm-4.7")
         self.assertEqual(cfg.codec, "json")
         self.assertEqual(cfg.max_actions_per_turn, 8)
+
+    def test_deepseek_chat_base_provider_switches_to_json_and_cap(self):
+        # Issue #182: --base-provider deepseek --base-model deepseek-chat → json codec, cap 6.
+        cfg = self._cfg("task", "--base-provider", "deepseek",
+                        "--base-model", "deepseek-chat")
+        self.assertEqual(cfg.codec, "json")
+        self.assertEqual(cfg.max_actions_per_turn, 6)
+
+    def test_deepseek_reasoner_base_cap_is_4(self):
+        cfg = self._cfg("task", "--base-provider", "deepseek",
+                        "--base-model", "deepseek-reasoner")
+        self.assertEqual(cfg.codec, "json")
+        self.assertEqual(cfg.max_actions_per_turn, 4)
 
     def test_explicit_codec_flag_wins_over_per_model(self):
         cfg = self._cfg("task", "--base-provider", "zhipuai",
