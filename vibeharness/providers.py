@@ -160,7 +160,8 @@ def api_key_present(provider: "ApiProviderConfig | Provider") -> bool:
 
 
 def make_api_client(provider_name: str, model_override: str | None = None,
-                    *, temperature: float | None = None, timeout: int | None = None):
+                    *, temperature: float | None = None, timeout: int | None = None,
+                    user_agent: str | None = None):
     """Construct an :class:`~vibeharness.api_llm.ApiLLMClient` for ``provider_name``.
 
     The api key is read (at this moment, never stored here) from the provider's
@@ -187,4 +188,6 @@ def make_api_client(provider_name: str, model_override: str | None = None,
         extra["temperature"] = temperature
     if timeout is not None:
         extra["timeout"] = timeout
+    if user_agent is not None:        # issue #198 — browser UA from Config when supplied
+        extra["user_agent"] = user_agent
     return ApiLLMClient(provider=provider, api_key=key, model=model, **extra)

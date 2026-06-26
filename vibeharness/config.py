@@ -3,6 +3,18 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 
+# Browser-like User-Agent for the OpenAI-compatible API client (issue #198). Community
+# reports (maintainer-shared SillyTavernAI thread on GLM-5/5.1 rate-limiting) indicate
+# z.ai/GLM rate-limits requests carrying default SDK User-Agents (e.g. "OpenAI/Python …")
+# more aggressively than browser-like ones, so a current Firefox UA reduces spurious 429s.
+# The exact string is a real, current desktop Firefox UA (verified June 2026 via
+# whatismybrowser.com's "latest user agent" reference).
+BROWSER_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:152.0) "
+    "Gecko/20100101 Firefox/152.0"
+)
+
+
 @dataclass(frozen=True)
 class ModelSpec:
     """Which model drives one agent role, and how to sample it (issue #163).
@@ -233,6 +245,9 @@ class Config:
     ollama_keep_alive: str = "30m"
     llamacpp_url: str = "http://127.0.0.1:8080"
     request_timeout: int = 600
+    # ISSUE #198: browser-like User-Agent sent on OpenAI-compatible API requests to reduce
+    # provider (z.ai/GLM) 429 rate-limiting of default SDK User-Agents. See BROWSER_USER_AGENT.
+    request_user_agent: str = BROWSER_USER_AGENT
 
     # web toolset (Playwright Agent CLI)
     web_session: str = "vibe"

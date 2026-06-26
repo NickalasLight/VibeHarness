@@ -228,6 +228,99 @@ class AdapterShapeTest(unittest.TestCase):
         self.assertEqual(dict(tc.function.arguments), {"target": "e1"})
 
 
+class _RetryCompletions:
+    """Fake completions whose ``create`` raises a queued sequence of errors, then streams
+    ``final_pieces``. Used to drive the issue-#198 retry path with REAL openai exceptions."""
+
+    def __init__(self, errors, final_pieces=("[]",)):
+        self._errors = list(errors)
+        self._final = list(final_pieces)
+        self.calls = []
+
+    def create(self, **kwargs):
+        self.calls.append(kwargs)
+        if self._errors:
+            raise self._errors.pop(0)
+        return iter([_stream_chunk(p) for p in self._final])
+
+
+def _http_error(cls, status, headers=None):
+    """Build a real openai ``APIStatusError`` subclass instance with a status + headers."""
+    import httpx
+    req = httpx.Request("POST", "https://api.z.ai/api/paas/v4/chat/completions")
+    resp = httpx.Response(status, headers=headers or {}, request=req)
+    return cls(f"HTTP {status}", response=resp, body=None)
+
+
+# Zero-wait policy so retry tests are instant.
+from vibeharness.retry import RetryError, RetryPolicy
+_FAST = RetryPolicy(max_attempts=10, base_delay=0.0, max_delay=0.0)
+
+
+def _retry_client(completions):
+    fake = FakeOpenAI(completions)
+    with mock.patch("openai.OpenAI", fake):
+        c = ApiLLMClient(provider=PROVIDER, api_key="secret", model="glm-5.2",
+                         retry_policy=_FAST)
+    return c, fake
+
+
+class BrowserUserAgentTest(unittest.TestCase):
+    def test_default_browser_ua_header_on_client(self):
+        from vibeharness.config import BROWSER_USER_AGENT
+        _, fake = _client(FakeCompletions(stream_pieces=["[]"]))
+        headers = fake.last_kwargs["default_headers"]
+        self.assertEqual(headers["User-Agent"], BROWSER_USER_AGENT)
+        self.assertTrue(headers["User-Agent"].startswith("Mozilla/5.0"))
+
+    def test_custom_ua_override_forwarded(self):
+        fake = FakeOpenAI(FakeCompletions(stream_pieces=["[]"]))
+        with mock.patch("openai.OpenAI", fake):
+            ApiLLMClient(provider=PROVIDER, api_key="k", model="m",
+                         user_agent="Custom/1.0")
+        self.assertEqual(fake.last_kwargs["default_headers"]["User-Agent"], "Custom/1.0")
+
+
+class RetryIntegrationTest(unittest.TestCase):
+    def test_retry_then_success_on_429(self):
+        import openai
+        err = _http_error(openai.RateLimitError, 429, {"retry-after": "0"})
+        comp = _RetryCompletions([err, err], final_pieces=['[{"tool":"x"}]'])
+        client, _ = _retry_client(comp)
+        d = client.decide("S", "U", SCHEMA)
+        self.assertEqual(d.action_json, '[{"tool":"x"}]')
+        self.assertEqual(len(comp.calls), 3)        # 2 failures + 1 success
+
+    def test_no_retry_on_4xx_client_error(self):
+        import openai
+        err = _http_error(openai.BadRequestError, 400)
+        comp = _RetryCompletions([err])
+        client, _ = _retry_client(comp)
+        with self.assertRaises(ApiUnavailable):
+            client.decide("S", "U", SCHEMA)
+        self.assertEqual(len(comp.calls), 1)        # surfaced immediately, no retry
+
+    def test_persistent_429_exhausts_and_raises_clear_error(self):
+        import openai
+        err = _http_error(openai.RateLimitError, 429, {"retry-after": "0"})
+        comp = _RetryCompletions([err] * 12)
+        client, _ = _retry_client(comp)
+        with self.assertRaises(ApiUnavailable) as ctx:
+            client.decide("S", "U", SCHEMA)
+        self.assertEqual(len(comp.calls), 10)       # max_attempts
+        self.assertIn("after 10 attempts", str(ctx.exception))
+
+    def test_transport_error_is_retried(self):
+        import httpx, openai
+        req = httpx.Request("POST", "https://api.z.ai/")
+        err = openai.APITimeoutError(request=req)
+        comp = _RetryCompletions([err], final_pieces=["[]"])
+        client, _ = _retry_client(comp)
+        d = client.decide("S", "U", SCHEMA)
+        self.assertEqual(d.action_json, "[]")
+        self.assertEqual(len(comp.calls), 2)
+
+
 class StripFencesTest(unittest.TestCase):
     def test_plain_passthrough(self):
         self.assertEqual(_strip_fences('  [1,2] '), "[1,2]")
