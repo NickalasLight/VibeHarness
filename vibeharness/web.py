@@ -952,13 +952,6 @@ class GotoTool(_WebTool):
         return ["goto", args["url"]]
 
 
-# A wizard "go to the PREVIOUS step" control — matched on its accessible name. Clicking
-# it abandons the current step's progress, so for a forward fill-and-submit task it is
-# almost always a mistake (iter-2: the model clicked "← Back" instead of setting the date,
-# bouncing page2->page1 and oscillating forever).
-_BACK_BUTTON_RE = re.compile(r'button\s+"[^"]*\b(?:back|previous|prev)\b[^"]*"', re.IGNORECASE)
-
-
 class ClickTool(_WebTool):
     name = "click"
     description = "Click an element (a link, button, checkbox, …). " + _REF_NOTE
@@ -967,45 +960,76 @@ class ClickTool(_WebTool):
     _validate_target = True
     _detect_dom_change = True
 
+    # Hard safety ceiling on `repeat`: a single call clicking more than this many times
+    # almost certainly reflects a misparsed count and would wedge the whole turn (each
+    # click carries a 2s settle). Generous enough for real multi-click widgets (a
+    # 12-month date-picker rewind, a stepper) while still bounding a runaway.
+    _MAX_REPEAT = 100
+
     @property
     def parameters(self):
-        return [Param("target", "string", "Element ref (e.g. 'e163') from the current page snapshot to "
-                      "click. Must be a ref from the snapshot — never a guessed CSS selector/class/id.")]
+        return [
+            Param("target", "string", "Element ref (e.g. 'e163') from the current page snapshot to "
+                  "click. Must be a ref from the snapshot — never a guessed CSS selector/class/id."),
+            Param("repeat", "integer",
+                  "How many times to click this SAME target in succession, in one call, with the "
+                  "standard ~2s settle after each click. Default 1. Use a count > 1 to drive a "
+                  "multi-click widget in a single call — e.g. a date-picker 'Previous month'/'Next "
+                  "month' button or a numeric stepper — instead of issuing many separate click "
+                  "calls. Stops early if a click fails (e.g. the target disappears).",
+                  required=False, default=1),
+        ]
 
     def _build(self, args):
         return ["click", args["target"]]
 
     # Post-click settle: overlay panels and async renders (e.g. fill.co.at "Bewirb dich"
     # form) take ~1-2 s to appear. Sleeping here ensures the end-of-turn 'Latest page
-    # state' snapshot (taken ~1 s after all actions) sees a fully-rendered page.
+    # state' snapshot (taken ~1 s after all actions) sees a fully-rendered page. When
+    # repeat > 1 this settle is applied AFTER EACH click (commit 6a131bf; issue #206).
     _POST_CLICK_SETTLE_S: float = 2.0
 
+    def _parse_repeat(self, raw) -> int | ToolResult:
+        """Coerce the optional ``repeat`` arg to a positive int (default 1).
+
+        0/negative collapse to a single click; a non-integer is a clear user error.
+        Clamped to :attr:`_MAX_REPEAT` so a misparsed count can't wedge the turn.
+        """
+        if raw is None or raw == "":
+            return 1
+        try:
+            n = int(raw)
+        except (TypeError, ValueError):
+            return ToolResult(False, f"you called `{self.name}` with a non-integer repeat "
+                              f"'{raw}'. Pass a positive integer, e.g. repeat=3.")
+        if n < 1:
+            return 1
+        return min(n, self._MAX_REPEAT)
+
     def run(self, args: dict) -> ToolResult:
-        # BACK-BUTTON GUARD (iter-2): block a click on the wizard "← Back"/"Previous"
-        # control. The task is forward-only (fill every step, then Continue/Submit); going
-        # back discards the current step and caused a page2->page1->page2 oscillation when
-        # the model used Back instead of filling the date and clicking Continue. Steer it to
-        # the right action (set any remaining field — especially the date picker — then click
-        # Continue). Fail open if we can't read the snapshot.
-        target = normalize_ref(args.get("target", "") or "")
-        if target is not None:
-            snap = capture_page_snapshot_raw(self._cli) or ""
-            for line in snap.splitlines():
-                if f"[ref={target}]" in line and _BACK_BUTTON_RE.search(line):
-                    date_ref = SelectOptionTool._find_date_combobox_ref(snap)
-                    date_hint = (f" If the 'Earliest available start date' is not set yet, "
-                                 f"call select_option(target='{date_ref}', "
-                                 f"value='2026-07-21') first." if date_ref else "")
-                    return ToolResult(
-                        False,
-                        f"I did NOT click '{target}' — it is the BACK/Previous button, which "
-                        f"would discard this step's progress and send you to an earlier step. "
-                        f"Do not go back. Instead, fill any remaining required field on THIS "
-                        f"step, then click the 'Continue →' button to advance.{date_hint}")
-        result = self._run_impl(args)
-        if result.ok:
+        # repeat (default 1): click the SAME target N times in succession in ONE tool call,
+        # with the 2s settle AFTER EACH click (#206). Lets a capable model drive multi-click
+        # widgets (date-picker "Previous month", steppers) in one call, and sidesteps the
+        # consecutive-duplicate dedup (#201/#204) which would collapse N identical calls.
+        repeat = self._parse_repeat(args.get("repeat"))
+        if isinstance(repeat, ToolResult):
+            return repeat
+        last: ToolResult | None = None
+        done = 0
+        for _ in range(repeat):
+            last = self._run_impl(args)
+            if not last.ok:
+                if done:
+                    # Some clicks landed before one failed mid-sequence — report both.
+                    return ToolResult(False, f"clicked '{args.get('target')}' {done} time(s), then "
+                                      f"click {done + 1} failed: {last.observation}")
+                return last
+            done += 1
             time.sleep(self._POST_CLICK_SETTLE_S)
-        return result
+        if repeat > 1 and last is not None:
+            return ToolResult(True, f"clicked '{args.get('target')}' {done} times. Last "
+                              f"result:\n{last.observation}")
+        return last
 
 
 class FillTool(_WebTool):
