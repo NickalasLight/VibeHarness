@@ -43,70 +43,148 @@ from .advisor import VibeThinkerAdvisor
 
 
 def build_parser() -> argparse.ArgumentParser:
-    saved_temp = Settings.apply(Config()).temperature
+    effective = Settings.apply(Config())
+    saved_temp = effective.temperature
     epilog = f"""\
 examples:
   vibe "create a README and fill in a project overview"
-  vibe --temp 1.0 "draft notes.txt"        run once at a different temperature
-  vibe --max-steps 30 "refactor this dir"  allow more steps for a big task
-  vibe "task" --codec tagged_json          use a different tool-call wire format
+  vibe --temp 1.0 "draft notes.txt"          run once at a different temperature
+  vibe --max-steps 30 "refactor this dir"    allow more steps for a big task
+  vibe --agent web "find the top 5 HN posts" drive a real browser (web toolset)
+  vibe --toolset web,fs "scrape & save"      compose toolsets for one run
+  vibe --task-file task.txt                  read a long task from a file
+  vibe "task" --codec tagged_json            use a different tool-call wire format
+  vibe --model qwen3:4b "..."                pick a different Ollama model
+  vibe --num-ctx 16384 --top-p 0.9 "..."     tune the context window / sampling
 
-manage persistent defaults (saved to ~/.vibeharness/settings.json):
-  vibe --set temp 0.5                      change the default temperature
-  vibe --set max-steps 25                  change the default step budget
-  vibe --show-config                       show current settings
-  vibe --reset-config                      restore built-in defaults
+inspect without running a task:
+  vibe --version                             package version + the source path it runs from
+  vibe --list-agents                         agent types and their default toolset(s)
+  vibe --list-toolsets                       toolsets and the tools in each
+  vibe --print-system                        the exact system prompt the model receives
+  vibe --show-config                         effective defaults + saved overrides
 
-settable keys: {', '.join(settable_keys())}
-current default temperature: {saved_temp}
+per-role / API endpoints (local <-> hosted; mix and match):
+  # run the base agent locally but VALIDATE with a hosted GLM model (needs the API key):
+  set ZHIPUAI_API_KEY=...                     (PowerShell: $env:ZHIPUAI_API_KEY="...")
+  vibe --set codec hermes "fill the signup form"
+  # (per-role --base-provider/--base-model/--validator-provider/--validator-model flags
+  #  land with #163/PR #168; until then the API validator is configured in config.py:
+  #  validation_provider=zhipuai, validation_model=glm-5.2.)
+
+manage persistent defaults (saved to {Settings.path()}):
+  vibe --set temp 0.5                        change the default temperature
+  vibe --set max-steps 25                    change the default step budget
+  vibe --set codec hermes                    change the default tool-call format
+  vibe --set num-ctx 16384                   change the default context window
+  vibe --show-config                         show current settings
+  vibe --reset-config                        restore built-in defaults
+
+settable keys (use with --set KEY VALUE): {', '.join(settable_keys())}
+resolution order: built-in defaults < saved settings < per-run flags
+current effective defaults: model={effective.model}, codec={effective.codec}, """ \
+        f"""temp={saved_temp}, top_p={effective.top_p}, top_k={effective.top_k}, """ \
+        f"""num_ctx={effective.num_ctx}, max_steps={effective.max_steps}
 """
     p = argparse.ArgumentParser(
         prog="vibe",
-        description="vibe - a tiny local coding agent (VibeThinker via Ollama)",
+        description="vibe - a tiny local coding/web agent: a small model (Ollama) works a "
+                    "task one step at a time (read/write/search files or drive a real "
+                    "browser), streaming its reasoning and actions, gated by a validator.",
         epilog=epilog, formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p.add_argument("task", nargs="*", help="the task for the agent to perform (quote it)")
+    # --- task input ---
+    p.add_argument("task", nargs="*",
+                   help="the task for the agent to perform; quote it as one argument")
     p.add_argument("--task-file", default=None, metavar="PATH",
-                   help="read the task text from a file instead of the command line")
-    p.add_argument("--temp", type=float, default=None, metavar="T",
-                   help="sampling temperature for this run only")
-    p.add_argument("--model", default=None, metavar="NAME",
-                   help="Ollama model name for this run only")
-    p.add_argument("--codec", default=None, metavar="CODEC",
-                   help="tool-call wire format for this run only; one of: "
-                        f"{', '.join(available_codecs())} (default: {Config.codec})")
-    p.add_argument("--max-steps", type=int, default=None, metavar="N",
-                   help="max turns for this run only (0 = unlimited, until finish)")
-    p.add_argument("--max-actions-per-turn", type=int, default=None, metavar="N",
-                   help="max tool calls the model may emit per turn for this run only")
+                   help="read the task text from a file instead of the command line "
+                        "(useful for long or multi-line tasks)")
     p.add_argument("--workdir", default=None, metavar="DIR",
-                   help="working directory (default: current terminal directory)")
+                   help="directory the agent operates in / treats as its workspace "
+                        "(default: the current terminal directory); created if missing")
+
+    # --- model / sampling (per-run overrides; persist with --set) ---
+    p.add_argument("--model", default=None, metavar="NAME",
+                   help="Ollama model tag to run this task with "
+                        f"(default: {Config.model}); overrides the saved/default model")
+    p.add_argument("--temp", type=float, default=None, metavar="T",
+                   help=f"sampling temperature for this run (default: {Config.temperature}); "
+                        "higher = more diverse/creative, lower = more deterministic")
+    p.add_argument("--top-p", dest="top_p", type=float, default=None, metavar="P",
+                   help=f"nucleus sampling top-p for this run (default: {Config.top_p})")
+    p.add_argument("--top_k", type=int, default=None, metavar="K",
+                   help=f"top-k sampling cutoff for this run (default: {Config.top_k}; "
+                        "0 disables the top-k filter)")
+
+    # --- tool-call format / agent / toolsets ---
+    p.add_argument("--codec", default=None, metavar="CODEC",
+                   help="tool-call wire format for this run; one of: "
+                        f"{', '.join(available_codecs())} (default: {Config.codec}). "
+                        "Controls how calls are described, decode-constrained, and parsed.")
     p.add_argument("--agent", default=None, metavar="TYPE",
                    help="agent type for this run; selects a default toolset of the same name "
-                        f"({', '.join(agent_default_toolsets())}). e.g. --agent web. "
+                        f"({', '.join(agent_default_toolsets())}), e.g. --agent web. "
                         "--toolset overrides/augments which toolset(s) are active.")
     p.add_argument("--toolset", action="append", metavar="NAME",
-                   help="toolset(s) to load; repeatable or comma-separated. Overrides/augments "
-                        "--agent's default. (default: fs). e.g. --toolset web,fs")
+                   help="toolset(s) to load; repeatable or comma-separated, overriding/"
+                        "augmenting --agent's default (default: fs). e.g. --toolset web,fs")
+
+    # --- loop / turn budgets ---
+    p.add_argument("--max-steps", type=int, default=None, metavar="N",
+                   help=f"max turns for this run (default: {Config.max_steps}; "
+                        "0 = unlimited, run until the validator passes)")
+    p.add_argument("--max-actions-per-turn", type=int, default=None, metavar="N",
+                   help="max tool calls the model may emit per turn for this run "
+                        "(default: the selected agent type's cap, else "
+                        f"{Config.max_actions_per_turn}; 0 = unlimited)")
+
+    # --- context window / token budgets ---
+    p.add_argument("--num-ctx", dest="num_ctx", type=int, default=None, metavar="N",
+                   help=f"Ollama context window in tokens for this run (default: "
+                        f"{Config.num_ctx}). The whole window is shared by the system "
+                        "prompt, chat history, the live page snapshot, and generation. "
+                        "Output is reserved up front (reason-tokens + action-tokens, "
+                        "settable via --set); the live snapshot is then sized to fit the "
+                        "remaining input budget.")
+
+    # --- web agent ---
     p.add_argument("--headless", action="store_true",
-                   help="run the web browser headless (default: headed so you can watch)")
-    p.add_argument("--advisor", action="store_true",
-                   help="enable VibeThinker advisor: after every 5 accumulated tool calls "
-                        "(counted across turns, injected at end-of-turn) VibeThinker generates "
-                        "free-text advice injected into the next Qwen turn.")
+                   help="run the web browser headless (default: headed so you can watch it)")
     p.add_argument("--web-snapshot-prose", action="store_true",
-                   help="render the live page snapshot as WebArena-style prose (pruned, "
-                        "ref-keyed) instead of raw ARIA-YAML (issue #64; A/B seam)")
-    p.add_argument("--no-color", action="store_true", help="disable colored output")
+                   help="render the live page snapshot as pruned, ref-keyed WebArena-style "
+                        "prose instead of raw ARIA-YAML (issue #64; A/B seam)")
+
+    # --- advisor ---
+    p.add_argument("--advisor", action="store_true",
+                   help="enable the advisor: after every N accumulated tool calls (counted "
+                        "across turns, injected at end-of-turn) an advisor model emits "
+                        "free-text advice injected into the next agent turn (see config "
+                        "advisor_model / advisor_interval)")
+
+    # --- output ---
+    p.add_argument("--no-color", action="store_true",
+                   help="disable ANSI colored terminal output")
+
+    # --- settings management (each exits immediately) ---
     p.add_argument("--set", nargs=2, metavar=("KEY", "VALUE"),
-                   help="persist a default, e.g. --set temp 0.5")
-    p.add_argument("--show-config", action="store_true", help="print current settings and exit")
-    p.add_argument("--reset-config", action="store_true", help="clear saved settings and exit")
-    p.add_argument("--list-toolsets", action="store_true", help="list available toolsets and exit")
-    p.add_argument("--list-agents", action="store_true", help="list available agent types and exit")
-    p.add_argument("--print-system", action="store_true", help="print the system prompt and exit")
+                   help="persist a default setting and exit, e.g. --set temp 0.5 "
+                        f"(settable keys: {', '.join(settable_keys())})")
+    p.add_argument("--show-config", action="store_true",
+                   help="print effective defaults + saved overrides, then exit")
+    p.add_argument("--reset-config", action="store_true",
+                   help="clear all saved settings (restore built-in defaults) and exit")
+
+    # --- introspection (each exits immediately, no model required) ---
+    p.add_argument("--list-toolsets", action="store_true",
+                   help="list available toolsets and the tools in each, then exit")
+    p.add_argument("--list-agents", action="store_true",
+                   help="list available agent types and their default toolset(s), then exit")
+    p.add_argument("--print-system", action="store_true",
+                   help="print the generated system prompt (honours --agent/--toolset/"
+                        "--codec) and exit")
     p.add_argument("--version", action="store_true",
-                   help="print the package version + git build identity and exit")
+                   help="print the package version, git build identity, and the absolute "
+                        "source path the running vibeharness is loaded from, then exit")
     return p
 
 
@@ -138,8 +216,38 @@ def build_identity() -> str:
     return f"vibe {__version__} (build {sha})"
 
 
+def build_source_report() -> str:
+    """A multi-line report: build identity + the ABSOLUTE source path the running
+    ``vibeharness`` package is imported from, plus a warning when that path is not a
+    git checkout of this repo.
+
+    The whole point (issue #175): a ``vibe`` installed editable from a STALE, unrelated
+    clone runs that clone's code while ``import vibeharness`` from the cwd may resolve
+    elsewhere — so the only reliable way to know what you are actually running is to
+    print the on-disk location of the loaded package. Show it, and flag it loudly if it
+    is not a git working tree (i.e. a wheel install or a detached copy that cannot report
+    a commit).
+    """
+    import vibeharness as _pkg
+
+    pkg_dir = Path(_pkg.__file__).resolve().parent       # .../vibeharness
+    repo_dir = pkg_dir.parent                            # repo root (editable checkout)
+    lines = [
+        build_identity(),
+        f"source:  {pkg_dir}",
+        f"repo:    {repo_dir}",
+    ]
+    if not (repo_dir / ".git").exists():
+        lines.append(
+            "warning: this source is NOT a git checkout (wheel install or detached copy) "
+            "— you cannot confirm which commit you are running. For development, install "
+            "editable from the repo root: `pip install -e .`"
+        )
+    return "\n".join(lines)
+
+
 def cmd_version() -> int:
-    print(build_identity())
+    print(build_source_report())
     return 0
 
 
@@ -221,6 +329,12 @@ def resolve_config(args: argparse.Namespace) -> Config:
     overrides: dict[str, object] = {}
     if args.temp is not None:
         overrides["temperature"] = args.temp
+    if getattr(args, "top_p", None) is not None:
+        overrides["top_p"] = args.top_p
+    if getattr(args, "top_k", None) is not None:
+        overrides["top_k"] = args.top_k
+    if getattr(args, "num_ctx", None) is not None:
+        overrides["num_ctx"] = args.num_ctx
     if args.model is not None:
         overrides["model"] = args.model
     if getattr(args, "codec", None) is not None:
@@ -277,6 +391,8 @@ def cmd_show_config() -> int:
     print(f"  max_actions_per_turn = {effective.max_actions_per_turn}")
     print(f"  top_p       = {effective.top_p}")
     print(f"  top_k       = {effective.top_k}")
+    print(f"  num_ctx     = {effective.num_ctx}")
+    print(f"  codec       = {effective.codec}")
     return 0
 
 
