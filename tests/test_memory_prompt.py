@@ -128,9 +128,11 @@ class ToollessPromptTest(unittest.TestCase):
 
     def test_full_build_still_has_tool_sections(self):
         # The default (full) build is unchanged — sanity that the flag is opt-in.
+        # The per-toolset guidance is now inlined ahead of the general "# Guidance"
+        # section (no "# Working with your tools" heading); the fs note proves it rendered.
         sp = self.builder.build("DO THE THING", include_tool_guidance=True)
         self.assertIn("# Tools", sp)
-        self.assertIn("# Working with your tools", sp)
+        self.assertIn("Use create_file for a new file", sp)
 
 
 class ToolsetGuidanceTest(unittest.TestCase):
@@ -150,7 +152,7 @@ class ToolsetGuidanceTest(unittest.TestCase):
 
     def test_fs_guidance_present_when_fs_active(self):
         sp = self._build(["fs"])
-        self.assertIn("# Working with your tools", sp)
+        # The per-toolset guidance is inlined (no "# Working with your tools" heading).
         self.assertIn("read the file back", sp.lower())
 
     def test_fs_guidance_absent_when_fs_not_active(self):
@@ -158,12 +160,12 @@ class ToolsetGuidanceTest(unittest.TestCase):
         # so the tools-guidance section IS present — but it must not contain the
         # filesystem-specific note, since the fs toolset is not active.
         sp = self._build(["web"])
-        self.assertIn("# Working with your tools", sp)
+        self.assertIn("# Web Agent", sp)   # web's own guidance section is present
         self.assertNotIn("read the file back", sp.lower())
 
     def test_web_guidance_present_when_web_active(self):
         sp = self._build(["web"])
-        self.assertIn("# Working with your tools", sp)
+        self.assertIn("# Web Agent", sp)
         # banner/consent dismissal wording
         lower = sp.lower()
         self.assertTrue(
@@ -182,7 +184,7 @@ class ToolsetGuidanceTest(unittest.TestCase):
 
     def test_both_guidances_present_when_web_and_fs_active(self):
         sp = self._build(["web", "fs"])
-        self.assertIn("# Working with your tools", sp)
+        self.assertIn("# Web Agent", sp)                   # web guidance section present
         self.assertIn("read the file back", sp.lower())   # fs
         self.assertIn("snapshot", sp.lower())              # web
 
@@ -217,9 +219,12 @@ class ToolsetGuidanceTest(unittest.TestCase):
         self.assertEqual(twice.count("read the file back"), 1)
 
     def test_guidance_section_sits_between_tools_and_guidance(self):
+        # The per-toolset guidance is inlined between the "# Tools" docs and the general
+        # "# Guidance" section (no "# Working with your tools" heading anymore).
         sp = self._build(["fs"])
-        self.assertLess(sp.index("# Tools"), sp.index("# Working with your tools"))
-        self.assertLess(sp.index("# Working with your tools"), sp.index("# Guidance"))
+        marker = "Use create_file for a new file and write_file"
+        self.assertLess(sp.index("# Tools"), sp.index(marker))
+        self.assertLess(sp.index(marker), sp.index("# Guidance"))
 
     def test_web_guidance_reconciled_to_point_at_live_snapshot_section(self):
         # Issue #24 reconcile (commit "Reconcile web-worker guidance with #24"):

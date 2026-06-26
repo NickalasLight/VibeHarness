@@ -156,14 +156,17 @@ class StatefulHistoryTest(unittest.TestCase):
         agent = self._agent(client)
         result = agent.run("write a.txt")
         self.assertTrue(result.finished)
-        # The SECOND decide_chat call must have seen turn-1 committed as
-        # system, user(t1), assistant(t1), tool(t1), user(t2).
+        # The SECOND decide_chat call must have seen turn-1 committed. Since #151 batches
+        # all tool results into ONE role:"user" <tool_response> message (Qwen3 training
+        # format) rather than separate role:"tool" messages, the shape is now:
+        # system, user(t1), assistant(t1), user(t1 batched tool responses), user(t2).
         msgs = client.seen_messages[1]
         roles = [m["role"] for m in msgs]
         self.assertEqual(roles[0], "system")
         self.assertEqual(roles[1], "user")
         self.assertEqual(roles[2], "assistant")
-        self.assertEqual(roles[3], "tool")
+        self.assertEqual(roles[3], "user")  # batched <tool_response> block (not role:tool)
+        self.assertIn("<tool_response>", msgs[3]["content"])
         self.assertEqual(roles[-1], "user")  # the current turn
 
     def test_tool_message_carries_observation_and_name(self):
@@ -173,10 +176,12 @@ class StatefulHistoryTest(unittest.TestCase):
             Decision("", '<tool_call>{"name": "validate", "arguments": {}}</tool_call>'),
         ])
         result = self._agent(client).run("list")
-        tool_msgs = [m for m in client.seen_messages[1] if m["role"] == "tool"]
-        self.assertTrue(tool_msgs)
-        self.assertEqual(tool_msgs[0]["tool_name"], "list_directory")
-        self.assertTrue(tool_msgs[0]["content"])  # the observation text
+        # #151: the tool observation rides a batched role:"user" <tool_response> message.
+        tool_resp = [m for m in client.seen_messages[1]
+                     if m["role"] == "user" and "<tool_response>" in (m.get("content") or "")]
+        self.assertTrue(tool_resp)
+        self.assertIn("<tool_response>", tool_resp[0]["content"])
+        self.assertIn("listed the directory", tool_resp[0]["content"])  # list_directory ran
 
     def test_structured_tool_calls_preferred_over_text(self):
         # Turn 1 returns STRUCTURED tool_calls (with junk text content); the agent must
@@ -192,9 +197,12 @@ class StatefulHistoryTest(unittest.TestCase):
         assistant = [m for m in client.seen_messages[1] if m["role"] == "assistant"][0]
         self.assertIn("tool_calls", assistant)
         self.assertEqual(assistant["tool_calls"][0]["function"]["name"], "list_directory")
-        # and a tool observation for list_directory was produced (the call ran).
-        tool_msgs = [m for m in client.seen_messages[1] if m["role"] == "tool"]
-        self.assertEqual(tool_msgs[0]["tool_name"], "list_directory")
+        # and a tool observation for list_directory was produced (the call ran) — it
+        # rides the batched role:"user" <tool_response> message (#151).
+        tool_resp = [m for m in client.seen_messages[1]
+                     if m["role"] == "user" and "<tool_response>" in (m.get("content") or "")]
+        self.assertTrue(tool_resp)
+        self.assertIn("listed the directory", tool_resp[0]["content"])
 
     def test_tools_field_passed_each_turn(self):
         client = _ScriptedNativeClient([
@@ -209,7 +217,8 @@ class FifoEvictionTest(unittest.TestCase):
         reg = _registry()
         # Tiny window so a couple of turns overflow and force eviction.
         cfg = Config(max_steps=8, num_ctx=400, reason_tokens=50, action_tokens=50,
-                     snapshot_safety_margin_tokens=0, snapshot_chars_per_token=4.0)
+                     snapshot_safety_margin_tokens=0, snapshot_chars_per_token=4.0,
+                     escalation_enabled=False)  # repeated calls would otherwise escalate
         # Each turn writes a file with a big content so the tool observation is large.
         big = "x" * 600
         call = ('<tool_call>{"name": "write_file", "arguments": {"path": "a.txt", '
@@ -229,7 +238,8 @@ class FifoEvictionTest(unittest.TestCase):
 
     def test_fixed_turn_cap_applied(self):
         reg = _registry()
-        cfg = Config(max_steps=8, chat_history_max_turns=4, num_ctx=32768)
+        cfg = Config(max_steps=8, chat_history_max_turns=4, num_ctx=32768,
+                     escalation_enabled=False)  # repeated calls would otherwise escalate
         call = '<tool_call>{"name": "list_directory", "arguments": {"path": "."}}</tool_call>'
         client = _ScriptedNativeClient([Decision("", call)] * 5 + [
             Decision("", '<tool_call>{"name": "validate", "arguments": {}}</tool_call>')])
@@ -263,17 +273,25 @@ class NativeSystemPromptTest(unittest.TestCase):
 
 
 class SnapshotOnUserTurnTest(unittest.TestCase):
-    """Issue #146: the live page snapshot rides the END of the USER turn (recency slot),
-    NOT the system prompt, and stale snapshots are pruned from chat history so only the
-    latest one is visible to the model."""
+    """Issue #146/#151: the live page snapshot rides the USER turn (NOT the system prompt)
+    as a ``page_snapshot`` observation captured AFTER the turn's tool calls and committed
+    inside that turn's batched ``<tool_response>`` user message under the
+    ``## Latest page state`` marker. Stale snapshots are stripped from older history so
+    only the latest one is visible to the model. The snapshot is captured only on
+    non-finishing turns, so the most recent committed snapshot is the last working turn's.
+    """
+
+    # The marker the post-turn snapshot observation is rendered with (see RalphAgent.run).
+    SNAP_MARKER = "## Latest page state"
 
     def setUp(self):
         self.reg = _registry()
-        self.cfg = Config(max_steps=5)
+        # Disable escalation so repeated identical calls don't reach for the API model.
+        self.cfg = Config(max_steps=5, escalation_enabled=False)
 
     def _agent(self, client, snapshots):
-        # snapshots: a list yielding one snapshot string per turn (the cli wires this
-        # to the budgeted live capture). We ignore the user arg and pop in order.
+        # snapshots: one snapshot string per NON-finishing turn (the cli wires this to the
+        # budgeted live capture). The provider is called zero-arg after each turn's tools.
         snaps = iter(snapshots)
         def provider(user=""):
             try:
@@ -282,55 +300,53 @@ class SnapshotOnUserTurnTest(unittest.TestCase):
                 return ""
         return RalphAgent(client, self.reg, "SYS", self.cfg,
                           FakeValidator(passed=True), codec=get_codec("hermes"),
-                          snapshot_provider=provider)
+                          raw_snapshot_provider=provider)
 
     def test_snapshot_appended_to_current_user_turn_not_system(self):
-        from vibeharness.prompt import SNAPSHOT_USER_MARKER
         call = '<tool_call>{"name": "list_directory", "arguments": {"path": "."}}</tool_call>'
         client = _ScriptedNativeClient([
             Decision("", call),
             Decision("", '<tool_call>{"name": "validate", "arguments": {}}</tool_call>')])
         agent = self._agent(client, ["### Page\nSNAP-TURN-1 ref e9"])
         agent.run("do it")
-        # Turn-1 request: system carries NO snapshot; the user turn ends with it.
-        msgs = client.seen_messages[0]
+        # Turn-1's snapshot is captured AFTER turn-1's decide, so it first appears in
+        # turn-2's request (seen_messages[1]). The system prompt never carries it.
+        msgs = client.seen_messages[1]
         system = [m for m in msgs if m["role"] == "system"][0]["content"]
-        self.assertNotIn(SNAPSHOT_USER_MARKER, system)
+        self.assertNotIn(self.SNAP_MARKER, system)
         self.assertNotIn("SNAP-TURN-1", system)
-        user = [m for m in msgs if m["role"] == "user"][-1]["content"]
-        self.assertIn(SNAPSHOT_USER_MARKER, user)
-        self.assertIn("SNAP-TURN-1 ref e9", user)
-        self.assertTrue(user.rstrip().endswith("SNAP-TURN-1 ref e9"))
+        # It rides a role:"user" <tool_response> message under the latest-page marker.
+        snap_users = [m for m in msgs if m["role"] == "user"
+                      and self.SNAP_MARKER in (m.get("content") or "")]
+        self.assertEqual(len(snap_users), 1)
+        self.assertIn("SNAP-TURN-1 ref e9", snap_users[0]["content"])
 
     def test_old_snapshots_pruned_from_history(self):
-        from vibeharness.prompt import (SNAPSHOT_USER_MARKER,
-                                         SNAPSHOT_PRUNED_PLACEHOLDER)
         call = '<tool_call>{"name": "list_directory", "arguments": {"path": "."}}</tool_call>'
         client = _ScriptedNativeClient([
-            Decision("", call),                        # turn 1
-            Decision("", call),                        # turn 2
+            Decision("", call),                        # turn 1 -> SNAP-ONE
+            Decision("", call),                        # turn 2 -> SNAP-TWO
             Decision("", '<tool_call>{"name": "validate", "arguments": {}}</tool_call>')])
         agent = self._agent(client, [
             "### Page\nSNAP-ONE", "### Page\nSNAP-TWO", "### Page\nSNAP-THREE"])
         agent.run("loop")
-        # On turn 3's request, the history holds turns 1 & 2's user messages. Only the
-        # MOST RECENT user turn with a snapshot keeps it; older ones are placeholdered.
+        # On turn 3's request, the history holds turns 1 & 2. Only the MOST RECENT
+        # committed snapshot survives; the older one is stripped from its user message.
+        # Turn 3 is `validate` (a finishing turn) so it captures no snapshot — the latest
+        # surviving snapshot is therefore turn 2's (SNAP-TWO); SNAP-THREE is never used.
         msgs = client.seen_messages[2]
         user_msgs = [m for m in msgs if m["role"] == "user"]
-        with_marker = [m for m in user_msgs if SNAPSHOT_USER_MARKER in m["content"]]
-        # Exactly one user message still carries a live snapshot block (the current turn).
+        with_marker = [m for m in user_msgs if self.SNAP_MARKER in (m.get("content") or "")]
         self.assertEqual(len(with_marker), 1)
-        self.assertIn("SNAP-THREE", with_marker[0]["content"])
-        # The earlier turns were pruned to the placeholder, and their old snapshot text
-        # is gone, but the user message body (task reminder) survives.
-        joined = "\n".join(m["content"] for m in user_msgs)
-        self.assertIn(SNAPSHOT_PRUNED_PLACEHOLDER, joined)
+        self.assertIn("SNAP-TWO", with_marker[0]["content"])
+        # The earlier snapshot text is gone, but the user messages (task reminder + the
+        # tool observations) survive.
+        joined = "\n".join(m.get("content") or "" for m in user_msgs)
         self.assertNotIn("SNAP-ONE", joined)
-        self.assertNotIn("SNAP-TWO", joined)
 
     def test_tool_observations_survive_pruning(self):
-        # Pruning strips only the snapshot block; action observations (tool messages)
-        # are untouched so the model keeps the record of what it did.
+        # Pruning strips only the snapshot block; action observations (the batched
+        # <tool_response> blocks) are untouched so the model keeps the record of what it did.
         call = '<tool_call>{"name": "list_directory", "arguments": {"path": "."}}</tool_call>'
         client = _ScriptedNativeClient([
             Decision("", call),
@@ -339,9 +355,10 @@ class SnapshotOnUserTurnTest(unittest.TestCase):
         agent = self._agent(client, ["### Page\nA", "### Page\nB", "### Page\nC"])
         agent.run("loop")
         msgs = client.seen_messages[2]
-        tool_msgs = [m for m in msgs if m["role"] == "tool"]
-        self.assertGreaterEqual(len(tool_msgs), 2)  # one per executed turn-1/turn-2 call
-        self.assertTrue(all(m.get("content") for m in tool_msgs))
+        tool_resp = [m for m in msgs if m["role"] == "user"
+                     and "<tool_response>" in (m.get("content") or "")]
+        self.assertGreaterEqual(len(tool_resp), 2)  # one batched block per turn-1/turn-2
+        self.assertTrue(all(m.get("content") for m in tool_resp))
 
 
 if __name__ == "__main__":

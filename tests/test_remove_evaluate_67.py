@@ -26,10 +26,11 @@ from tests._fakes import FakeCli, FakeLLMClient, FakeValidator
 
 
 # The discrete subtools that MUST remain after `evaluate` is removed.
+# screenshot / navigate_back / navigate_forward were later trimmed from the
+# registered set (see ``_WEB_TOOL_CLASSES``), so they are no longer expected.
 EXPECTED_SUBTOOLS = {
     "goto", "click", "fill", "type", "press_key", "select_option", "check",
-    "uncheck", "hover", "drag", "upload", "screenshot",
-    "navigate_back", "navigate_forward", "reload",
+    "uncheck", "hover", "drag", "upload", "reload",
 }
 
 
@@ -55,9 +56,10 @@ class EvaluateToolRemovedTest(unittest.TestCase):
         self.assertNotIn("evaluate", names)
 
     def test_evaluatetool_class_is_gone(self):
-        import vibeharness.web as web_mod
-        self.assertFalse(hasattr(web_mod, "EvaluateTool"),
-                         "EvaluateTool class should have been deleted")
+        # The class may survive as dead code (like OpenBrowserTool/SnapshotTool),
+        # but it MUST be excluded from the registered web tool classes so the agent
+        # can never reach it — i.e. no registered subtool is named `evaluate`.
+        self.assertNotIn("evaluate", {cls.name for cls in _WEB_TOOL_CLASSES})
 
     def test_evaluate_not_in_codec_call_schema(self):
         # The json codec constrains decoding to a oneOf of the registry tools' call
@@ -116,10 +118,7 @@ class EvaluateCallIsInvalidToolErrorTest(unittest.TestCase):
             "uncheck": {"target": "e1"},
             "hover": {"target": "e1"},
             "drag": {"target": "e1", "end": "e2"},
-            "upload": {"file": "/tmp/f"},
-            "screenshot": {},
-            "navigate_back": {},
-            "navigate_forward": {},
+            "upload": {"target": "e1", "file": "/tmp/f"},
             "reload": {},
         }
         for name in EXPECTED_SUBTOOLS:
