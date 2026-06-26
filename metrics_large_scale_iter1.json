@@ -1,9 +1,0 @@
-{
-  "session": "large_scale_iter_1",
-  "issue": 158,
-  "started_at": "2026-06-25T19:30:00",
-  "glm_model": "glm-5.2",
-  "glm_price_per_1k_input_usd": 0.00015,
-  "glm_price_per_1k_output_usd": 0.00015,
-  "jobs": []
-}
