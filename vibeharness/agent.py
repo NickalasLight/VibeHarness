@@ -125,7 +125,8 @@ class RalphAgent:
                  codec: ToolCallCodec | None = None,
                  validator_context_provider: Callable[[str], str] | None = None,
                  raw_snapshot_provider: Callable[[], str] | None = None,
-                 turn_io_logger: "Callable[[int, str, list, str, str, str], None] | None" = None):
+                 turn_input_logger: "Callable[[int, str, list, str, float], None] | None" = None,
+                 turn_output_logger: "Callable[[int, str, str], None] | None" = None):
         self._client = client
         self._registry = registry
         self._system = system_prompt
@@ -144,9 +145,13 @@ class RalphAgent:
         # Zero-arg callable that captures the live page snapshot after tool execution.
         # When None (fs-only runs / unit tests), no post-turn snapshot is recorded.
         self._raw_snapshot_provider = raw_snapshot_provider
-        # Optional per-turn callback: (turn, system, history, user, reasoning, action) -> None.
-        # Called after every LLM decision for full IO logging.
-        self._turn_io_logger = turn_io_logger
+        # Optional per-turn IO logging hooks (issue #170/#171). Split into two so the
+        # request payload is persisted BEFORE the (blocking) model call — a crash during
+        # generation then still leaves the crashing turn's exact input on disk:
+        #   turn_input_logger(turn, system, messages, user, chars_per_token) -> None
+        #   turn_output_logger(turn, reasoning, action) -> None
+        self._turn_input_logger = turn_input_logger
+        self._turn_output_logger = turn_output_logger
         # Cached arity of the system_prompt_provider (does it take the user message?).
         # Resolved lazily on first use (see _build_system).
         self._provider_wants_user: bool | None = None
@@ -242,6 +247,17 @@ class RalphAgent:
                         user += (f"\n\n<user_advice>The human user gives you the following "
                                  f"hint: '{hint}'</user_advice>")
                 system = self._build_system(user)
+                # Persist the EXACT request BEFORE the blocking model call, so a crash
+                # DURING generation still leaves this turn's full input (incl. the
+                # accumulated history and its token size) on disk (#170/#171). Legacy
+                # single-message path has no stateful history, so log an empty list.
+                if self._turn_input_logger is not None:
+                    try:
+                        self._turn_input_logger(
+                            i, system, list(chat_history) if self._native else [], user,
+                            self._cfg.snapshot_chars_per_token)
+                    except Exception:
+                        pass
                 if self._native:
                     decision = self._decide_chat(system, chat_history, user, constraint)
                 else:
@@ -259,15 +275,10 @@ class RalphAgent:
                         on_turn(result)
                     break
 
-                if self._turn_io_logger is not None:
+                if self._turn_output_logger is not None:
                     try:
-                        self._turn_io_logger(
-                            i, system,
-                            list(chat_history),  # snapshot before this turn's commit
-                            user,
-                            decision.reasoning or "",
-                            decision.action_json or "",
-                        )
+                        self._turn_output_logger(
+                            i, decision.reasoning or "", decision.action_json or "")
                     except Exception:
                         pass
                 turn = Turn(index=i, reasoning=decision.reasoning, raw_action=decision.action_json)
