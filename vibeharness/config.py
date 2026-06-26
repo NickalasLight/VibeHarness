@@ -43,6 +43,11 @@ class ModelSpec:
     # shot = 1).
     codec: str | None = None
     max_actions_per_turn: int | None = None
+    # ISSUE #201 — per-MODEL toggle for the agent's same-turn CONSECUTIVE-DUPLICATE
+    # tool-call collapse (agent.py "_dedup_actions" filter). Optional per-role override of
+    # the registry value (resolve_model_collapse_dups): spec → MODEL_TOOL_POLICIES → True.
+    # None inherits the per-model policy (so leaving it None is a no-op).
+    collapse_consecutive_dup_tool_calls: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -438,6 +443,14 @@ class ModelToolPolicy:
     #     budgeting input, so the API never receives a giant ``num_ctx`` Ollama option.
     # 0 means "unknown / inherit config.num_ctx" (no behaviour change).
     context_window: int = 0
+    # ISSUE #201 — should the agent collapse same-turn CONSECUTIVE-DUPLICATE tool calls
+    # (the agent.py "_dedup_actions" filter) for this model? TRUE only for the small local
+    # qwen3:4b, which tends to repeat itself; FALSE for the capable API models (GLM/DeepSeek)
+    # where emitting the same tool twice in one turn is sometimes legitimate and must NOT be
+    # silently dropped. Defaults to True so an unconfigured (likely small/local) model keeps
+    # today's safety; the resolver (resolve_model_collapse_dups) reads the ACTIVE model's
+    # policy, so an escalation take-over to a powerful model also lifts the collapse.
+    collapse_consecutive_dup_tool_calls: bool = True
     rationale: str = ""
 
 
@@ -535,27 +548,33 @@ MODEL_TOOL_POLICIES: dict[str, ModelToolPolicy] = {
     # when we re-tighten. codec + context_window are unchanged from #178/#182/#193.
     "qwen3:4b": ModelToolPolicy(
         codec="hermes", max_actions_per_turn=99, context_window=32768,
+        collapse_consecutive_dup_tool_calls=True,  # #201: small local model repeats itself
         rationale="native Hermes dialect; sub-7B 3-call accuracy peak (arXiv:2602.07359); "
                   "ctx 32768 = GPU-pinned num_ctx (#77/#140), NOT a model limit; "
                   "cap lifted to 99 for now (#197)"),
     "glm-4.7-flash": ModelToolPolicy(
         codec="json", max_actions_per_turn=99, context_window=131072,
+        collapse_consecutive_dup_tool_calls=False,  # #201: capable model; keep legit repeats
         rationale="API reasoning model; schema-constrained JSON; lighter flash tier; "
                   "128K ctx (GLM-4.5-Flash documented 128K); cap lifted to 99 for now (#197)"),
     "glm-4.7": ModelToolPolicy(
         codec="json", max_actions_per_turn=99, context_window=204800,
+        collapse_consecutive_dup_tool_calls=False,  # #201: capable model; keep legit repeats
         rationale="flagship agentic-coding; 200K ctx (GLM-4.6 documented 200K) + native "
                   "parallel_tool_calls; cap lifted to 99 for now (#197)"),
     "glm-5.2": ModelToolPolicy(
         codec="json", max_actions_per_turn=99, context_window=1048576,
+        collapse_consecutive_dup_tool_calls=False,  # #201: capable model; keep legit repeats
         rationale="newest flagship long-horizon agentic line; 1M lossless ctx "
                   "(z.ai release notes); cap lifted to 99 for now (#197)"),
     "deepseek-chat": ModelToolPolicy(
         codec="json", max_actions_per_turn=99, context_window=131072,
+        collapse_consecutive_dup_tool_calls=False,  # #201: capable model; keep legit repeats
         rationale="DeepSeek-V3.1 non-thinking; OpenAI-compat function calling; "
                   "128K ctx (V3.1 documented baseline); cap lifted to 99 for now (#197)"),
     "deepseek-reasoner": ModelToolPolicy(
         codec="json", max_actions_per_turn=99, context_window=131072,
+        collapse_consecutive_dup_tool_calls=False,  # #201: capable model; keep legit repeats
         rationale="DeepSeek-V3.1 thinking; tool calls supported since V3.1 (was unsupported "
                   "on legacy R1); reasoning_content consumed as reasoning; 128K ctx (V3.1 "
                   "documented baseline); cap lifted to 99 for now (#197)"),
@@ -570,10 +589,12 @@ MODEL_TOOL_POLICIES: dict[str, ModelToolPolicy] = {
     #   https://openrouter.ai/deepseek/deepseek-v4-flash .
     "deepseek-v4-flash": ModelToolPolicy(
         codec="json", max_actions_per_turn=99, context_window=1_000_000,
+        collapse_consecutive_dup_tool_calls=False,  # #201: capable model; keep legit repeats
         rationale="DeepSeek-V4-Flash (284B/13B-active); OpenAI-compat tool calling; native 1M "
                   "context (news260424); json single-shot codec; cap lifted to 99 for now (#197)"),
     "deepseek-v4-pro": ModelToolPolicy(
         codec="json", max_actions_per_turn=99, context_window=1_000_000,
+        collapse_consecutive_dup_tool_calls=False,  # #201: capable model; keep legit repeats
         rationale="DeepSeek-V4-Pro (1.6T/49B-active); OpenAI-compat tool calling; native 1M "
                   "context (news260424); json single-shot codec; cap lifted to 99 for now (#197)"),
 }
@@ -584,6 +605,7 @@ MODEL_TOOL_POLICIES: dict[str, ModelToolPolicy] = {
 # inheriting the local `hermes` default. The qwen-local default is the global Config codec.
 _GLM_FAMILY_POLICY = ModelToolPolicy(
     codec="json", max_actions_per_turn=99, context_window=131072,
+    collapse_consecutive_dup_tool_calls=False,  # #201: capable GLM family; keep legit repeats
     rationale="unrecognised GLM/z.ai model: API JSON codec + 128K ctx; "
               "cap lifted to 99 for now (#197)")
 
@@ -594,6 +616,7 @@ _GLM_FAMILY_POLICY = ModelToolPolicy(
 # conservative `json` + 5 policy rather than silently inheriting the local `hermes` default.
 _DEEPSEEK_FAMILY_POLICY = ModelToolPolicy(
     codec="json", max_actions_per_turn=99, context_window=131072,
+    collapse_consecutive_dup_tool_calls=False,  # #201: capable DeepSeek family; keep repeats
     rationale="unrecognised DeepSeek model: API JSON codec + 128K ctx; "
               "cap lifted to 99 for now (#197)")
 
@@ -631,6 +654,28 @@ def resolve_model_codec(config: Config, spec: ModelSpec) -> str:
     if policy is not None:
         return policy.codec
     return config.codec
+
+
+def resolve_model_collapse_dups(config: Config, spec: ModelSpec) -> bool:
+    """Resolve whether to COLLAPSE same-turn consecutive duplicate tool calls for ``spec``
+    (issue #201) — the agent.py "_dedup_actions" filter.
+
+    Precedence (mirrors :func:`resolve_model_codec`): the spec's explicit
+    ``collapse_consecutive_dup_tool_calls`` field WINS; else the per-model registry
+    (:func:`model_tool_policy`); else ``True`` — the CONSERVATIVE default that keeps today's
+    collapse safety for an UNCONFIGURED (likely small/local) model. The ACTIVE model's spec
+    drives this: the agent re-resolves it on escalation take-over (``_escalate``) so a swap to
+    a capable API model (GLM/DeepSeek, collapse off) also lifts the collapse mid-run.
+
+    True  → qwen3:4b: the small local model tends to repeat itself; collapse is a crutch.
+    False → GLM/DeepSeek (and their family fallbacks): emitting the same tool twice in one
+            turn can be legitimate, so the duplicate (and its tool_response) is preserved."""
+    if spec.collapse_consecutive_dup_tool_calls is not None:
+        return spec.collapse_consecutive_dup_tool_calls
+    policy = model_tool_policy(spec.model)
+    if policy is not None:
+        return policy.collapse_consecutive_dup_tool_calls
+    return True
 
 
 def resolve_model_limit(config: Config, spec: ModelSpec) -> int:

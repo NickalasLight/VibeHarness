@@ -169,11 +169,22 @@ class RalphAgent:
         # base role's spec and is updated by ``_escalate`` when the run switches to the API
         # model, so the budget tracks the live client (e.g. DeepSeek/GLM's large window
         # instead of qwen3:4b's GPU-pinned 32768) rather than a flat num_ctx.
-        from .config import resolve_role_spec
+        from .config import resolve_role_spec, resolve_model_collapse_dups
         try:
             self._active_spec = resolve_role_spec(config, "base")
         except Exception:
             self._active_spec = None
+        # ISSUE #201 — per-MODEL toggle for the same-turn CONSECUTIVE-DUPLICATE tool-call
+        # collapse below (the "_dedup_actions" filter in the act loop). Resolved from the
+        # ACTIVE model's policy (True only for the small local qwen3:4b, which tends to
+        # repeat itself; False for capable API models where a repeated call can be legit),
+        # and RE-resolved on escalation take-over (``_escalate``) so a mid-run swap to a
+        # powerful model also lifts the collapse. Defaults True when the spec is unknown.
+        try:
+            self._collapse_dup_tool_calls = resolve_model_collapse_dups(
+                config, self._active_spec) if self._active_spec is not None else True
+        except Exception:
+            self._collapse_dup_tool_calls = True
         self._validator = validator
         self._reporter = reporter or NullReporter()
         # Optional per-turn refresh hook. When set, it is called at the start of
@@ -402,47 +413,60 @@ class RalphAgent:
                                     _tc_blocks[limit - 1])
                                 decision = _dc_replace(
                                     decision, action_json=decision.action_json[:_end])
-                    # CONSECUTIVE-DUPLICATE filter: if the model emits the same action
-                    # back-to-back — either within this turn's batch OR as the first
-                    # action of this turn matching the last action of the prior turn —
-                    # execute only the first occurrence. The duplicate is silently
-                    # dropped from decision.tool_calls / decision.action_json so chat
-                    # history records only what was actually executed, as if the second
-                    # call never happened.
-                    _dedup_actions: list[tuple[str, dict]] = []
-                    _dedup_kept: list[int] = []
-                    _prev_sig: str | None = None
-                    for _di, (_dn, _da) in enumerate(actions):
-                        _ds = self._action_signature(_dn, _da)
-                        if _ds is not None and _ds == _prev_sig:
-                            self._reporter.note(
-                                f"[DEDUP] dropping consecutive duplicate {_dn}")
-                            continue
-                        _dedup_actions.append((_dn, _da))
-                        _dedup_kept.append(_di)
-                        if _ds is not None:
-                            _prev_sig = _ds
-                    if len(_dedup_actions) < len(actions):
-                        actions = _dedup_actions
-                        if decision.tool_calls:
-                            decision = _dc_replace(
-                                decision,
-                                tool_calls=[decision.tool_calls[j] for j in _dedup_kept])
-                        elif decision.action_json:
-                            _tc_all = re.findall(
-                                r"<tool_call>[\s\S]*?</tool_call>", decision.action_json)
-                            if _tc_all:
-                                _tc_kept = [_tc_all[j] for j in _dedup_kept
-                                            if j < len(_tc_all)]
-                                if len(_tc_kept) < len(_tc_all):
-                                    _tc_start = decision.action_json.index(_tc_all[0])
-                                    _tc_end = (decision.action_json.rindex(_tc_all[-1])
-                                               + len(_tc_all[-1]))
-                                    decision = _dc_replace(
-                                        decision,
-                                        action_json=(decision.action_json[:_tc_start]
-                                                     + "\n".join(_tc_kept)
-                                                     + decision.action_json[_tc_end:]))
+                    # CONSECUTIVE-DUPLICATE filter (PER-MODEL, issue #201): if the model
+                    # emits the same action back-to-back — either within this turn's batch
+                    # OR as the first action of this turn matching the last action of the
+                    # prior turn — execute only the first occurrence. The duplicate is
+                    # silently dropped from BOTH the executed ``actions`` AND
+                    # decision.tool_calls / decision.action_json, so the replayed chat
+                    # history records only what actually ran, as if the second call never
+                    # happened (the same philosophy as web_dedup_same_turn_tools).
+                    #
+                    # This is a CRUTCH for the small local qwen3:4b (which tends to repeat
+                    # itself) and is therefore gated on the ACTIVE model's policy
+                    # (resolve_model_collapse_dups via ``_collapse_dup_tool_calls``): ON for
+                    # qwen3:4b, OFF for capable API models (GLM/DeepSeek), where a repeated
+                    # tool call can be legitimate and must NOT be silently dropped. When OFF
+                    # we skip the whole block, so identical consecutive calls execute as
+                    # separate calls and BOTH the call and its tool_response stay in history.
+                    # The gate reads ``_collapse_dup_tool_calls``, which ``_escalate`` re-
+                    # resolves on take-over, so an escalation to a powerful model also lifts
+                    # the collapse mid-run.
+                    if self._collapse_dup_tool_calls:
+                        _dedup_actions: list[tuple[str, dict]] = []
+                        _dedup_kept: list[int] = []
+                        _prev_sig: str | None = None
+                        for _di, (_dn, _da) in enumerate(actions):
+                            _ds = self._action_signature(_dn, _da)
+                            if _ds is not None and _ds == _prev_sig:
+                                self._reporter.note(
+                                    f"[DEDUP] dropping consecutive duplicate {_dn}")
+                                continue
+                            _dedup_actions.append((_dn, _da))
+                            _dedup_kept.append(_di)
+                            if _ds is not None:
+                                _prev_sig = _ds
+                        if len(_dedup_actions) < len(actions):
+                            actions = _dedup_actions
+                            if decision.tool_calls:
+                                decision = _dc_replace(
+                                    decision,
+                                    tool_calls=[decision.tool_calls[j] for j in _dedup_kept])
+                            elif decision.action_json:
+                                _tc_all = re.findall(
+                                    r"<tool_call>[\s\S]*?</tool_call>", decision.action_json)
+                                if _tc_all:
+                                    _tc_kept = [_tc_all[j] for j in _dedup_kept
+                                                if j < len(_tc_all)]
+                                    if len(_tc_kept) < len(_tc_all):
+                                        _tc_start = decision.action_json.index(_tc_all[0])
+                                        _tc_end = (decision.action_json.rindex(_tc_all[-1])
+                                                   + len(_tc_all[-1]))
+                                        decision = _dc_replace(
+                                            decision,
+                                            action_json=(decision.action_json[:_tc_start]
+                                                         + "\n".join(_tc_kept)
+                                                         + decision.action_json[_tc_end:]))
                     # SAME-TURN duplicate suppression (#162): generalise the consecutive
                     # filter above to NON-adjacent repeats, but only for web tools the run
                     # explicitly opted in via config.web_dedup_same_turn_tools. No-op when
@@ -949,7 +973,7 @@ class RalphAgent:
         detector.escalated = True
         from .clients import build_client, select_execution_codec
         from .config import (resolve_role_spec, resolve_model_codec,
-                             resolve_model_limit)
+                             resolve_model_limit, resolve_model_collapse_dups)
         spec = resolve_role_spec(self._cfg, "escalation")
         try:
             # Build the escalation client through the unified factory + the escalation role
@@ -970,6 +994,10 @@ class RalphAgent:
         # ISSUE #193 — the budget now follows the escalated model's context window so the
         # live page snapshot is no longer truncated to the local model's cap post-escalation.
         self._active_spec = spec
+        # ISSUE #201 — re-resolve the consecutive-duplicate collapse for the NEW active
+        # model: escalating from qwen3:4b (collapse on) to a capable API model (GLM/DeepSeek,
+        # collapse off) lifts the collapse mid-run, so legit repeats are no longer dropped.
+        self._collapse_dup_tool_calls = resolve_model_collapse_dups(self._cfg, spec)
         # Switch the ACTIVE codec + call path + cap to the escalator model's (#179/#178).
         codec_name = resolve_model_codec(self._cfg, spec)
         escalator_codec = get_codec(codec_name)
