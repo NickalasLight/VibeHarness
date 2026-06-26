@@ -85,6 +85,57 @@ class RunLogger:
             # Diagnostics are a best-effort aid; never let a dump failure break the run.
             pass
 
+    def dump_full_turn_io(self, turn: int, *, system: str,
+                          messages: list, user: str,
+                          reasoning: str, action: str) -> None:
+        """Write the complete LLM input + output for one turn to ``<stamp>-diagnostics/``.
+
+        Saves everything sent to and received from the model:
+          - ``turn-<NNN>-input-<ts>.txt``  — system prompt + full message history + user turn
+          - ``turn-<NNN>-output-<ts>.txt`` — model reasoning + raw action/tool-call output
+
+        Best-effort and exception-safe — a failure here never aborts the agent loop.
+        """
+        try:
+            self.diagnostics_dir.mkdir(parents=True, exist_ok=True)
+            _hide(self.dir)
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            tag = f"turn-{turn:03d}"
+
+            import json as _json
+
+            # Input: system prompt + message history + this turn's user message
+            history_text = _json.dumps(messages, indent=2, ensure_ascii=False)
+            input_body = (
+                f"# turn {turn} — FULL LLM INPUT\n"
+                f"# captured at: {ts}\n\n"
+                f"## SYSTEM PROMPT ({len(system)} chars)\n\n"
+                f"{system}\n\n"
+                f"---\n\n"
+                f"## MESSAGE HISTORY (before this turn)\n\n"
+                f"{history_text}\n\n"
+                f"---\n\n"
+                f"## USER MESSAGE THIS TURN ({len(user)} chars)\n\n"
+                f"{user}\n"
+            )
+            (self.diagnostics_dir / f"{tag}-input-{ts}.txt").write_text(
+                input_body, encoding="utf-8", errors="backslashreplace")
+
+            # Output: reasoning + action
+            output_body = (
+                f"# turn {turn} — FULL LLM OUTPUT\n"
+                f"# captured at: {ts}\n\n"
+                f"## REASONING ({len(reasoning)} chars)\n\n"
+                f"{reasoning}\n\n"
+                f"---\n\n"
+                f"## ACTION / TOOL CALL ({len(action)} chars)\n\n"
+                f"{action}\n"
+            )
+            (self.diagnostics_dir / f"{tag}-output-{ts}.txt").write_text(
+                output_body, encoding="utf-8", errors="backslashreplace")
+        except Exception:
+            pass
+
     def log_validator(self, *, context: str, history: str,
                       reasoning: str, passed: bool, reason: str,
                       model: str | None = None, config: Config | None = None) -> None:

@@ -117,7 +117,7 @@ class SystemPromptBuilder:
             if text and text not in seen:
                 seen.add(text)
                 notes.append(text)
-        return "\n".join(f"- {note}" for note in notes)
+        return "\n\n".join(notes)
 
     def build(self, task: str = "", workspace: str = "", page: str = "",
               include_tool_guidance: bool = True, native_tools: bool = False) -> str:
@@ -153,7 +153,7 @@ class SystemPromptBuilder:
             # so a no-guidance build leaves no empty "# Working with your tools" heading.
             tool_guidance = ""
             if self._guidance.strip():
-                tool_guidance = f"# Working with your tools\n{self._guidance.strip()}\n\n"
+                tool_guidance = f"{self._guidance.strip()}\n\n"
             if native_tools:
                 # Ollama injects the tools + format instructions from the model's own
                 # template; omit the harness's `# Tools` docs and format block.

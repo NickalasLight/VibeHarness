@@ -38,22 +38,15 @@ Before any other action, read the snapshot. If a cookie consent dialog or banner
 Navigate to the Job URL above. The page is a karriere.at job listing.
 
 Find the main apply button. It will be labeled one of:
-- "Jetzt bewerben" (Apply Now) — most common, often opens external ATS in a NEW TAB
+- "Jetzt bewerben" (Apply Now) — most common, redirects to external ATS
 - "smart bewerben" / "Schnell bewerben" (Quick Apply) — on-site karriere.at form
 - "Bewerben" — generic apply button
 
-Click it. **CRITICAL — after clicking, immediately check the click result:**
-
-- If the result shows **"Open tabs"** with a NEW tab URL (e.g. tab 1, tab 2) that is NOT karriere.at:
-  → **Switch to that new tab immediately** using: `goto(url="<the new tab URL>")`
-  → Do NOT stay on the karriere.at page — the application form is on the new tab
-  → Example: if the result shows `1: [Career board | VESCON Energy](https://vescon.softgarden.io/...)`, call `goto(url="https://vescon.softgarden.io/...")`
-- If no new tab opened and you stayed on the same page (or redirected in place):
-  → You may be on a karriere.at form or login page — continue with Step 3
+Click it. You will land on either an external ATS form (Workday, SoftGarden, ContactRH, custom recruiting domain) or a karriere.at internal form. Continue with Step 2b to handle the landing page.
 
 ## Step 2b — Handle ATS-specific landing pages
 
-After navigating to an external ATS URL (from a new tab), the page may show:
+After clicking Apply and landing on an external ATS, the page may show:
 
 - **SoftGarden** (`softgarden.io`): Shows a "Career board" application form. Look for text fields labeled "Vorname", "Nachname", "E-Mail", "Telefon". Fill them directly. There may be file upload areas for CV/resume.
 - **Workday** (`myworkdayjobs.com`): Multi-step wizard. Look for "Apply" / "Jetzt bewerben" button on the job detail page, then fill fields in steps.

@@ -620,7 +620,8 @@ def _run_locked(args, task, config, registry, codec, names, workdir, logger,
     agent = RalphAgent(client, registry, system_prompt, config, validator,
                        reporter=reporter, system_prompt_provider=system_prompt_provider,
                        codec=codec, validator_context_provider=validator_context_provider,
-                       raw_snapshot_provider=raw_snapshot_provider)
+                       raw_snapshot_provider=raw_snapshot_provider,
+                       turn_io_logger=logger.dump_full_turn_io)
 
     # Advisor advice buffer: the checkpoint populates it after N accumulated tool calls;
     # advice_provider drains it once at the start of the next turn.

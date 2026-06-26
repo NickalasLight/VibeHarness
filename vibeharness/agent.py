@@ -124,7 +124,8 @@ class RalphAgent:
                  system_prompt_provider: Callable[[], str] | None = None,
                  codec: ToolCallCodec | None = None,
                  validator_context_provider: Callable[[str], str] | None = None,
-                 raw_snapshot_provider: Callable[[], str] | None = None):
+                 raw_snapshot_provider: Callable[[], str] | None = None,
+                 turn_io_logger: "Callable[[int, str, list, str, str, str], None] | None" = None):
         self._client = client
         self._registry = registry
         self._system = system_prompt
@@ -143,6 +144,9 @@ class RalphAgent:
         # Zero-arg callable that captures the live page snapshot after tool execution.
         # When None (fs-only runs / unit tests), no post-turn snapshot is recorded.
         self._raw_snapshot_provider = raw_snapshot_provider
+        # Optional per-turn callback: (turn, system, history, user, reasoning, action) -> None.
+        # Called after every LLM decision for full IO logging.
+        self._turn_io_logger = turn_io_logger
         # Cached arity of the system_prompt_provider (does it take the user message?).
         # Resolved lazily on first use (see _build_system).
         self._provider_wants_user: bool | None = None
@@ -255,6 +259,17 @@ class RalphAgent:
                         on_turn(result)
                     break
 
+                if self._turn_io_logger is not None:
+                    try:
+                        self._turn_io_logger(
+                            i, system,
+                            list(chat_history),  # snapshot before this turn's commit
+                            user,
+                            decision.reasoning or "",
+                            decision.action_json or "",
+                        )
+                    except Exception:
+                        pass
                 turn = Turn(index=i, reasoning=decision.reasoning, raw_action=decision.action_json)
                 result.turns.append(turn)
 
@@ -304,6 +319,47 @@ class RalphAgent:
                                     _tc_blocks[limit - 1])
                                 decision = _dc_replace(
                                     decision, action_json=decision.action_json[:_end])
+                    # CONSECUTIVE-DUPLICATE filter: if the model emits the same action
+                    # back-to-back — either within this turn's batch OR as the first
+                    # action of this turn matching the last action of the prior turn —
+                    # execute only the first occurrence. The duplicate is silently
+                    # dropped from decision.tool_calls / decision.action_json so chat
+                    # history records only what was actually executed, as if the second
+                    # call never happened.
+                    _dedup_actions: list[tuple[str, dict]] = []
+                    _dedup_kept: list[int] = []
+                    _prev_sig: str | None = None
+                    for _di, (_dn, _da) in enumerate(actions):
+                        _ds = self._action_signature(_dn, _da)
+                        if _ds is not None and _ds == _prev_sig:
+                            self._reporter.note(
+                                f"[DEDUP] dropping consecutive duplicate {_dn}")
+                            continue
+                        _dedup_actions.append((_dn, _da))
+                        _dedup_kept.append(_di)
+                        if _ds is not None:
+                            _prev_sig = _ds
+                    if len(_dedup_actions) < len(actions):
+                        actions = _dedup_actions
+                        if decision.tool_calls:
+                            decision = _dc_replace(
+                                decision,
+                                tool_calls=[decision.tool_calls[j] for j in _dedup_kept])
+                        elif decision.action_json:
+                            _tc_all = re.findall(
+                                r"<tool_call>[\s\S]*?</tool_call>", decision.action_json)
+                            if _tc_all:
+                                _tc_kept = [_tc_all[j] for j in _dedup_kept
+                                            if j < len(_tc_all)]
+                                if len(_tc_kept) < len(_tc_all):
+                                    _tc_start = decision.action_json.index(_tc_all[0])
+                                    _tc_end = (decision.action_json.rindex(_tc_all[-1])
+                                               + len(_tc_all[-1]))
+                                    decision = _dc_replace(
+                                        decision,
+                                        action_json=(decision.action_json[:_tc_start]
+                                                     + "\n".join(_tc_kept)
+                                                     + decision.action_json[_tc_end:]))
                     for _ti, (tool_name, args) in enumerate(actions):
                         if _ti > 0:
                             time.sleep(1)  # 1-second safety gap between batched calls

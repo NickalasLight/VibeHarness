@@ -433,77 +433,17 @@ def _extract_validation_alerts(snapshot: str) -> list[str]:
 
 def _check_dom_delta(cli: "PlaywrightCli", before_snapshot: str,
                      result: "ToolResult") -> "ToolResult":
-    """Append a DOM-change summary to ``result`` when new elements appeared.
+    """DOM-delta detection disabled.
 
-    Captures a fresh snapshot, computes the ref diff against
-    ``before_snapshot``, and — if any new refs exist — appends a
-    ``DOM CHANGE DETECTED`` paragraph to the observation so the model sees
-    the new elements' refs immediately without needing to call ``snapshot``.
-    Returns the original ``result`` unchanged when the action failed or no
-    new elements appeared.
+    Mid-turn partial snapshots were causing ref conflicts: the PAGE CHANGED summary
+    listed refs from a snapshot taken 2s post-click, while the end-of-turn
+    'Latest page state' captured refs from a LATER snapshot — the same button could
+    appear as e144 in one and e65 in the other, confusing the model into hallucinating
+    refs. The end-of-turn 'Latest page state' is now the SOLE snapshot the agent
+    receives. Returning result unchanged here; call sites are preserved for easy
+    re-enabling.
     """
-    if not result.ok:
-        return result
-    after = capture_page_snapshot_raw(cli) or ""
-    new_refs = _diff_snapshot_refs(before_snapshot, after)
-    # NOTE (iter-3 fix): do NOT early-return when ``new_refs`` is empty. A blind Continue
-    # re-click on a step whose validation errors are ALREADY rendered produces NO new refs
-    # (the alert nodes were created by the FIRST rejected Continue and persist), yet the form
-    # is still stuck — the model needs the "FORM NOT ADVANCED" steer EVERY time it re-clicks
-    # Continue while errors are visible, not only the first time (iter-3 turns 6-9: 4 blind
-    # Continue clicks, Country alert pre-existing -> no new refs -> steer never re-fired).
-    # PAGE-ADVANCE detection (iter-2): a wizard Continue/Back click swaps the ENTIRE step
-    # — most old refs vanish and a fresh batch appears. Distinguish that from a small
-    # in-place change (a dropdown opening, an inline error). When the page substantially
-    # turned over, say so explicitly and list the new step's INTERACTABLE controls, so the
-    # model re-reads the new refs instead of guessing sequential ones (iter-1: e208/e209
-    # invented after Continue advanced the form).
-    before_set = set(re.findall(r"\[ref=(e\d+)\]", before_snapshot or ""))
-    after_set = set(re.findall(r"\[ref=(e\d+)\]", after))
-    gone = before_set - after_set
-    page_changed = bool(before_set) and len(gone) >= max(5, len(before_set) // 2)
-    if page_changed:
-        controls = _interactable_ref_lines(after)
-        delta_msg = (
-            "\n\nPAGE CHANGED: this click loaded a NEW page/step — the previous refs are "
-            "GONE and the refs below are the ONLY valid ones now. Do NOT reuse or increment "
-            "old refs; read these fresh refs and act on them:\n"
-            + "\n".join(f"  {line}" for line in controls[:40])
-        )
-        return ToolResult(result.ok, (result.observation or "") + delta_msg)
-    # VALIDATION-REJECT detection (iter-2 fix; iter-3 extension): the page did NOT turn over
-    # (no page advance), but `alert` nodes are visible — i.e. a Continue/Submit click was
-    # REJECTED by client-side validation. Tell the model the EXACT errors and that the form did
-    # not advance, so it fixes the named fields instead of re-clicking Continue blindly.
-    #
-    # ITER-3 FIX: surface ALL currently-visible alerts, not just NEWLY-appeared ones. After the
-    # FIRST rejected Continue, the alert nodes persist in the DOM. A subsequent Continue re-click
-    # that leaves a field still unset produces NO new alert (it was already there) — under the
-    # old new-alerts-only check the steer went silent and the agent looped Continue blindly
-    # (iter-3 turns 6-9: Country alert pre-existing from turn 2, never re-surfaced, 4 wasted
-    # clicks). Any alert visible after a Continue means the form is still rejecting, so we
-    # always re-surface them.
-    alerts = _extract_validation_alerts(after)
-    if alerts:
-        errs = "\n".join(f"  • {a}" for a in alerts)
-        reject_msg = (
-            "\n\nFORM NOT ADVANCED — the page did NOT move to the next step. The form is still "
-            "REJECTED by validation. Fix these errors BEFORE clicking Continue again:\n"
-            + errs
-            + "\nFor each error: find the matching field in the snapshot above and set it "
-            "(select_option for dropdowns, the calendar for dates). Do NOT click Continue "
-            "again until every error above is resolved — re-clicking it without fixing them "
-            "does nothing."
-        )
-        return ToolResult(result.ok, (result.observation or "") + reject_msg)
-    if not new_refs:
-        return result
-    new_lines = _extract_ref_lines(new_refs, after)
-    delta_msg = (
-        f"\n\nDOM CHANGE DETECTED: {len(new_refs)} new element(s) appeared:\n"
-        + "\n".join(f"  {line}" for line in new_lines[:20])
-    )
-    return ToolResult(result.ok, (result.observation or "") + delta_msg)
+    return result
 
 
 # Substrings playwright-cli emits (in its error text) when the named session has no
@@ -934,19 +874,12 @@ class _WebTool(Tool):
         return ToolResult(True, f"you {self._verb} {subject}. Result:\n{self._trim(_strip_snapshot_filelink(output))}")
 
     def run(self, args: dict) -> ToolResult:
-        """Public entry point. Wraps ``_run_impl`` with optional DOM-change detection.
+        """Public entry point. Runs the action and returns the result.
 
-        When ``_detect_dom_change`` is True, captures a before-snapshot, runs the
-        action, then appends a DOM CHANGE DETECTED message listing any new element
-        refs that appeared. Subclasses that override ``run()`` call
-        ``super()._run_impl()`` directly so they retain control of when (and if) the
-        delta is appended.
+        DOM-change detection removed: the end-of-turn 'Latest page state' is the
+        sole snapshot the model receives (see _check_dom_delta).
         """
-        if not self._detect_dom_change:
-            return self._run_impl(args)
-        before = capture_page_snapshot_raw(self._cli) or ""
-        result = self._run_impl(args)
-        return _check_dom_delta(self._cli, before, result)
+        return self._run_impl(args)
 
     def _guard_target(self, args: dict) -> ToolResult | None:
         """Reject a ``target`` that is not a ref present in the current snapshot.
@@ -1043,8 +976,8 @@ class ClickTool(_WebTool):
         return ["click", args["target"]]
 
     # Post-click settle: overlay panels and async renders (e.g. fill.co.at "Bewirb dich"
-    # form) take ~1-2 s to appear. Waiting before the DOM-delta snapshot ensures new
-    # refs are captured rather than seeing an empty/pre-render page and missing the form.
+    # form) take ~1-2 s to appear. Sleeping here ensures the end-of-turn 'Latest page
+    # state' snapshot (taken ~1 s after all actions) sees a fully-rendered page.
     _POST_CLICK_SETTLE_S: float = 2.0
 
     def run(self, args: dict) -> ToolResult:
@@ -1069,13 +1002,10 @@ class ClickTool(_WebTool):
                         f"would discard this step's progress and send you to an earlier step. "
                         f"Do not go back. Instead, fill any remaining required field on THIS "
                         f"step, then click the 'Continue →' button to advance.{date_hint}")
-        # Inline DOM-change detection with post-click settle so async overlays render
-        # before the diff snapshot is taken.
-        before = capture_page_snapshot_raw(self._cli) or ""
         result = self._run_impl(args)
         if result.ok:
             time.sleep(self._POST_CLICK_SETTLE_S)
-        return _check_dom_delta(self._cli, before, result)
+        return result
 
 
 class FillTool(_WebTool):
@@ -2392,43 +2322,144 @@ class WebToolset(Toolset):
                    "The page is shown to you automatically each turn.")
 
     def system_guidance(self) -> str | None:
-        return (
-            "Each turn the current page is shown to you automatically under "
-            "'# Current page (live snapshot — provided automatically)' — you do NOT and CANNOT "
-            "request it; just read it before deciding what to do next. "
-            "There is no tool to fetch the page; use the discrete browser tools (goto, click, "
-            "fill, type, select_option, hover, press_key, navigate_back, …) to ACT. "
-            "If there is NO current page shown, or a web action reports the browser is not open / "
-            "the session was closed, call `open_browser` to (re)open the session, then `goto` "
-            "your target URL again before continuing — never give up because the page is missing. "
-            "SNAPSHOT IS GROUND TRUTH — the page_snapshot result is the COMPLETE current state "
-            "of the page. Only elements listed there exist right now. NEVER guess, invent, or "
-            "increment refs (e.g. trying e308 because you saw e307): if a ref is not in the "
-            "latest snapshot it does not exist. Only act on refs you can SEE in the most recent "
-            "page_snapshot observation. "
-            "When a tool takes a target element you MUST pass the element's ref (e.g. 'e163') "
-            "exactly as it appears in the current snapshot. NEVER guess a CSS selector, class, "
-            "id or tag (e.g. '.ytd-play-button'): such targets are rejected before the browser "
-            "is touched, and the rejection lists the refs that are actually available. "
-            "If a cookie/consent banner or modal dialog blocks what you need, clear it first: "
-            "locate its Accept / Agree / Reject / Dismiss / Continue control in the snapshot and "
-            "click that ref before doing anything else. "
-            "FILE UPLOADS — single step: call `upload` with BOTH the trigger ref (the upload "
-            "button or file-input shown in the snapshot) AND the absolute file path. The tool "
-            "clicks the trigger and uploads the file automatically — do NOT click the trigger "
-            "separately first. Pass the ABSOLUTE path exactly as given in the task. "
-            "If the upload trigger is NOT visible in the current snapshot, the upload section is "
-            "not on the current page yet — navigate/scroll there first. Never call `upload` with "
-            "a ref that is not in the snapshot. "
-            "FORM VALIDATION ERRORS — if after clicking a 'Next'/'Weiter'/'Submit'/'Absenden' "
-            "button the form still shows (page did not advance, or a field is marked [invalid] / "
-            "shows 'Eingabe erforderlich'), do NOT click the button again. Instead locate the "
-            "field(s) marked [invalid] in the snapshot, fill or select the correct value, and "
-            "only then click the advance/submit button again. "
-            "FAILED TOOL CALLS — never repeat the EXACT same tool call that just failed. "
-            "If an action fails, change your approach: use a different ref, open a prerequisite "
-            "dialog, or take a different action entirely."
-        )
+        return """\
+# Job Application Agent
+
+## Browser Rules
+
+Each turn the current page is shown to you automatically under \
+'# Current page (live snapshot — provided automatically)'. \
+Read it before every action. Do not request it — there is no tool for that.
+
+SNAPSHOT IS GROUND TRUTH. Only refs listed in the latest snapshot exist. \
+Never guess, invent, or increment refs. Never use CSS selectors or class names.
+
+If there is no current page or the browser session is closed, call `open_browser` \
+then `goto` the target URL before continuing.
+
+If a cookie or consent banner blocks the page, locate its Accept/Agree/Dismiss \
+control in the snapshot and click it first.
+
+FAILED TOOL CALLS — never repeat the exact same failing call. \
+Change your approach: use a different ref or action.
+
+FORM VALIDATION ERRORS — if clicking Next/Submit does not advance the form \
+(page unchanged, or fields marked [invalid]), do NOT click again. \
+Find and fix the invalid fields, then click once more.
+
+FILE UPLOADS — call `upload` with both the trigger ref AND the absolute file path \
+in one step. Do not click the trigger separately first.
+
+## General Application Flow
+
+1. Navigate to the job URL.
+2. Accept any cookie or consent banner.
+3. Find the primary apply button and click it.
+4. If a new tab or external page opens, continue there.
+5. Prefer guest / no-registration application. If unavailable, create an account \
+using the candidate email and password from the task.
+6. Fill all visible required fields using the candidate profile.
+7. Upload CV and cover letter when upload fields appear.
+8. Answer questionnaire fields using the candidate profile.
+9. Check required consent checkboxes (privacy policy, data processing, terms).
+10. Advance one page at a time using Next/Weiter/Continue.
+11. Submit only when on the final review or submission step.
+12. After submitting, wait for a confirmation page or message.
+13. When confirmation is visible, call `validate` with success.
+
+## Field Filling
+
+Fill all visible required fields before clicking Next or Submit.
+Match fields by label, placeholder, aria-label, nearby text, or section heading.
+
+Common mappings:
+- first name → first_name from task
+- last name → last_name from task
+- full name → full_name from task
+- email → email from task
+- phone / mobile → phone from task
+- date of birth → date_of_birth_local from task (DD.MM.YYYY) or date_of_birth_iso (YYYY-MM-DD)
+- gender → gender from task
+- nationality / citizenship → nationality from task
+- street → street from task
+- house number → house_number from task
+- postal code / zip → postal_code from task
+- city → city from task
+- country → country from task
+- salary / expected salary → salary_expectation_annual_gross_eur from task
+- start date / availability → earliest_start_date from task
+- source / how did you hear → application_source from task
+- cover letter / motivation text → cover_letter_text from task
+
+If a field is optional and the value is known, fill it.
+If a required field cannot be answered from the candidate profile, \
+choose the closest truthful generic option.
+Do not invent degrees, certifications, work history, or legal status.
+
+## Dropdowns, Radio Buttons, Checkboxes
+
+For dropdowns and radio buttons, choose the closest matching option.
+For required consent checkboxes (privacy, data processing, terms, application), check them.
+Do not check marketing or newsletter checkboxes unless required to continue.
+
+## Document Upload
+
+Upload before leaving any document upload step.
+- CV/resume field → cv_file from task
+- Cover letter/motivation field → cover_letter_file from task
+- If only one upload field, upload the CV first.
+
+If upload fails and the document is optional, continue.
+If upload fails and the document is required, call `validate` with blocker.
+If an uploaded CV auto-fills fields incorrectly, overwrite with candidate profile values.
+
+## Login and Registration
+
+Prefer in order:
+1. Apply as guest
+2. Continue without account
+3. Register / create account (use candidate email and password)
+4. Login (only if page clearly requires an existing account)
+
+If email verification, SMS verification, or manual account approval is required, \
+call `validate` with blocker.
+If login or registration fails twice, call `validate` with blocker.
+
+## Captcha and Verification
+
+If the page shows CAPTCHA, reCAPTCHA, hCaptcha, phone verification, SMS code, \
+or email verification, do not attempt to bypass it.
+Call `validate` and describe the blocker.
+
+## Submission
+
+Submit only when ALL are true:
+- all required visible fields are filled
+- required documents are uploaded (or optional / unavailable)
+- required consent boxes are checked
+- the page is a final submit or review step
+- the button is not just the first apply button on a job listing
+
+After submitting, wait for confirmation before calling `validate`.
+
+## Success
+
+Call `validate` with success when the page shows a clear confirmation:
+thank-you message, application submitted message, confirmation page, success modal.
+
+## Failure / Blocker
+
+Call `validate` with blocker if:
+- CAPTCHA or bot challenge appears
+- phone/SMS/email verification is required
+- required login cannot be completed
+- required document upload cannot be completed
+- required info is unavailable and cannot be skipped
+- no progress is possible after three attempts on the same step
+
+When calling `validate` for a blocker, include the current page type, URL, \
+blocker text, last attempted action, and what is needed to continue.\
+"""
 
     def create_tools(self, config: Config) -> list[Tool]:
         # Carry the run's open flags so a tool that has to reopen a dead session

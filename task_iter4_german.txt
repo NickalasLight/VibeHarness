@@ -43,6 +43,10 @@ The wizard may include pages covering some or all of these topics — adapt to w
 - **Personal data**: name, email, phone, address fields
 - **Documents / uploads**: CV, cover letter, or other file uploads
   - FILE UPLOADS: Call `upload` with the trigger ref AND the absolute file path in one step — the tool handles the click internally. Example: `upload(target="e163", file="C:\\path\\to\\file.docx")`. Do NOT click the trigger separately first.
+  - **HIDDEN FILE INPUTS** (fill.co.at specific): This form hides its file upload fields from the ARIA snapshot. When you reach the Bewerbungsunterlagen step (which shows only "Meine Anfrage" text field and checkboxes — NO visible upload buttons), you MUST still upload the CV and cover letter using the JS-index syntax:
+    - CV / Lebenslauf: `upload(target="js:0", file="C:\\git\\vibethinkharnessProto1\\test_assets\\jason_statham_resume.docx")`
+    - Cover Letter / Anschreiben: `upload(target="js:1", file="C:\\git\\vibethinkharnessProto1\\test_assets\\jason_statham_cover_letter.docx")`
+  - Do this BEFORE checking the privacy checkbox and BEFORE clicking Weiter/Absenden. The form WILL reject submission if files are not uploaded.
 - **Message / cover message**: a free-text message or motivation field
 - **Source / referral**: how did you hear about the position (use "Sonstiges")
 - **Confirmation / review**: final review before submission
@@ -54,4 +58,21 @@ The wizard may include pages covering some or all of these topics — adapt to w
 - If a cookie/consent banner appears, dismiss it first before interacting with the form.
 - After clicking "Weiter" or "Absenden", the page refreshes with entirely new refs — re-read the snapshot.
 - If a page shows a field you have no data for, leave it empty rather than inventing a value.
+- **FILL ALL PERSONAL DATA FIELDS** before clicking Weiter. The Persönliche Daten section has these required fields — fill ALL of them:
+  - Vorname: Jakob
+  - Nachname: Steinberg
+  - Geschlecht: Männlich
+  - Geburtsdatum: 1990-03-15
+  - **Staatsbrgerschaft (citizenship): MUST select "Deutschland"** — this dropdown appears after Geburtsdatum. It is a REQUIRED field and will show [invalid] if skipped. Do NOT confuse with "Land" (address country). Fill Staatsbrgerschaft separately.
+  - Straße: Mariahilfer Straße
+  - Hausnummer: 45
+  - PLZ: 1060
+  - Stadt: Wien
+  - Land (address): Österreich
+  - E-Mail: jakob.steinberg.dev@example.com
+  - Telefon: +43 660 1234567
+  - Beworben aufgrund von: Sonstiges
+- **IMPORTANT: After clicking Weiter, if the form does NOT advance, immediately read the snapshot for any field marked [invalid] or showing "Eingabe erforderlich". That field MUST be filled before clicking Weiter again. Do NOT click Weiter repeatedly — fill the invalid field first.**
+- **DO NOT call `validate` until you have seen "Vielen Dank" or a thank-you confirmation on the page.** Filling fields and having the Absenden button visible is NOT success — you must click Absenden and see the confirmation first.
+- When the "Absenden" button appears in the snapshot, CLICK IT IMMEDIATELY. Do not call validate, do not think further — just click it.
 - On the final page, click "Absenden" to submit. Confirm the submission succeeded (thank-you message or URL change).
