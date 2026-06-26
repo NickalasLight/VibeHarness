@@ -56,6 +56,13 @@ _BLOCK_RE = re.compile(
 # <tool_call> block is present we recover JSON objects from fences / raw text instead.
 _FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL | re.IGNORECASE)
 
+# ISSUE #183: a <think>…</think> reasoning trace must NEVER be parsed as the action.
+# On the native path qwen3's thinking arrives in a SEPARATE channel (message.thinking),
+# but a thinking model can still LEAK a <think> block into message.content — and anything
+# it wrote while reasoning (including a <tool_call> it was only *considering*) must not be
+# executed. So a <think>…</think> region is stripped BEFORE the tool call is located.
+_THINK_RE = re.compile(r"<think\b[^>]*>.*?</think\s*>", re.DOTALL | re.IGNORECASE)
+
 
 def _unwrap_arg_value(v):
     """Repair the SCHEMA-LEAK argument bug a weak 3B model emits under native tools.
@@ -267,15 +274,34 @@ class HermesCodec(ToolCallCodec):
 
     def parse(self, raw: str) -> "tuple[list[ToolCall] | None, str | None]":
         raw = raw or ""
+        # ISSUE #183: drop any <think>…</think> reasoning trace BEFORE locating the call,
+        # so a tool call the model only CONSIDERED while thinking is never executed and a
+        # reasoning-only turn is recognised distinctly (below). ``had_think`` records that
+        # the content was (at least partly) a thinking trace.
+        had_think = bool(_THINK_RE.search(raw))
+        body = _THINK_RE.sub("", raw)
+        # A budget-truncated trace can leave an UNclosed <think> with no </think>; treat
+        # everything from that open tag on as reasoning and discard it.
+        _open = re.search(r"<think\b[^>]*>", body, re.IGNORECASE)
+        if _open and not re.search(r"</think\s*>", body, re.IGNORECASE):
+            had_think = True
+            body = body[:_open.start()]
         # 1) Preferred: explicit <tool_call>...</tool_call> blocks (the trained wrapper).
-        blocks = [b.strip() for b in _BLOCK_RE.findall(raw) if b.strip()]
+        blocks = [b.strip() for b in _BLOCK_RE.findall(body) if b.strip()]
         # 2) Fallback (#125 iter 1): no wrapper tags -> recover the {"name","arguments"}
         #    JSON the model DID emit, from ```json ... ``` fences, else from the raw text.
         #    Keeps a valid call from being thrown away just because the tags are missing.
         if not blocks:
-            fenced = [m.strip() for m in _FENCE_RE.findall(raw) if m.strip()]
-            blocks = fenced if fenced else ([raw.strip()] if raw.strip() else [])
+            fenced = [m.strip() for m in _FENCE_RE.findall(body) if m.strip()]
+            blocks = fenced if fenced else ([body.strip()] if body.strip() else [])
         if not blocks:
+            # Reasoning-only: the model spent the turn thinking and emitted no call. Surface
+            # this DISTINCTLY (issue #183) so it reads as "still thinking", not a hard
+            # malformed-output error.
+            if had_think:
+                return None, ('still thinking: the response was reasoning only — no '
+                              '<tool_call> yet. Emit a <tool_call>{...}</tool_call> '
+                              "block with the action to take.")
             return None, ('no tool call found (expected a <tool_call>{...}</tool_call> '
                           'block or a {"name", "arguments"} JSON object)')
 
@@ -287,10 +313,18 @@ class HermesCodec(ToolCallCodec):
                 # A top-level array is treated as several calls; a lone object as one.
                 items = value if isinstance(value, list) else [value]
                 for obj in items:
-                    if not isinstance(obj, dict) or "name" not in obj:
+                    if not isinstance(obj, dict):
                         return None, ("each tool call must be a JSON object with a "
                                       "'name' field")
-                    name = obj["name"]
+                    # qwen3:4b sometimes emits the call as {"function": <name>, ...} (the
+                    # key its enveloped tool schema uses) instead of {"name": <name>, ...};
+                    # accept "function" as an alias for "name" so the call is not lost.
+                    name = obj.get("name")
+                    if name is None and isinstance(obj.get("function"), str):
+                        name = obj.get("function")
+                    if name is None:
+                        return None, ("each tool call must be a JSON object with a "
+                                      "'name' field")
                     if not isinstance(name, str) or not name:
                         return None, "'name' must be a non-empty string"
                     # Qwen sometimes uses "parameters" instead of "arguments" (the key
@@ -304,6 +338,11 @@ class HermesCodec(ToolCallCodec):
                         return None, "'arguments' must be an object"
                     actions.append((name, _repair_arguments(name, args)))
         if not saw_json:
+            # No JSON anywhere in the post-think body. If the turn was a thinking trace,
+            # report it as "still thinking" rather than a hard parse error (issue #183).
+            if had_think:
+                return None, ('still thinking: the response was reasoning only — no '
+                              "parseable <tool_call> yet.")
             return None, ('could not parse a tool call: expected a '
                           '<tool_call>{...}</tool_call> block or a {"name", "arguments"} '
                           "JSON object")

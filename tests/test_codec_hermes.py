@@ -193,6 +193,51 @@ class HermesCodecTest(unittest.TestCase):
         self.assertIsNone(err)
         self.assertEqual(actions, [("a", {}), ("b", {})])
 
+    # ---- ISSUE #183: reason-then-act — thinking is never the action ----
+    def test_parse_reasoning_then_tool_call(self):
+        # A <think> preamble followed by the real <tool_call> -> only the call is parsed.
+        actions, err = self.codec.parse(
+            "<think>\nThe page has a search box e35. I should fill it, then click search.\n"
+            "</think>\n"
+            '<tool_call>\n{"name": "fill", "arguments": {"target": "e35", "text": "x"}}\n'
+            "</tool_call>")
+        self.assertIsNone(err)
+        self.assertEqual(actions, [("fill", {"target": "e35", "text": "x"})])
+
+    def test_parse_tool_call_inside_think_is_not_executed(self):
+        # A <tool_call> the model only CONSIDERED inside its thinking must be ignored; the
+        # call AFTER </think> is the real one.
+        actions, err = self.codec.parse(
+            '<think>Maybe <tool_call>{"name": "goto", "arguments": {"url": "wrong"}}'
+            "</tool_call> first? No.</think>\n"
+            '<tool_call>{"name": "goto", "arguments": {"url": "right"}}</tool_call>')
+        self.assertIsNone(err)
+        self.assertEqual(actions, [("goto", {"url": "right"})])
+
+    def test_parse_reasoning_only_is_distinct_signal(self):
+        # The model spent the turn thinking and emitted NO call -> a distinct "still
+        # thinking" signal, NOT a generic malformed-output error.
+        actions, err = self.codec.parse(
+            "<think>Let me consider the options before acting.</think>")
+        self.assertIsNone(actions)
+        self.assertIn("still thinking", err)
+
+    def test_parse_unclosed_think_truncated_is_reasoning_only(self):
+        # A budget-truncated trace leaves an UNclosed <think>; it must read as reasoning
+        # only, never as a (malformed) action.
+        actions, err = self.codec.parse(
+            "<think>I am still reasoning and got cut off mid-thought")
+        self.assertIsNone(actions)
+        self.assertIn("still thinking", err)
+
+    def test_parse_function_key_alias_for_name(self):
+        # qwen3:4b sometimes emits {"function": <name>, ...} instead of {"name": ...};
+        # accept "function" as an alias so the call is not lost.
+        actions, err = self.codec.parse(
+            '<tool_call>\n{"function": "goto", "arguments": {"url": "u"}}\n</tool_call>')
+        self.assertIsNone(err)
+        self.assertEqual(actions, [("goto", {"url": "u"})])
+
 
 if __name__ == "__main__":
     unittest.main()
