@@ -164,6 +164,16 @@ class RalphAgent:
         self._registry = registry
         self._system = system_prompt
         self._cfg = config
+        # ISSUE #193 — the model spec currently driving the run, used to size the input/
+        # snapshot budget against the ACTIVE model's per-model context window. Starts at the
+        # base role's spec and is updated by ``_escalate`` when the run switches to the API
+        # model, so the budget tracks the live client (e.g. DeepSeek/GLM's large window
+        # instead of qwen3:4b's GPU-pinned 32768) rather than a flat num_ctx.
+        from .config import resolve_role_spec
+        try:
+            self._active_spec = resolve_role_spec(config, "base")
+        except Exception:
+            self._active_spec = None
         self._validator = validator
         self._reporter = reporter or NullReporter()
         # Optional per-turn refresh hook. When set, it is called at the start of
@@ -823,7 +833,13 @@ class RalphAgent:
         touched) an EXTREMELY VISIBLE, grep-able line is emitted to BOTH stdout (the
         reporter, flushed) and the run log (``result.context_events``) so a budgeting
         event can never masquerade as a model failure. Returns the report (for tests)."""
-        report = fit_chat_history(chat_history, system, user, self._cfg)
+        # ISSUE #193 — size the fit against the ACTIVE model's per-model context window
+        # (base spec, or the escalated API model). A local model resolves back to
+        # config.num_ctx (qwen3:4b stays 32768); an API model gets its larger documented
+        # window so the latest page snapshot is preserved whole instead of truncated.
+        from .config import effective_context_window
+        window = effective_context_window(self._cfg, self._active_spec)
+        report = fit_chat_history(chat_history, system, user, self._cfg, window)
         if report.over_budget or report.acted:
             self._log_context_overrun(report, result, turn_index)
         return report
@@ -951,6 +967,9 @@ class RalphAgent:
                 f"[ESCALATION] {why} — FAILED, could NOT take over: {exc}")
             return
         self._client = new_client
+        # ISSUE #193 — the budget now follows the escalated model's context window so the
+        # live page snapshot is no longer truncated to the local model's cap post-escalation.
+        self._active_spec = spec
         # Switch the ACTIVE codec + call path + cap to the escalator model's (#179/#178).
         codec_name = resolve_model_codec(self._cfg, spec)
         escalator_codec = get_codec(codec_name)

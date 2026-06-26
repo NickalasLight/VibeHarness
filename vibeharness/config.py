@@ -405,6 +405,18 @@ class ModelToolPolicy:
     """
     codec: str
     max_actions_per_turn: int
+    # ISSUE #193 — per-MODEL context window (TOKENS) for the input/snapshot budget.
+    # This is the model's DOCUMENTED context length (ground-truthed from the provider API
+    # docs; URLs cited in MODEL_TOOL_POLICIES below) and is used ONLY to size the input
+    # budget (how much page snapshot / history to keep), via
+    # ``vibeharness.snapshot_budget.input_budget_tokens``. It is NEVER sent to a provider:
+    #   * the LOCAL Ollama path keeps sending ``Config.num_ctx`` as the runner ``num_ctx``
+    #     option (the 8 GB-GPU ceiling, #77/#140) — so for local models the resolver returns
+    #     ``config.num_ctx``, NOT this field;
+    #   * the API path (DeepSeek/GLM) sends no context size at all — this window is purely a
+    #     budgeting input, so the API never receives a giant ``num_ctx`` Ollama option.
+    # 0 means "unknown / inherit config.num_ctx" (no behaviour change).
+    context_window: int = 0
     rationale: str = ""
 
 
@@ -466,28 +478,61 @@ class ModelToolPolicy:
 #   https://api-docs.deepseek.com/guides/thinking_mode (reasoner tool-call support) ,
 #   https://api-docs.deepseek.com/guides/reasoning_model (legacy R1: FC unsupported) ,
 #   https://api-docs.deepseek.com/news/news250821 (V3.1 release: 128K ctx, chat/reasoner modes).
+# ISSUE #193 — per-MODEL context window (TOKENS), ground-truthed from the LIVE provider
+# docs (verified 2026-06, URLs below). Used ONLY to size the input/snapshot budget
+# (resolve_model_context_window → input_budget_tokens); NEVER sent to a provider. The
+# qwen3:4b window is the GPU-pinned 32768 (a hardware/VRAM limit, #77/#140 — NOT the
+# model's capability) and the LOCAL resolver returns config.num_ctx for it (so a
+# --num-ctx override is honoured); the API models get their documented windows so a large
+# (~45k-char YouTube) ARIA snapshot is no longer truncated to the 32768-derived budget.
+#
+# DeepSeek (api-docs.deepseek.com):
+#   deepseek-chat / deepseek-reasoner — DeepSeek-V3.1 documents 128K context for BOTH the
+#   non-thinking (chat) and thinking (reasoner) modes
+#   (https://api-docs.deepseek.com/news/news250821 — "128K context for both"). As of 2026
+#   these two model IDs additionally ROUTE to deepseek-v4-flash (1M context) and are slated
+#   to retire 2026-07-24 (https://api-docs.deepseek.com/news/news260424). We pin the budget
+#   window to the STABLE, model-id-native 128K (131072): it is the documented baseline, it
+#   already exceeds the largest real snapshot by ~25x (so the qwen 32768 cap is fully
+#   lifted), and it stays safely valid through the alias retirement. (Sources cited in PR:
+#   https://api-docs.deepseek.com/news/news250821 , .../news/news260424 .)
+# z.ai/GLM (docs.z.ai):
+#   glm-4.7       → 200K (204800): GLM-4.6 "expands the context window to 200K"
+#                   (https://docs.z.ai/release-notes/new-released ,
+#                    https://docs.z.ai/guides/llm/glm-4.6); glm-4.7 is the flagship
+#                   successor and inherits the 200K flagship window.
+#   glm-4.7-flash → 128K (131072): the lighter "flash" tier (GLM-4.5-Flash documents 128K
+#                   context — https://github.com/zai-org/GLM-4.5); conservative for the
+#                   small tier, still ~25x the largest snapshot.
+#   glm-5.2       → 1M (1048576): z.ai release notes — "GLM-5.2 supports 1M lossless context"
+#                   (https://docs.z.ai/release-notes/new-released).
 MODEL_TOOL_POLICIES: dict[str, ModelToolPolicy] = {
     "qwen3:4b": ModelToolPolicy(
-        codec="hermes", max_actions_per_turn=3,
-        rationale="native Hermes dialect; sub-7B 3-call accuracy peak (arXiv:2602.07359)"),
+        codec="hermes", max_actions_per_turn=3, context_window=32768,
+        rationale="native Hermes dialect; sub-7B 3-call accuracy peak (arXiv:2602.07359); "
+                  "ctx 32768 = GPU-pinned num_ctx (#77/#140), NOT a model limit"),
     "glm-4.7-flash": ModelToolPolicy(
-        codec="json", max_actions_per_turn=5,
-        rationale="API reasoning model; schema-constrained JSON; lighter flash tier (cap 5)"),
+        codec="json", max_actions_per_turn=5, context_window=131072,
+        rationale="API reasoning model; schema-constrained JSON; lighter flash tier (cap 5); "
+                  "128K ctx (GLM-4.5-Flash documented 128K)"),
     "glm-4.7": ModelToolPolicy(
-        codec="json", max_actions_per_turn=8,
-        rationale="flagship agentic-coding; 200K ctx + native parallel_tool_calls (cap 8)"),
+        codec="json", max_actions_per_turn=8, context_window=204800,
+        rationale="flagship agentic-coding; 200K ctx (GLM-4.6 documented 200K) + native "
+                  "parallel_tool_calls (cap 8)"),
     "glm-5.2": ModelToolPolicy(
-        codec="json", max_actions_per_turn=8,
-        rationale="newest flagship long-horizon agentic line (cap 8)"),
+        codec="json", max_actions_per_turn=8, context_window=1048576,
+        rationale="newest flagship long-horizon agentic line (cap 8); 1M lossless ctx "
+                  "(z.ai release notes)"),
     "deepseek-chat": ModelToolPolicy(
-        codec="json", max_actions_per_turn=6,
+        codec="json", max_actions_per_turn=6, context_window=131072,
         rationale="DeepSeek-V3.1 non-thinking; OpenAI-compat function calling; "
-                  "no documented per-request tool cap → conservative json cap 6"),
+                  "no documented per-request tool cap → conservative json cap 6; "
+                  "128K ctx (V3.1 documented baseline)"),
     "deepseek-reasoner": ModelToolPolicy(
-        codec="json", max_actions_per_turn=4,
+        codec="json", max_actions_per_turn=4, context_window=131072,
         rationale="DeepSeek-V3.1 thinking; tool calls supported since V3.1 (was unsupported "
                   "on legacy R1); reasoning_content consumed as reasoning; cap 4 (reasons "
-                  "between calls)"),
+                  "between calls); 128K ctx (V3.1 documented baseline)"),
 }
 
 # Family fallback for any other z.ai/GLM API model id (e.g. a future glm-4.7-air): the API
@@ -495,8 +540,8 @@ MODEL_TOOL_POLICIES: dict[str, ModelToolPolicy] = {
 # unrecognised GLM model resolves to the conservative `json` + 5 policy rather than silently
 # inheriting the local `hermes` default. The qwen-local default is the global Config codec.
 _GLM_FAMILY_POLICY = ModelToolPolicy(
-    codec="json", max_actions_per_turn=5,
-    rationale="unrecognised GLM/z.ai model: API JSON codec + conservative cap")
+    codec="json", max_actions_per_turn=5, context_window=131072,
+    rationale="unrecognised GLM/z.ai model: API JSON codec + conservative cap + 128K ctx")
 
 # Family fallback for any other DeepSeek API model id (issue #182) — e.g. a future
 # `deepseek-v4-flash` (the V4 successor the deepseek-chat/deepseek-reasoner aliases now point
@@ -504,8 +549,8 @@ _GLM_FAMILY_POLICY = ModelToolPolicy(
 # (never the native-only hermes), so an unrecognised DeepSeek model resolves to the
 # conservative `json` + 5 policy rather than silently inheriting the local `hermes` default.
 _DEEPSEEK_FAMILY_POLICY = ModelToolPolicy(
-    codec="json", max_actions_per_turn=5,
-    rationale="unrecognised DeepSeek model: API JSON codec + conservative cap")
+    codec="json", max_actions_per_turn=5, context_window=131072,
+    rationale="unrecognised DeepSeek model: API JSON codec + conservative cap + 128K ctx")
 
 
 def model_tool_policy(model: str | None) -> ModelToolPolicy | None:
@@ -556,3 +601,49 @@ def resolve_model_limit(config: Config, spec: ModelSpec) -> int:
     if policy is not None:
         return policy.max_actions_per_turn
     return config.max_actions_per_turn
+
+
+def _provider_is_local(name: str) -> bool:
+    """True if ``name`` is a LOCAL (ollama/llamacpp) endpoint (issue #193).
+
+    Resolved through the provider registry so it tracks one source of truth; an unknown
+    provider name degrades to a literal kind-token check (``"ollama"``/``"llamacpp"``). The
+    import is local to avoid any import-ordering coupling between config and providers."""
+    from .providers import LOCAL_KINDS, get_endpoint, is_local
+    try:
+        return is_local(get_endpoint(name))
+    except KeyError:
+        return name in LOCAL_KINDS
+
+
+def resolve_model_context_window(config: Config, spec: ModelSpec) -> int:
+    """Resolve the context window (TOKENS) that bounds the INPUT/snapshot budget for
+    ``spec`` (issue #193). This is a BUDGETING input only — it is never sent to a provider.
+
+    Precedence:
+      * a LOCAL endpoint (ollama/llamacpp) → ``config.num_ctx`` — the runner is literally
+        created at that size (the 8 GB-GPU ceiling, #77/#140), so it IS the real window and
+        a ``--num-ctx`` override is honoured. qwen3:4b therefore stays 32768, NOT raised.
+      * else the per-model registry's documented ``context_window``
+        (:func:`model_tool_policy`, ground-truthed from the provider docs) when set (> 0);
+      * else ``config.num_ctx`` (unknown API model → conservative, no behaviour change).
+    """
+    if _provider_is_local(spec.provider):
+        return config.num_ctx
+    policy = model_tool_policy(spec.model)
+    if policy is not None and policy.context_window > 0:
+        return policy.context_window
+    return config.num_ctx
+
+
+def effective_context_window(config: Config, spec: ModelSpec | None = None) -> int:
+    """The context window (TOKENS) for the ACTIVE base model (issue #193).
+
+    When ``spec`` is None the BASE role's spec is resolved (:func:`resolve_role_spec`), so
+    the input/snapshot budget reflects whichever model is currently driving the run (e.g. a
+    DeepSeek/GLM API model gets its large documented window instead of qwen3:4b's 32768).
+    Callers that have already escalated to a different model (the agent) pass that model's
+    ``spec`` explicitly so the budget tracks the live client."""
+    if spec is None:
+        spec = resolve_role_spec(config, "base")
+    return resolve_model_context_window(config, spec)
