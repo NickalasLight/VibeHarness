@@ -168,12 +168,28 @@ class ApiLLMClient(LLMClient):
                 stream=True, stream_options={"include_usage": True}, **kwargs)
             parts: list[str] = []
             reasoning_parts: list[str] = []
+            usage_seen = False
             for chunk in stream:
-                # usage chunk (last, no choices)
-                if hasattr(chunk, "usage") and chunk.usage and not chunk.choices:
-                    self.tokens_in += (chunk.usage.prompt_tokens or 0)
-                    self.tokens_out += (chunk.usage.completion_tokens or 0)
-                    continue
+                # Usage tally (issue #187). With ``stream_options={"include_usage": True}``
+                # the API reports a ``usage`` object exactly once, on the FINAL chunk. The
+                # shape differs by provider, so we MUST NOT gate the tally on empty
+                # ``choices``: OpenAI/z.ai send usage on a trailing chunk whose ``choices``
+                # is ``[]``, but DeepSeek attaches usage to the LAST CONTENT chunk (which
+                # still carries ``choices`` with ``finish_reason="stop"``). Verified live
+                # (DeepSeek chunk#7: ``choices_len=1`` + ``CompletionUsage(...)``). The old
+                # ``not chunk.choices`` guard therefore dropped DeepSeek's usage entirely,
+                # logging ``tokens_in=0``. We tally whenever usage is present and STILL fall
+                # through to process any ``choices`` on the same chunk. ``usage_seen`` guards
+                # against a misbehaving provider emitting usage more than once. Docs:
+                # https://platform.openai.com/docs/api-reference/chat/streaming (usage as a
+                # final chunk with empty ``choices``); DeepSeek shape confirmed empirically.
+                # ``completion_tokens`` already includes reasoning tokens where a reasoning
+                # model (DeepSeek/GLM ``reasoning_content``) reports them in its usage object.
+                usage = getattr(chunk, "usage", None)
+                if usage and not usage_seen:
+                    self.tokens_in += (getattr(usage, "prompt_tokens", 0) or 0)
+                    self.tokens_out += (getattr(usage, "completion_tokens", 0) or 0)
+                    usage_seen = True
                 if not chunk.choices:
                     continue
                 delta = chunk.choices[0].delta

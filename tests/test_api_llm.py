@@ -15,7 +15,46 @@ SCHEMA = {"type": "array", "items": {"type": "object"}}
 def _stream_chunk(text):
     delta = types.SimpleNamespace(content=text)
     choice = types.SimpleNamespace(delta=delta)
-    return types.SimpleNamespace(choices=[choice])
+    return types.SimpleNamespace(choices=[choice], usage=None)
+
+
+def _usage(prompt_tokens, completion_tokens):
+    return types.SimpleNamespace(prompt_tokens=prompt_tokens,
+                                 completion_tokens=completion_tokens)
+
+
+def _openai_usage_chunk(prompt_tokens, completion_tokens):
+    """OpenAI/z.ai shape: a FINAL chunk with empty ``choices`` carrying the usage object."""
+    return types.SimpleNamespace(choices=[],
+                                 usage=_usage(prompt_tokens, completion_tokens))
+
+
+def _deepseek_final_chunk(text, prompt_tokens, completion_tokens):
+    """DeepSeek shape: the LAST content chunk carries BOTH ``choices`` and ``usage``
+    (verified live: choices_len=1 + CompletionUsage(...)). Issue #187."""
+    delta = types.SimpleNamespace(content=text)
+    choice = types.SimpleNamespace(delta=delta)
+    return types.SimpleNamespace(choices=[choice],
+                                 usage=_usage(prompt_tokens, completion_tokens))
+
+
+def _reasoning_chunk(text):
+    delta = types.SimpleNamespace(content=None, reasoning_content=text)
+    choice = types.SimpleNamespace(delta=delta)
+    return types.SimpleNamespace(choices=[choice], usage=None)
+
+
+class FakeChunkCompletions:
+    """Streams a caller-supplied list of raw chunk objects (so a test can inject a usage
+    chunk of the exact provider shape)."""
+
+    def __init__(self, chunks):
+        self._chunks = chunks
+        self.calls = []
+
+    def create(self, **kwargs):
+        self.calls.append(kwargs)
+        return iter(self._chunks)
 
 
 def _full_response(text):
@@ -110,6 +149,76 @@ class ApiLLMClientTest(unittest.TestCase):
         client, _ = _client(comp)
         d = client.decide("VALIDATOR_SYS", "history", {"type": "object"})
         self.assertEqual(d.action_json, '{"verdict":"pass","reason":"ok"}')
+
+
+class UsageAccountingTest(unittest.TestCase):
+    """Issue #187: the streamed usage chunk MUST be tallied so [API_USAGE] is nonzero for
+    GLM and DeepSeek. The chunk shape differs by provider; both must be captured."""
+
+    def test_openai_style_trailing_usage_chunk_tallied(self):
+        # z.ai/OpenAI: usage rides a trailing chunk whose ``choices`` is empty.
+        chunks = [_stream_chunk("[]"),
+                  _openai_usage_chunk(prompt_tokens=120, completion_tokens=34)]
+        client, _ = _client(FakeChunkCompletions(chunks))
+        client.decide("S", "U", SCHEMA)
+        self.assertEqual(client.tokens_in, 120)
+        self.assertEqual(client.tokens_out, 34)
+        self.assertGreater(client.usage_summary()["estimated_cost_usd"], 0)
+
+    def test_deepseek_style_usage_on_final_content_chunk_tallied(self):
+        # DeepSeek: usage rides the LAST content chunk (choices non-empty). The pre-#187
+        # ``not chunk.choices`` guard dropped this, logging tokens_in=0.
+        chunks = [_stream_chunk('[{"tool":'),
+                  _deepseek_final_chunk(' "click"}]', prompt_tokens=11, completion_tokens=5)]
+        comp = FakeChunkCompletions(chunks)
+        client, _ = _client(comp)
+        d = client.decide("S", "U", SCHEMA)
+        # Content on the usage-bearing chunk is STILL processed (not dropped).
+        self.assertEqual(d.action_json, '[{"tool": "click"}]')
+        self.assertEqual(client.tokens_in, 11)
+        self.assertEqual(client.tokens_out, 5)
+
+    def test_reasoning_chunks_do_not_break_usage_tally(self):
+        # Reasoning models stream reasoning_content; completion_tokens (incl. reasoning, per
+        # the provider's usage object) is what we trust for tokens_out.
+        chunks = [_reasoning_chunk("thinking..."),
+                  _stream_chunk("[]"),
+                  _openai_usage_chunk(prompt_tokens=200, completion_tokens=88)]
+        client, _ = _client(FakeChunkCompletions(chunks))
+        d = client.decide("S", "U", SCHEMA)
+        self.assertEqual(d.reasoning, "thinking...")
+        self.assertEqual(client.tokens_in, 200)
+        self.assertEqual(client.tokens_out, 88)
+
+    def test_usage_is_cumulative_and_counted_once_per_call(self):
+        client, _ = _client(FakeChunkCompletions(
+            [_stream_chunk("[]"), _openai_usage_chunk(10, 5)]))
+        client.decide("S", "U", SCHEMA)
+        # Second call reuses the same fake chunk list -> tallies again (cumulative).
+        client._client.chat.completions = FakeChunkCompletions(
+            [_stream_chunk("[]"), _openai_usage_chunk(7, 3)])
+        client.decide("S", "U", SCHEMA)
+        self.assertEqual(client.tokens_in, 17)
+        self.assertEqual(client.tokens_out, 8)
+
+    def test_non_streaming_fallback_tallies_usage(self):
+        # The non-stream fallback path reads resp.usage (issue #187 parity).
+        err = RuntimeError("streaming is not supported for this model")
+        comp = FakeCompletions(error=err, full_text='[]')
+        client, _ = _client(comp)
+        # Attach a usage object to the non-stream response.
+        orig_create = comp.create
+
+        def create(**kwargs):
+            if kwargs.get("stream"):
+                return orig_create(**kwargs)
+            resp = orig_create(**kwargs)
+            resp.usage = _usage(40, 9)
+            return resp
+        comp.create = create
+        client.decide("S", "U", SCHEMA)
+        self.assertEqual(client.tokens_in, 40)
+        self.assertEqual(client.tokens_out, 9)
 
 
 class AdapterShapeTest(unittest.TestCase):

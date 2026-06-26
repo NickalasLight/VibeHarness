@@ -259,19 +259,21 @@ class LongRunShrinkingBudgetTest(unittest.TestCase):
 
 
 class EndToEndProviderTest(unittest.TestCase):
-    """Drive the actual cli budgeting providers with a fake raw-snapshot source (no
+    """Drive the actual cli budgeting provider with a fake raw-snapshot source (no
     browser, no model). Proves the FULL message is what gets budgeted and the snapshot is
-    trimmed at provider time. Issue #146: the budgeted snapshot now rides the USER turn
-    (``make_user_snapshot_provider``) for the agent, while the validator's TOOL-LESS
-    system-prompt provider still renders it as a `# Current page` section — both share the
-    same #43 budgeting, so the budget is asserted through whichever surface carries it."""
+    trimmed at provider time.
 
-    def _snapshot(self, cfg, raw_text, task="DO THE THING", workspace="ws-tree"):
-        # The agent-facing path: the budgeted snapshot appended to the user turn.
-        from vibeharness.cli import make_user_snapshot_provider
-        builder = SystemPromptBuilder(_registry(["web"]))
-        return make_user_snapshot_provider(
-            builder, cfg, task, lambda: workspace, (lambda: raw_text))
+    Issue #151/#187: ``make_user_snapshot_provider`` was REMOVED. The agent-facing snapshot
+    no longer rides a dedicated cli provider — it is recorded as a ``page_snapshot`` tool
+    observation in the agent loop (``RalphAgent.run``) and budgeted at the TOP of the next
+    turn by ``_fit_request_to_context`` against the assembled request, not at provider time.
+    These tests therefore exercise the #43 budgeting through the surviving cli surface that
+    STILL renders a budgeted snapshot: the validator's TOOL-LESS system-prompt provider
+    (``make_system_prompt_provider(..., include_tool_guidance=False)``), which appends the
+    same #43-budgeted page as a `# Current page` section. Both the (now agent-internal) and
+    validator paths share the one ``_budget_snapshot_for_turn`` core, so this remains a true
+    end-to-end check that the page is sized against the FULL message (system + user) and
+    trimmed/omitted exactly as #43 dictates."""
 
     def _validator_prompt(self, cfg, raw_text, task="DO THE THING", workspace="ws-tree"):
         # The validator path: the tool-less system prompt WITH the page section appended.
@@ -295,22 +297,22 @@ class EndToEndProviderTest(unittest.TestCase):
     def test_small_snapshot_injected_whole(self):
         cfg = _cfg()
         raw = "### Page\nCONSENT BANNER e6"
-        snap = self._snapshot(cfg, raw)(user="short user message")
-        self.assertIn("CONSENT BANNER e6", snap)
-        self.assertNotIn("truncated", snap)
-        # And the validator section carries the same snapshot under its heading.
+        # The validator section carries the budgeted snapshot under its heading, whole.
         vp = self._validator_prompt(cfg, raw)(user="short user message")
         self.assertIn("# Current page (live snapshot", vp)
         self.assertIn("CONSENT BANNER e6", vp)
+        self.assertNotIn("truncated", vp)
 
     def test_large_snapshot_truncated_against_full_message(self):
         # Small window so even a modest snapshot must truncate; the user message is part
-        # of 'rest', so a bigger user message yields a smaller injected snapshot.
+        # of 'rest', so a bigger user message yields a smaller injected snapshot. The
+        # returned prompt is (constant system prefix) + the budgeted page section, so its
+        # length tracks the surviving snapshot.
         cfg = _cfg(num_ctx=8_000, reason_tokens=500, action_tokens=1_500,
                    snapshot_safety_margin_tokens=0)
         raw = "z" * 100_000
-        small_user = self._snapshot(cfg, raw)(user="u" * 100)
-        big_user = self._snapshot(cfg, raw)(user="u" * 4_000)
+        small_user = self._validator_prompt(cfg, raw)(user="u" * 100)
+        big_user = self._validator_prompt(cfg, raw)(user="u" * 4_000)
         self.assertIn("truncated", small_user)
         self.assertIn("truncated", big_user)
         # Bigger user message -> 'rest' bigger -> fewer snapshot chars survive.
@@ -320,27 +322,21 @@ class EndToEndProviderTest(unittest.TestCase):
         # 'rest' alone already exceeds the window: provider must inject NO snapshot.
         cfg = _cfg(num_ctx=600, reason_tokens=200, action_tokens=300,
                    snapshot_safety_margin_tokens=0)
-        snap = self._snapshot(cfg, "z" * 100_000)(user="u" * 8_000)
-        self.assertEqual(snap, "")
         vp = self._validator_prompt(cfg, "z" * 100_000)(user="u" * 8_000)
         self.assertNotIn("# Current page (live snapshot", vp)
 
     def test_no_snapshot_renders_nothing(self):
         cfg = _cfg()
-        self.assertEqual(self._snapshot(cfg, "")(user="hi"), "")
         vp = self._validator_prompt(cfg, "")(user="hi")
         self.assertNotIn("# Current page (live snapshot", vp)
 
     def test_provider_accepts_user_message(self):
-        # The providers must accept the per-turn user message (arity contract for #43).
+        # The provider must accept the per-turn user message (arity contract for #43).
         import inspect
-        from vibeharness.cli import (make_system_prompt_provider,
-                                     make_user_snapshot_provider)
+        from vibeharness.cli import make_system_prompt_provider
         builder = SystemPromptBuilder(_registry(["web"]))
         p = make_system_prompt_provider(builder, _cfg(), "t", lambda: "ws", (lambda: "snap"))
         self.assertEqual(len(inspect.signature(p).parameters), 1)
-        s = make_user_snapshot_provider(builder, _cfg(), "t", lambda: "ws", (lambda: "snap"))
-        self.assertEqual(len(inspect.signature(s).parameters), 1)
 
 
 class PinnedNumCtxFitsHeavyPageTest(unittest.TestCase):
