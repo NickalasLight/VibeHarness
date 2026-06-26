@@ -38,7 +38,7 @@ from .memory import NarrativeMemory
 from .prompt import build_turn_prompt
 from .registry import ToolRegistry
 from .reporting import NullReporter, Reporter
-from .snapshot_budget import estimate_tokens, input_budget_tokens
+from .snapshot_budget import fit_chat_history, BudgetFitReport
 from .validation import Validator
 
 
@@ -71,6 +71,11 @@ class RunResult:
     # Set when the run ended for a reason other than finishing/exhausting the step
     # budget (e.g. a turn exceeded its wall-clock generation budget). Empty otherwise.
     stop_reason: str = ""
+    # Context-budget events (issues #170/#172/#173): one entry every time the assembled
+    # request would exceed num_ctx and the harness evicted history and/or truncated the
+    # live page snapshot to fit. Persisted in the run log so an agent that "went blind"
+    # is never a silent budgeting event. Each entry mirrors the loud stdout line.
+    context_events: list[dict] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -254,6 +259,14 @@ class RalphAgent:
                         user += (f"\n\n<user_advice>The human user gives you the following "
                                  f"hint: '{hint}'</user_advice>")
                 system = self._build_system(user)
+                # NATIVE stateful budget guard (issues #170/#172/#173). BEFORE the request
+                # is assembled/logged/sent, ensure [system] + chat_history + [user] fits
+                # num_ctx: evict the OLDEST history first, and truncate the live page
+                # snapshot ONLY as a last resort (the snapshot is the agent's eyes). Any
+                # action is logged LOUDLY (never a silent "the agent went blind"). Done
+                # here so the input dump below records the ACTUAL request that is sent.
+                if self._native:
+                    self._fit_request_to_context(chat_history, system, user, result, i)
                 # Persist the EXACT request BEFORE the blocking model call, so a crash
                 # DURING generation still leaves this turn's full input (incl. the
                 # accumulated history and its token size) on disk (#170/#171). Legacy
@@ -515,14 +528,17 @@ class RalphAgent:
                 # message per executed action (its observation) — exactly the shape
                 # Ollama's chat template feeds back via <tool_response>. Done here, after
                 # the action loop, so every observation recorded on the turn is captured.
-                # Then FIFO-evict the oldest non-system messages to stay within the token
-                # budget. Skipped on the legacy path (chat_history stays empty/unused).
+                # The token/snapshot budget is NOT enforced here: it is enforced at the
+                # TOP of the next turn by ``_fit_request_to_context`` against the ACTUAL
+                # assembled request (system + history + user), where it can evict oldest
+                # history first and truncate the live snapshot only as a last resort, and
+                # log it loudly (issues #170/#172/#173). Keeping a single budgeter there
+                # avoids two policies fighting over the history. Skipped on the legacy path.
                 if self._native:
                     # Evict any previous page_snapshot observation before committing the
                     # new turn so only the LATEST snapshot is visible in history.
                     self._evict_old_page_snapshot(chat_history)
                     self._commit_turn_to_history(chat_history, user, decision, turn)
-                    self._evict_history(chat_history, system, user)
             except BaseException as exc:
                 # Failsafe: any unexpected mid-turn error (an uncaught tool/validator/
                 # decode exception, a KeyboardInterrupt, …) must NOT discard the work
@@ -744,42 +760,77 @@ class RalphAgent:
             )
             chat_history.append({"role": "user", "content": responses})
 
-    def _evict_history(self, chat_history: list[dict], system: str, user: str) -> None:
-        """FIFO-evict the OLDEST non-system messages until the history fits the budget.
+    def _fit_request_to_context(self, chat_history: list[dict], system: str, user: str,
+                                result: "RunResult", turn_index: int) -> BudgetFitReport:
+        """Make the assembled native request fit ``num_ctx`` (issues #170/#172/#173).
 
-        Two bounds, both applied (whichever is tighter wins):
-          * a TOKEN budget — the input window (``num_ctx`` minus the output reservation
-            and safety margin, via :func:`input_budget_tokens`) minus what the freshly
-            rebuilt system + the next user message will cost; the remainder is what the
-            history may occupy. Tokens are estimated with the same conservative
-            chars-per-token heuristic the snapshot budget uses (#43), so the two agree.
-          * an optional fixed message cap (``chat_history_max_turns``, 0 = off).
+        Delegates the maths to :func:`fit_chat_history`, which mutates ``chat_history``
+        in place: it evicts the OLDEST non-snapshot messages first (respecting
+        ``chat_history_max_turns``) and truncates the live page snapshot ONLY as a last
+        resort, so the latest snapshot — the agent's eyes — is preserved whole whenever
+        evicting stale history alone makes the request fit.
 
-        The system message is regenerated each turn and is NEVER evicted (it is not in
-        ``chat_history``). We always keep at least the most recent message so a single
-        oversized turn cannot empty the history entirely."""
-        cfg = self._cfg
-        cpt = cfg.snapshot_chars_per_token
-        in_budget = input_budget_tokens(cfg)
-        # Reserve room for the system + the user message that will accompany the history
-        # on the NEXT request (the current user turn is already in chat_history).
-        fixed = estimate_tokens(system, cpt) + estimate_tokens(user, cpt)
-        history_budget = max(0, in_budget - fixed)
+        When the request was over budget (anything was evicted or the snapshot was
+        touched) an EXTREMELY VISIBLE, grep-able line is emitted to BOTH stdout (the
+        reporter, flushed) and the run log (``result.context_events``) so a budgeting
+        event can never masquerade as a model failure. Returns the report (for tests)."""
+        report = fit_chat_history(chat_history, system, user, self._cfg)
+        if report.over_budget or report.acted:
+            self._log_context_overrun(report, result, turn_index)
+        return report
 
-        def msg_tokens(m: dict) -> int:
-            text = m.get("content") or ""
-            for tc in m.get("tool_calls", []) or []:
-                text += json.dumps(tc, ensure_ascii=False)
-            return estimate_tokens(text, cpt)
+    def _log_context_overrun(self, report: BudgetFitReport, result: "RunResult",
+                             turn_index: int) -> None:
+        """Emit the loud, single-line, grep-able CONTEXT-OVERRUN signal (issue #172).
 
-        # Optional fixed cap first (coarse), then the token budget.
-        cap = cfg.chat_history_max_turns
-        if cap and cap > 0:
-            while len(chat_history) > cap:
-                chat_history.pop(0)
-        total = sum(msg_tokens(m) for m in chat_history)
-        while total > history_budget and len(chat_history) > 1:
-            total -= msg_tokens(chat_history.pop(0))
+        Marker ``!!! CONTEXT-OVERRUN`` so it is trivially searchable. The fully-dropped
+        snapshot (the agent is blind) is flagged even more prominently than a partial
+        truncation; an eviction-only event (snapshot preserved) is reported as the
+        healthy, preferred outcome. Written to stdout via the reporter (flushed) AND
+        appended to the run log so a subsequent crash can never hide it."""
+        common = (
+            f"request ~{report.request_tokens_before}->{report.request_tokens_after}"
+            f"/{report.num_ctx} tok, input_budget {report.input_budget_tokens} tok, "
+            f"history {report.history_msgs_after} msgs/{report.history_tokens_after} tok, "
+            f"evicted {report.evicted_msgs} msgs/{report.evicted_tokens} tok")
+        if report.snapshot_dropped:
+            kind = "snapshot-dropped"
+            line = (f"!!! CONTEXT-OVERRUN [SNAPSHOT FULLY DROPPED — AGENT IS BLIND THIS "
+                    f"TURN] turn {turn_index}: the live page snapshot "
+                    f"({report.snapshot_raw_chars} chars) did not fit even after evicting "
+                    f"all evictable history — {common} !!!")
+        elif report.snapshot_truncated:
+            kind = "snapshot-truncated"
+            line = (f"!!! CONTEXT-OVERRUN [snapshot truncated] turn {turn_index}: kept "
+                    f"{report.snapshot_kept_chars}/{report.snapshot_raw_chars} chars "
+                    f"(dropped {report.snapshot_dropped_chars}) — {common} !!!")
+        elif report.evicted_msgs:
+            kind = "history-evicted"
+            line = (f"!!! CONTEXT-OVERRUN [history evicted, snapshot preserved] turn "
+                    f"{turn_index}: {common} !!!")
+        else:
+            # Over budget but nothing evictable and no snapshot to trim — still loud.
+            kind = "over-budget"
+            line = (f"!!! CONTEXT-OVERRUN [over budget, nothing to evict] turn "
+                    f"{turn_index}: {common} !!!")
+        # stdout (flushed by the reporter) + the run log, so neither path can hide it.
+        self._reporter.note(line)
+        result.context_events.append({
+            "turn": turn_index, "kind": kind,
+            "request_tokens_before": report.request_tokens_before,
+            "request_tokens_after": report.request_tokens_after,
+            "num_ctx": report.num_ctx,
+            "input_budget_tokens": report.input_budget_tokens,
+            "evicted_msgs": report.evicted_msgs,
+            "evicted_tokens": report.evicted_tokens,
+            "snapshot_raw_chars": report.snapshot_raw_chars,
+            "snapshot_kept_chars": report.snapshot_kept_chars,
+            "snapshot_dropped_chars": report.snapshot_dropped_chars,
+            "snapshot_truncated": report.snapshot_truncated,
+            "snapshot_dropped": report.snapshot_dropped,
+            "fits_after": report.fits_after,
+            "message": line,
+        })
 
     # ---- validation ----
     def _validate(self, args: dict, turn: Turn, memory: NarrativeMemory,
