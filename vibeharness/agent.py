@@ -159,10 +159,17 @@ class RalphAgent:
         # flow), and (c) the codec actually speaks native tools (codec.tools() non-None —
         # only ``hermes`` today). Otherwise we use the legacy single-message decide(),
         # so json/xml/etc codecs and VibeThinker are completely unaffected.
+        # The client capability is the final gate (issue #163): a non-native client (the
+        # single-shot API client) is ALWAYS driven via _decide, never decide_chat, even if
+        # the codec speaks native tools — the CLI separately auto-degrades the codec to a
+        # constrained-JSON one for such clients (see clients.select_execution_codec). The
+        # test doubles that implement decide_chat report native via the base default, so the
+        # existing native-path tests are unaffected.
         self._native = bool(
             getattr(config, "native_tools", False)
             and not config.two_phase
             and self._codec.tools(registry) is not None
+            and self._client.supports_native_tools()
         )
         # The native enveloped tool schemas, computed once (stateless). Sent in every
         # native /api/chat request's ``tools:`` field so Ollama applies the model's own
@@ -799,15 +806,18 @@ class RalphAgent:
             return
         detector.escalated = True
         try:
-            from .providers import make_api_client
-            new_client = make_api_client(
-                self._cfg.escalation_provider,
-                self._cfg.escalation_model or None,
-            )
+            # Build the escalation client through the unified factory + the escalation role
+            # spec (issue #163), so escalation honours config.models["escalation"] (or the
+            # legacy escalation_provider/escalation_model keys via resolve_role_spec) exactly
+            # like every other role. For the default zhipuai/glm config this resolves to the
+            # same make_api_client("zhipuai", "glm-5.2") call as before.
+            from .clients import build_client
+            from .config import resolve_role_spec
+            spec = resolve_role_spec(self._cfg, "escalation")
+            new_client = build_client(spec, self._cfg)
             self._client = new_client
             self._reporter.note(
-                f"[ESCALATION] {why} — switching to "
-                f"{self._cfg.escalation_provider}:{self._cfg.escalation_model}"
+                f"[ESCALATION] {why} — switching to {spec.provider}:{spec.model}"
             )
         except Exception as exc:
             self._reporter.note(

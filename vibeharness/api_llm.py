@@ -23,6 +23,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 
+from .codec import DecodeConstraint
 from .llm import Decision, LLMClient, TokenSink
 from .providers import ApiProviderConfig
 
@@ -93,33 +94,70 @@ class ApiLLMClient(LLMClient):
             "estimated_cost_usd": round(self.cost_usd(), 6),
         }
 
+    def supports_native_tools(self) -> bool:
+        """The OpenAI-compatible client is SINGLE-SHOT (issue #163): it does not speak
+        Ollama's native ``tools:`` /api/chat protocol, so it reports ``False``. The agent
+        therefore routes API-backed roles to ``_decide`` (single-shot) and the harness
+        auto-selects a constrained-JSON codec for them, rather than the stateful
+        ``decide_chat`` path. ``decide_chat`` stays inherited from the base default
+        (flatten → ``decide``) for any caller that still invokes it."""
+        return False
+
     # ---- LLMClient interface ----
-    def decide(self, system: str, user: str, action_schema: dict,
+    def decide(self, system: str, user: str,
+               constraint: "DecodeConstraint | dict | None",
                on_reason: TokenSink | None = None,
                on_action: TokenSink | None = None) -> Decision:
-        """Single-shot decision. The model is asked to emit JSON matching
-        ``action_schema`` (the agent's constrained-action protocol). For the
-        validator, ``action_schema`` is the verdict schema. Returns the emitted
-        text as ``action_json``; reasoning is left empty (the API hides it)."""
-        instructed_user = f"{user}\n\n" + _ACTION_INSTRUCTION.format(
-            schema=json.dumps(action_schema, ensure_ascii=False))
-        text = self._chat([
+        """Single-shot decision matching the real :class:`~vibeharness.llm.LLMClient`
+        interface (issue #163 — repairs the stale ``action_schema`` signature that broke
+        the validator and escalation API paths).
+
+        ``constraint`` is a :class:`~vibeharness.codec.DecodeConstraint`. Its
+        ``json_schema`` (when not ``None``) becomes the JSON-instruction appended to the
+        user turn so the model emits exactly that shape — the agent's constrained-action
+        array, or the validator's verdict schema; the schema clause is OMITTED when
+        ``json_schema`` is ``None`` (an unconstrained codec). Its ``stop`` strings are
+        forwarded to the API's ``stop`` parameter.
+
+        For backward compatibility a bare ``dict`` (a raw JSON schema) or ``None`` is also
+        accepted, so historical callers/tests that passed a schema directly keep working.
+        Returns the emitted text as ``action_json``; ``reasoning`` carries any
+        reasoning-trace tokens the model exposed separately (see :meth:`_chat`)."""
+        schema, stop = _unpack_constraint(constraint)
+        instructed_user = user
+        if schema is not None:
+            instructed_user = f"{user}\n\n" + _ACTION_INSTRUCTION.format(
+                schema=json.dumps(schema, ensure_ascii=False))
+        text, reasoning = self._chat([
             {"role": "system", "content": system},
             {"role": "user", "content": instructed_user},
-        ], on_token=on_action)
-        return Decision(reasoning="", action_json=_strip_fences(text))
+        ], on_token=on_action, on_reason=on_reason, stop=stop)
+        # GLM reasoning models (e.g. glm-4.7-flash) sometimes stream the WHOLE answer as
+        # reasoning_content and leave content empty. If so, fall back to the reasoning text
+        # as the action payload so the verdict/action is never lost (see _chat).
+        action = text if text.strip() else reasoning
+        return Decision(reasoning=reasoning, action_json=_strip_fences(action))
 
     # ---- transport ----
-    def _chat(self, messages: list[dict], on_token: TokenSink | None) -> str:
-        """Stream a chat completion, emitting chunks to ``on_token``. Falls back to
-        a non-streaming call if the provider does not support streaming."""
+    def _chat(self, messages: list[dict], on_token: TokenSink | None,
+              on_reason: TokenSink | None = None,
+              stop: "tuple[str, ...]" = ()) -> "tuple[str, str]":
+        """Stream a chat completion, returning ``(content, reasoning)``.
+
+        ``content`` is the visible answer; ``reasoning`` accumulates any
+        ``delta.reasoning_content`` a reasoning model (GLM-4.x) streams separately — those
+        tokens go to ``on_reason`` and never pollute the JSON answer. Visible content goes
+        to ``on_token``. Falls back to a non-streaming call if the provider rejects
+        streaming. ``stop`` is forwarded as the API ``stop`` parameter when non-empty."""
+        kwargs: dict = {"model": self._model, "messages": messages,
+                        "temperature": self._temperature}
+        if stop:
+            kwargs["stop"] = list(stop)
         try:
             stream = self._client.chat.completions.create(
-                model=self._model, messages=messages,
-                temperature=self._temperature, stream=True,
-                stream_options={"include_usage": True},
-            )
+                stream=True, stream_options={"include_usage": True}, **kwargs)
             parts: list[str] = []
+            reasoning_parts: list[str] = []
             for chunk in stream:
                 # usage chunk (last, no choices)
                 if hasattr(chunk, "usage") and chunk.usage and not chunk.choices:
@@ -128,27 +166,36 @@ class ApiLLMClient(LLMClient):
                     continue
                 if not chunk.choices:
                     continue
-                piece = chunk.choices[0].delta.content
+                delta = chunk.choices[0].delta
+                think = getattr(delta, "reasoning_content", None)
+                if think:
+                    reasoning_parts.append(think)
+                    if on_reason:
+                        on_reason(think)
+                piece = getattr(delta, "content", None)
                 if piece:
                     parts.append(piece)
                     if on_token:
                         on_token(piece)
-            return "".join(parts)
+            return "".join(parts), "".join(reasoning_parts)
         except Exception as e:   # openai.APIError, connection errors, etc.
             # Some endpoints/models reject streaming; retry once non-streamed.
             if _is_streaming_unsupported(e):
-                return self._chat_once(messages, on_token)
+                return self._chat_once(messages, on_token, on_reason, stop)
             raise ApiUnavailable(
                 f"{self._provider.name} API call failed "
                 f"(model={self._model}): {type(e).__name__}: {e}"
             ) from e
 
-    def _chat_once(self, messages: list[dict], on_token: TokenSink | None) -> str:
+    def _chat_once(self, messages: list[dict], on_token: TokenSink | None,
+                   on_reason: TokenSink | None = None,
+                   stop: "tuple[str, ...]" = ()) -> "tuple[str, str]":
+        kwargs: dict = {"model": self._model, "messages": messages,
+                        "temperature": self._temperature, "stream": False}
+        if stop:
+            kwargs["stop"] = list(stop)
         try:
-            resp = self._client.chat.completions.create(
-                model=self._model, messages=messages,
-                temperature=self._temperature, stream=False,
-            )
+            resp = self._client.chat.completions.create(**kwargs)
         except Exception as e:
             raise ApiUnavailable(
                 f"{self._provider.name} API call failed "
@@ -158,10 +205,33 @@ class ApiLLMClient(LLMClient):
         if usage:
             self.tokens_in += (getattr(usage, "prompt_tokens", 0) or 0)
             self.tokens_out += (getattr(usage, "completion_tokens", 0) or 0)
-        text = (resp.choices[0].message.content or "") if resp.choices else ""
+        message = resp.choices[0].message if resp.choices else None
+        text = (getattr(message, "content", "") or "") if message else ""
+        reasoning = (getattr(message, "reasoning_content", "") or "") if message else ""
+        if reasoning and on_reason:
+            on_reason(reasoning)
         if text and on_token:
             on_token(text)
-        return text
+        return text, reasoning
+
+
+def _unpack_constraint(
+    constraint: "DecodeConstraint | dict | None",
+) -> "tuple[dict | None, tuple[str, ...]]":
+    """Return ``(json_schema, stop)`` from a decode constraint (issue #163).
+
+    The agent and validator pass a :class:`~vibeharness.codec.DecodeConstraint`; we read
+    its ``json_schema`` (the shape to instruct, or ``None`` for an unconstrained codec) and
+    its ``stop`` strings. For backward compatibility a bare schema ``dict`` is treated as
+    the json_schema with no stop strings, and ``None`` means "no schema, no stop"."""
+    if constraint is None:
+        return None, ()
+    if isinstance(constraint, DecodeConstraint):
+        return constraint.json_schema, tuple(constraint.stop or ())
+    if isinstance(constraint, dict):
+        return constraint, ()
+    # Duck-typed fallback: anything exposing the two attributes.
+    return getattr(constraint, "json_schema", None), tuple(getattr(constraint, "stop", ()) or ())
 
 
 def _is_streaming_unsupported(exc: Exception) -> bool:
