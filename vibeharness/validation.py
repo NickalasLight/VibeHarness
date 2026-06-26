@@ -43,9 +43,8 @@ unverified actions as incomplete.
 - Be strict but fair. If ANY required part of the task is missing, not done, or not \
 supported by the snapshot/history, the verdict is "fail".
 - When you fail it, do NOT merely diagnose what is missing. Your `reason` MUST give \
-a CONCRETE, PRIORITIZED next-step recommendation that unblocks the working agent (it \
-is a small 3B model that freezes when it cannot decide which element to act on, even \
-though the snapshot names it). Make the decision FOR it:
+a CONCRETE, PRIORITIZED next-step recommendation that unblocks the working agent. \
+Make the decision FOR it:
   * Name the SINGLE most important next action AND its EXACT ref (the one thing that \
 unblocks progress) first, then 1-2 concrete follow-up steps.
   * Use ONLY real refs/text that ACTUALLY EXIST in the page snapshot you see. Never \
