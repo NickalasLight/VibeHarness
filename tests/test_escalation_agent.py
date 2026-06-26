@@ -112,7 +112,7 @@ class EscalationAgentTest(unittest.TestCase):
     # ---- issue #191: per-model codec/path switch + recorded events ----
     def test_takeover_switches_codec_to_json_single_shot(self):
         # Escalating to a GLM model (json policy) MUST flip the agent to the json codec
-        # + single-shot path + the escalator's per-turn cap (glm-5.2 -> 99 since #197), not leave it
+        # + single-shot path + the escalator's per-turn cap (glm-5.2 -> 10 since #206), not leave it
         # on the local native/hermes path (the #179 failure).
         action = {"tool": "list_directory", "args": {"path": self.tmp.name}}
         cfg = Config(max_steps=5, escalation_enabled=True, escalation_stuck_threshold=3,
@@ -127,7 +127,7 @@ class EscalationAgentTest(unittest.TestCase):
         self.assertIs(agent._client, swapped)
         self.assertEqual(agent._codec.name, "json")     # codec = json for the API path
         self.assertFalse(agent._native)                 # single-shot path
-        self.assertEqual(agent._max_actions, 99)        # flipped to glm-5.2 policy cap (99 since #197)
+        self.assertEqual(agent._max_actions, 10)        # flipped to glm-5.2 policy cap (10 since #206)
         # a VISIBLE success event is recorded in the run log
         evs = [e for e in result.escalation_events if e["success"]]
         self.assertEqual(len(evs), 1)

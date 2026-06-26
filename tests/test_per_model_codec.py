@@ -29,37 +29,43 @@ from vibeharness.providers import get_endpoint
 # Per-model policy registry.
 # --------------------------------------------------------------------------- #
 class ModelPolicyTest(unittest.TestCase):
-    # ISSUE #197: per-turn cap lifted to 99 on every policy "for now" (supersedes the
-    # #178-ground-truthed per-model caps); codec is unchanged.
+    # ISSUE #206: GLM + DeepSeek per-turn caps set to 10 (steady state, superseding the
+    # temporary #197 lift to 99); qwen3:4b stays at 99. Codecs are unchanged.
     def test_qwen_is_hermes_99(self):
         p = model_tool_policy("qwen3:4b")
         self.assertEqual((p.codec, p.max_actions_per_turn), ("hermes", 99))
 
-    def test_glm_flash_is_json_99(self):
+    def test_glm_flash_is_json_10(self):
         p = model_tool_policy("glm-4.7-flash")
-        self.assertEqual((p.codec, p.max_actions_per_turn), ("json", 99))
+        self.assertEqual((p.codec, p.max_actions_per_turn), ("json", 10))
 
-    def test_glm_flagships_are_json_99(self):
+    def test_glm_flagships_are_json_10(self):
         for m in ("glm-4.7", "glm-5.2"):
             p = model_tool_policy(m)
-            self.assertEqual((p.codec, p.max_actions_per_turn), ("json", 99), m)
+            self.assertEqual((p.codec, p.max_actions_per_turn), ("json", 10), m)
 
-    def test_deepseek_chat_is_json_99(self):
+    def test_deepseek_chat_is_json_10(self):
         # Issue #182: DeepSeek-V3.1 non-thinking; OpenAI-compat function calling → json codec.
         p = model_tool_policy("deepseek-chat")
-        self.assertEqual((p.codec, p.max_actions_per_turn), ("json", 99))
+        self.assertEqual((p.codec, p.max_actions_per_turn), ("json", 10))
 
-    def test_deepseek_reasoner_is_json_99(self):
+    def test_deepseek_reasoner_is_json_10(self):
         # Issue #182: V3.1 thinking mode supports tool calls; reasoning_content as reasoning.
         p = model_tool_policy("deepseek-reasoner")
-        self.assertEqual((p.codec, p.max_actions_per_turn), ("json", 99))
+        self.assertEqual((p.codec, p.max_actions_per_turn), ("json", 10))
 
     def test_deepseek_v4_explicit_policies(self):
-        # Issue #197: explicit V4 entries — json codec, native 1M context, cap 99.
+        # Issue #206: explicit V4 entries — json codec, native 1M context, cap 10.
         for m in ("deepseek-v4-flash", "deepseek-v4-pro"):
             p = model_tool_policy(m)
-            self.assertEqual((p.codec, p.max_actions_per_turn), ("json", 99), m)
+            self.assertEqual((p.codec, p.max_actions_per_turn), ("json", 10), m)
             self.assertEqual(p.context_window, 1_000_000, m)
+
+    def test_glm_and_deepseek_family_fallbacks_cap_10(self):
+        # Issue #206: both family fallbacks resolve to cap 10 (json codec).
+        for m in ("glm-4.7-air", "deepseek-v9-flash"):
+            p = model_tool_policy(m)
+            self.assertEqual((p.codec, p.max_actions_per_turn), ("json", 10), m)
 
     def test_unknown_deepseek_family_falls_back_to_json(self):
         # A still-unknown future DeepSeek id gets the schema-constrained codec via fallback.
@@ -93,7 +99,7 @@ class ResolveCodecLimitTest(unittest.TestCase):
     def test_registry_used_when_spec_unset(self):
         spec = ModelSpec(provider="zhipuai", model="glm-4.7")
         self.assertEqual(resolve_model_codec(Config(), spec), "json")
-        self.assertEqual(resolve_model_limit(Config(), spec), 99)  # #197: cap lifted to 99
+        self.assertEqual(resolve_model_limit(Config(), spec), 10)  # #206: GLM cap set to 10
 
     def test_config_fallback_for_unknown_model(self):
         spec = ModelSpec(provider="ollama", model="mystery:1b")
@@ -104,7 +110,7 @@ class ResolveCodecLimitTest(unittest.TestCase):
     def test_qwen_resolves_to_hermes(self):
         spec = ModelSpec(provider="ollama", model="qwen3:4b")
         self.assertEqual(resolve_model_codec(Config(), spec), "hermes")
-        self.assertEqual(resolve_model_limit(Config(), spec), 99)  # #197: cap lifted to 99
+        self.assertEqual(resolve_model_limit(Config(), spec), 99)  # #206: qwen stays at 99
 
 
 # --------------------------------------------------------------------------- #
@@ -135,25 +141,25 @@ class CliResolutionTest(unittest.TestCase):
         cfg = self._cfg("task", "--base-provider", "zhipuai",
                         "--base-model", "glm-4.7-flash")
         self.assertEqual(cfg.codec, "json")
-        self.assertEqual(cfg.max_actions_per_turn, 99)  # #197: cap lifted to 99
+        self.assertEqual(cfg.max_actions_per_turn, 10)  # #206: GLM cap set to 10
 
     def test_glm_flagship_base_cap(self):
         cfg = self._cfg("task", "--base-provider", "zhipuai", "--base-model", "glm-4.7")
         self.assertEqual(cfg.codec, "json")
-        self.assertEqual(cfg.max_actions_per_turn, 99)  # #197: cap lifted to 99
+        self.assertEqual(cfg.max_actions_per_turn, 10)  # #206: GLM cap set to 10
 
     def test_deepseek_chat_base_provider_switches_to_json_and_cap(self):
         # Issue #182: --base-provider deepseek --base-model deepseek-chat → json codec.
         cfg = self._cfg("task", "--base-provider", "deepseek",
                         "--base-model", "deepseek-chat")
         self.assertEqual(cfg.codec, "json")
-        self.assertEqual(cfg.max_actions_per_turn, 99)  # #197: cap lifted to 99
+        self.assertEqual(cfg.max_actions_per_turn, 10)  # #206: DeepSeek cap set to 10
 
     def test_deepseek_reasoner_base_cap(self):
         cfg = self._cfg("task", "--base-provider", "deepseek",
                         "--base-model", "deepseek-reasoner")
         self.assertEqual(cfg.codec, "json")
-        self.assertEqual(cfg.max_actions_per_turn, 99)  # #197: cap lifted to 99
+        self.assertEqual(cfg.max_actions_per_turn, 10)  # #206: DeepSeek cap set to 10
 
     def test_explicit_codec_flag_wins_over_per_model(self):
         cfg = self._cfg("task", "--base-provider", "zhipuai",

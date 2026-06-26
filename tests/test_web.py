@@ -15,6 +15,7 @@ import subprocess
 import sys
 import time
 import unittest
+from unittest import mock
 
 from vibeharness.config import Config
 from vibeharness.web import (
@@ -213,6 +214,120 @@ class SubtoolMappingTest(unittest.TestCase):
         self.assertFalse(res.ok)
         self.assertIn("failed", res.observation)
         self.assertIn("not found", res.observation)
+
+
+class ClickRepeatAndBackGuardTest(unittest.TestCase):
+    """Issue #206: `click` gains a `repeat` count (N clicks in one call, 2s settle
+    after each) and the old back-button guard is gone (clicking a "Previous month"/
+    "Back" element is no longer rejected)."""
+
+    # A snapshot whose only interactable is a date-picker "Previous month" control —
+    # exactly the label the deleted _BACK_BUTTON_RE used to block.
+    _PREV_SNAP = (
+        'Page: "Calendar"\n'
+        '  - button "Previous month" [ref=e192] [cursor=pointer]: ‹\n'
+        '  - button "Next month" [ref=e193] [cursor=pointer]: ›\n'
+    )
+
+    def _click(self, output=None):
+        out = output if output is not None else self._PREV_SNAP
+        cli = FakeCli(ok=True, output=out)
+        return ClickTool(cli, observation_limit=2000), cli
+
+    def test_repeat_param_declared_optional_default_1(self):
+        tool, _ = self._click()
+        repeat = next(p for p in tool.parameters if p.name == "repeat")
+        self.assertEqual(repeat.type, "integer")
+        self.assertFalse(repeat.required)
+        self.assertEqual(repeat.default, 1)
+        # repeat is NOT in the required list of the derived schema.
+        self.assertNotIn("repeat", tool._args_schema().get("required", []))
+
+    def test_default_is_single_click_with_one_settle(self):
+        tool, cli = self._click()
+        with mock.patch("vibeharness.web.time.sleep") as slp:
+            res = tool.run({"target": "e192"})       # no repeat -> default 1
+        self.assertTrue(res.ok)
+        self.assertEqual([c for c in cli.calls if c and c[0] == "click"],
+                         [["click", "e192"]])
+        slp.assert_called_once_with(2.0)
+
+    def test_repeat_clicks_n_times_with_settle_after_each(self):
+        tool, cli = self._click()
+        with mock.patch("vibeharness.web.time.sleep") as slp:
+            res = tool.run({"target": "e192", "repeat": 5})
+        self.assertTrue(res.ok)
+        clicks = [c for c in cli.calls if c and c[0] == "click"]
+        self.assertEqual(clicks, [["click", "e192"]] * 5)        # 5 real clicks
+        # 2s settle AFTER each of the 5 clicks (commit 6a131bf preserved).
+        self.assertEqual(slp.call_args_list, [mock.call(2.0)] * 5)
+        self.assertIn("5 times", res.observation)
+
+    def test_repeat_accepts_string_integer(self):
+        # Models often emit numbers as JSON strings; "3" must coerce to 3 clicks.
+        tool, cli = self._click()
+        with mock.patch("vibeharness.web.time.sleep"):
+            res = tool.run({"target": "e192", "repeat": "3"})
+        self.assertTrue(res.ok)
+        self.assertEqual(len([c for c in cli.calls if c and c[0] == "click"]), 3)
+
+    def test_repeat_zero_or_negative_is_single_click(self):
+        for val in (0, -4):
+            tool, cli = self._click()
+            with mock.patch("vibeharness.web.time.sleep"):
+                res = tool.run({"target": "e192", "repeat": val})
+            self.assertTrue(res.ok)
+            self.assertEqual(len([c for c in cli.calls if c and c[0] == "click"]), 1, val)
+
+    def test_repeat_non_integer_rejected_without_clicking(self):
+        tool, cli = self._click()
+        with mock.patch("vibeharness.web.time.sleep") as slp:
+            res = tool.run({"target": "e192", "repeat": "lots"})
+        self.assertFalse(res.ok)
+        self.assertIn("repeat", res.observation)
+        self.assertEqual([c for c in cli.calls if c and c[0] == "click"], [])
+        slp.assert_not_called()
+
+    def test_repeat_clamped_to_max(self):
+        tool, cli = self._click()
+        with mock.patch("vibeharness.web.time.sleep"):
+            tool.run({"target": "e192", "repeat": 10_000})
+        self.assertEqual(len([c for c in cli.calls if c and c[0] == "click"]),
+                         ClickTool._MAX_REPEAT)
+
+    def test_repeat_stops_early_on_failure(self):
+        # The first click succeeds, the second fails -> stop, report progress.
+        cli = _SnapshotThenResultCli(snapshot=self._PREV_SNAP, result_ok=True,
+                                     result_output="### Page\nclicked")
+        calls = {"n": 0}
+        orig_run = cli.run
+
+        def flaky(*args):
+            if args and args[0] == "click":
+                calls["n"] += 1
+                if calls["n"] == 2:
+                    return (False, "Error: element not found")
+            return orig_run(*args)
+        cli.run = flaky
+        tool = ClickTool(cli, observation_limit=2000)
+        with mock.patch("vibeharness.web.time.sleep"):
+            res = tool.run({"target": "e192", "repeat": 4})
+        self.assertFalse(res.ok)
+        self.assertEqual(calls["n"], 2)                 # stopped after the failing 2nd
+        self.assertIn("1 time", res.observation)         # reports the 1 that landed
+
+    def test_previous_month_click_no_longer_rejected(self):
+        # The old _BACK_BUTTON_RE guard would have refused this; now it proceeds.
+        tool, cli = self._click()
+        with mock.patch("vibeharness.web.time.sleep"):
+            res = tool.run({"target": "e192"})           # "Previous month"
+        self.assertTrue(res.ok)
+        self.assertIn(["click", "e192"], cli.calls)
+        self.assertNotIn("BACK/Previous", res.observation)
+
+    def test_back_button_re_symbol_removed(self):
+        import vibeharness.web as web
+        self.assertFalse(hasattr(web, "_BACK_BUTTON_RE"))
 
 
 class SnapshotRefEnforcementTest(unittest.TestCase):

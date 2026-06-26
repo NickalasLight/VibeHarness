@@ -553,31 +553,31 @@ MODEL_TOOL_POLICIES: dict[str, ModelToolPolicy] = {
                   "ctx 32768 = GPU-pinned num_ctx (#77/#140), NOT a model limit; "
                   "cap lifted to 99 for now (#197)"),
     "glm-4.7-flash": ModelToolPolicy(
-        codec="json", max_actions_per_turn=99, context_window=131072,
+        codec="json", max_actions_per_turn=10, context_window=131072,
         collapse_consecutive_dup_tool_calls=False,  # #201: capable model; keep legit repeats
         rationale="API reasoning model; schema-constrained JSON; lighter flash tier; "
-                  "128K ctx (GLM-4.5-Flash documented 128K); cap lifted to 99 for now (#197)"),
+                  "128K ctx (GLM-4.5-Flash documented 128K); cap set to 10 (#206)"),
     "glm-4.7": ModelToolPolicy(
-        codec="json", max_actions_per_turn=99, context_window=204800,
+        codec="json", max_actions_per_turn=10, context_window=204800,
         collapse_consecutive_dup_tool_calls=False,  # #201: capable model; keep legit repeats
         rationale="flagship agentic-coding; 200K ctx (GLM-4.6 documented 200K) + native "
-                  "parallel_tool_calls; cap lifted to 99 for now (#197)"),
+                  "parallel_tool_calls; cap set to 10 (#206)"),
     "glm-5.2": ModelToolPolicy(
-        codec="json", max_actions_per_turn=99, context_window=1048576,
+        codec="json", max_actions_per_turn=10, context_window=1048576,
         collapse_consecutive_dup_tool_calls=False,  # #201: capable model; keep legit repeats
         rationale="newest flagship long-horizon agentic line; 1M lossless ctx "
-                  "(z.ai release notes); cap lifted to 99 for now (#197)"),
+                  "(z.ai release notes); cap set to 10 (#206)"),
     "deepseek-chat": ModelToolPolicy(
-        codec="json", max_actions_per_turn=99, context_window=131072,
+        codec="json", max_actions_per_turn=10, context_window=131072,
         collapse_consecutive_dup_tool_calls=False,  # #201: capable model; keep legit repeats
         rationale="DeepSeek-V3.1 non-thinking; OpenAI-compat function calling; "
-                  "128K ctx (V3.1 documented baseline); cap lifted to 99 for now (#197)"),
+                  "128K ctx (V3.1 documented baseline); cap set to 10 (#206)"),
     "deepseek-reasoner": ModelToolPolicy(
-        codec="json", max_actions_per_turn=99, context_window=131072,
+        codec="json", max_actions_per_turn=10, context_window=131072,
         collapse_consecutive_dup_tool_calls=False,  # #201: capable model; keep legit repeats
         rationale="DeepSeek-V3.1 thinking; tool calls supported since V3.1 (was unsupported "
                   "on legacy R1); reasoning_content consumed as reasoning; 128K ctx (V3.1 "
-                  "documented baseline); cap lifted to 99 for now (#197)"),
+                  "documented baseline); cap set to 10 (#206)"),
     # ISSUE #197: explicit DeepSeek-V4 entries (the V4 successors the deepseek-chat /
     # deepseek-reasoner aliases now route to, and the default escalator model). Both natively
     # support a 1M-token context window and tool/function calling — pinning explicit entries
@@ -588,15 +588,15 @@ MODEL_TOOL_POLICIES: dict[str, ModelToolPolicy] = {
     #   Tool Calls guide + enhanced agentic capabilities) ,
     #   https://openrouter.ai/deepseek/deepseek-v4-flash .
     "deepseek-v4-flash": ModelToolPolicy(
-        codec="json", max_actions_per_turn=99, context_window=1_000_000,
+        codec="json", max_actions_per_turn=10, context_window=1_000_000,
         collapse_consecutive_dup_tool_calls=False,  # #201: capable model; keep legit repeats
         rationale="DeepSeek-V4-Flash (284B/13B-active); OpenAI-compat tool calling; native 1M "
-                  "context (news260424); json single-shot codec; cap lifted to 99 for now (#197)"),
+                  "context (news260424); json single-shot codec; cap set to 10 (#206)"),
     "deepseek-v4-pro": ModelToolPolicy(
-        codec="json", max_actions_per_turn=99, context_window=1_000_000,
+        codec="json", max_actions_per_turn=10, context_window=1_000_000,
         collapse_consecutive_dup_tool_calls=False,  # #201: capable model; keep legit repeats
         rationale="DeepSeek-V4-Pro (1.6T/49B-active); OpenAI-compat tool calling; native 1M "
-                  "context (news260424); json single-shot codec; cap lifted to 99 for now (#197)"),
+                  "context (news260424); json single-shot codec; cap set to 10 (#206)"),
 }
 
 # Family fallback for any other z.ai/GLM API model id (e.g. a future glm-4.7-air): the API
@@ -604,10 +604,10 @@ MODEL_TOOL_POLICIES: dict[str, ModelToolPolicy] = {
 # unrecognised GLM model resolves to the conservative `json` + 5 policy rather than silently
 # inheriting the local `hermes` default. The qwen-local default is the global Config codec.
 _GLM_FAMILY_POLICY = ModelToolPolicy(
-    codec="json", max_actions_per_turn=99, context_window=131072,
+    codec="json", max_actions_per_turn=10, context_window=131072,
     collapse_consecutive_dup_tool_calls=False,  # #201: capable GLM family; keep legit repeats
     rationale="unrecognised GLM/z.ai model: API JSON codec + 128K ctx; "
-              "cap lifted to 99 for now (#197)")
+              "cap set to 10 (#206)")
 
 # Family fallback for any other DeepSeek API model id (issue #182) — e.g. a future
 # `deepseek-v4-flash` (the V4 successor the deepseek-chat/deepseek-reasoner aliases now point
@@ -615,10 +615,10 @@ _GLM_FAMILY_POLICY = ModelToolPolicy(
 # (never the native-only hermes), so an unrecognised DeepSeek model resolves to the
 # conservative `json` + 5 policy rather than silently inheriting the local `hermes` default.
 _DEEPSEEK_FAMILY_POLICY = ModelToolPolicy(
-    codec="json", max_actions_per_turn=99, context_window=131072,
+    codec="json", max_actions_per_turn=10, context_window=131072,
     collapse_consecutive_dup_tool_calls=False,  # #201: capable DeepSeek family; keep repeats
     rationale="unrecognised DeepSeek model: API JSON codec + 128K ctx; "
-              "cap lifted to 99 for now (#197)")
+              "cap set to 10 (#206)")
 
 
 def model_tool_policy(model: str | None) -> ModelToolPolicy | None:
