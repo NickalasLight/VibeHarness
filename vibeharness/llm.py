@@ -154,30 +154,20 @@ class OllamaClient(LLMClient):
                     constraint: DecodeConstraint,
                     on_reason: TokenSink | None = None,
                     on_action: TokenSink | None = None) -> Decision:
-        """Native /api/chat — Ollama's native THINK-THEN-ACT in a single request (#183).
+        """Native /api/chat with a bounded REASON-THEN-ACT split for thinking models (#183).
 
         When ``config.reason_then_act`` is True (the default on ``beta_qwen3coder``,
-        qwen3:4b — a REASONING model): ONE /api/chat call with ``think:True`` + ``tools:``.
-        Ollama does the think-then-act internally: it routes qwen3's reasoning into the
-        SEPARATE ``message.thinking`` channel and constrains ONLY the action (to the
-        ``tools:`` schema), returning the tool call as a STRUCTURED ``message.tool_calls``
-        entry. The thinking is captured as ``Decision.reasoning`` (streamed to
-        ``on_reason``) and is NEVER parsed as the action; the call is taken from
-        ``tool_calls`` (or, if the model emits it as text, the codec's tolerant
-        ``parse()`` of the content, which also strips any leaked ``<think>`` block).
-
-        Ground-truthed live (Ollama 0.30.10, qwen3:4b): with ``think:True`` + ``tools:`` a
-        single call returns ``thinking`` populated, ``content`` empty, and
-        ``tool_calls=[{"function":{"name":"click","arguments":{"target":"Accept all"}}}]``
-        even on a heavy snapshot turn. This is exactly the scenario issue #183 needs and
-        it is NATIVE: no two-phase prefill, no assistant-prefill bug. The PRIOR behaviour
-        (``think:False``) did NOT stop qwen3:4b (Ollama #12917) — it reasoned anyway, the
-        trace flooded ``message.content`` UNtagged, and on a non-trivial turn devoured the
-        whole budget before any ``<tool_call>`` (live run 20260626_210514: 12/12 turns
-        failed to parse). qwen3:4b ignores the ``"low"/"medium"`` think LEVELS (verified:
-        same trace length), so there is no native thinking-token budget; ``num_predict``
-        is sized to ``thinking_budget + action_tokens`` to give the trace its budget AND
-        leave the action its own headroom in the single generation.
+        qwen3:4b — a REASONING model): a TWO-PHASE flow that keeps the thinking trace and
+        the executed tool call in strictly separate stages (see
+        :meth:`_decide_chat_reason_then_act`). This is REQUIRED, not cosmetic: a single
+        ``think:True`` + ``tools:`` call makes Ollama PROMOTE the ``<tool_call>`` drafts the
+        model writes WHILE thinking into structured ``message.tool_calls`` — so a call the
+        model was only *considering* gets executed. Ground-truthed live (Ollama 0.30.10,
+        qwen3:4b): run ``20260626_222714`` turn 1 — the thinking held 3 ``<tool_call>``
+        drafts, the action/content was EMPTY, yet ``goto`` ran (parsed straight from the
+        thinking). The two-phase split sends NO ``tools:`` in the think phase, so Ollama has
+        no schema to promote drafts against (verified: 4 drafts in the trace →
+        ``tool_calls=[]``), then emits the committed call in a separate tools phase.
 
         When ``config.reason_then_act`` is False (a NON-thinking model, e.g.
         qwen2.5-coder): one native call with ``tools:`` and ``think:False`` — the call is
@@ -186,18 +176,18 @@ class OllamaClient(LLMClient):
 
         Independent of ``config.two_phase`` (which stays False so the native path remains
         enabled — see ``RalphAgent._native``)."""
-        thinking_model = self._cfg.reason_then_act
-        # A reasoning model needs room for the thinking trace AND the action in the one
-        # generation; a non-thinking model only emits the action.
-        num_predict = (self._cfg.thinking_budget + self._cfg.action_tokens
-                       if thinking_model else self._cfg.action_tokens)
+        if self._cfg.reason_then_act:
+            return self._decide_chat_reason_then_act(
+                messages, tools, constraint, on_reason, on_action)
+
+        # Single native call (non-thinking model): think:False, the call is emitted directly.
         payload: dict = {
             "model": self._cfg.model,
             "messages": messages,
-            "think": bool(thinking_model),
+            "think": False,
             "options": {**self._options(),
                         "temperature": self._cfg.action_temperature,
-                        "num_predict": num_predict,
+                        "num_predict": self._cfg.action_tokens,
                         "stop": list(constraint.stop)},
         }
         if tools:
@@ -206,6 +196,64 @@ class OllamaClient(LLMClient):
             payload["format"] = constraint.json_schema
         content, tool_calls, thinking = self._stream_chat(payload, on_action, on_reason)
         return Decision(reasoning=thinking, action_json=content.strip(),
+                        tool_calls=tuple(tool_calls))
+
+    def _decide_chat_reason_then_act(
+            self, messages: list[dict], tools: list[dict] | None,
+            constraint: DecodeConstraint,
+            on_reason: TokenSink | None = None,
+            on_action: TokenSink | None = None) -> Decision:
+        """Bounded REASON-THEN-ACT over the chat history (issue #183, qwen3:4b).
+
+        PHASE 1 — THINK, with NO ``tools:``. ``think:True`` routes qwen3's reasoning into
+        the SEPARATE ``message.thinking`` channel (captured as the reasoning, streamed to
+        ``on_reason``), capped at ``thinking_budget``. Because no tool schema is sent,
+        Ollama CANNOT promote the ``<tool_call>`` drafts the model writes while reasoning
+        into structured ``tool_calls`` — they stay pure reasoning text and are never
+        executed (ground-truthed: 4 drafts in the trace → ``tool_calls=[]``). This is the
+        whole point: the agent THINKS about tool calls without any of them firing.
+
+        PHASE 2 — ACT, with ``tools:`` and ``think:False``. The (possibly budget-truncated)
+        thinking is replayed as a CLOSED ``<think>…</think>`` assistant prefill so the model
+        resumes AFTER its reasoning and emits the COMMITTED call, which Ollama returns as a
+        structured ``message.tool_calls`` entry (ground-truthed: phase 2 →
+        ``goto({"url":"https://www.youtube.com"})``). Only this stage can produce an
+        executed action. ``Decision.reasoning`` holds the trace; ``action_json`` /
+        ``tool_calls`` hold only the committed call — the two never mix."""
+        # PHASE 1 — pure thinking; deliberately NO `tools` key (prevents draft promotion).
+        think_payload: dict = {
+            "model": self._cfg.model,
+            "messages": messages,
+            "think": True,
+            "options": {**self._options(),
+                        "temperature": self._cfg.temperature,
+                        "num_predict": self._cfg.thinking_budget},
+        }
+        _c1, _tc1, thinking = self._stream_chat(
+            think_payload, on_token=None, on_reason=on_reason)
+
+        # PHASE 2 — commit the action. Replay the thinking as a CLOSED <think> prefill so
+        # the model resumes past it; a budget-truncated trace is still closed here, so the
+        # model proceeds straight to the tool call instead of re-opening thinking.
+        prefill = f"<think>\n{thinking.strip()}\n</think>\n\n" if thinking.strip() else ""
+        convo = list(messages)
+        if prefill:
+            convo = convo + [{"role": "assistant", "content": prefill}]
+        act_payload: dict = {
+            "model": self._cfg.model,
+            "messages": convo,
+            "think": False,
+            "options": {**self._options(),
+                        "temperature": self._cfg.action_temperature,
+                        "num_predict": self._cfg.action_tokens,
+                        "stop": list(constraint.stop)},
+        }
+        if tools:
+            act_payload["tools"] = tools
+        if constraint.json_schema is not None:
+            act_payload["format"] = constraint.json_schema
+        content, tool_calls, _ = self._stream_chat(act_payload, on_action)
+        return Decision(reasoning=thinking.strip(), action_json=content.strip(),
                         tool_calls=tuple(tool_calls))
 
     def generate(self, prompt: str, max_chars: int | None = None,
