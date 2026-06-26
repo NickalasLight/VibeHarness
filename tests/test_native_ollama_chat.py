@@ -211,6 +211,40 @@ class StatefulHistoryTest(unittest.TestCase):
         self.assertTrue(client.seen_tools)
         self.assertEqual(client.seen_tools[0][0]["type"], "function")
 
+    def test_reasoning_trace_not_persisted_in_history(self):
+        # ISSUE #183: a thinking model can leak a <think>…</think> trace into the action
+        # text. The committed assistant message must carry ONLY the tool call — the
+        # reasoning trace must NEVER be replayed into the stateful history.
+        t1 = Decision(
+            "the separate reasoning channel",
+            '<think>\nI should list the directory first, then decide.\n</think>\n'
+            '<tool_call>{"name": "list_directory", "arguments": {"path": "."}}</tool_call>')
+        t2 = Decision("", '<tool_call>{"name": "validate", "arguments": {}}</tool_call>')
+        client = _ScriptedNativeClient([t1, t2])
+        result = self._agent(client).run("go")
+        self.assertTrue(result.finished)
+        assistant = [m for m in client.seen_messages[1] if m["role"] == "assistant"][0]
+        self.assertNotIn("<think>", assistant["content"])
+        self.assertNotIn("I should list the directory", assistant["content"])
+        self.assertNotIn("separate reasoning channel", assistant["content"])
+        # the action itself survives
+        self.assertIn("list_directory", assistant["content"])
+
+    def test_truncated_reasoning_trace_not_persisted(self):
+        # A budget-truncated trace leaves an UNCLOSED <think>; it too must be stripped
+        # from the persisted assistant turn (everything from the open tag on is reasoning).
+        t1 = Decision(
+            "",
+            '<tool_call>{"name": "list_directory", "arguments": {"path": "."}}</tool_call>\n'
+            '<think>and now I am rambling past the budget without ever closing')
+        t2 = Decision("", '<tool_call>{"name": "validate", "arguments": {}}</tool_call>')
+        client = _ScriptedNativeClient([t1, t2])
+        self._agent(client).run("go")
+        assistant = [m for m in client.seen_messages[1] if m["role"] == "assistant"][0]
+        self.assertNotIn("<think>", assistant["content"])
+        self.assertNotIn("rambling past the budget", assistant["content"])
+        self.assertIn("list_directory", assistant["content"])
+
 
 class FifoEvictionTest(unittest.TestCase):
     def test_evicts_oldest_when_over_budget(self):
