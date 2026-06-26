@@ -226,6 +226,24 @@ class Config:
     web_headless: bool = False        # headed by default so a human can watch
     web_browser: str = "chrome"
 
+    # --- same-turn duplicate tool-call suppression (issue #162) ---
+    # Names of web tools for which an EXACT duplicate call within the SAME assistant turn
+    # (same tool name + identical args, at ANY position — not only back-to-back) is
+    # suppressed: the duplicate is NOT executed, is stripped from the assistant tool-call
+    # block, and produces NO tool_response — so the model's replayed history shows no sign
+    # it ever requested a duplicate (a history that implied it did would bias a small model
+    # toward repeating itself). Per-tool OPT-IN: only the tools named here participate, so
+    # the default (empty) is a complete no-op — behaviour is unchanged unless a run opts a
+    # tool in. Applies ONLY to the web-agent flow (a live snapshot provider is present) and
+    # never to the snapshot/validate pseudo-tools. CROSS-turn duplicates are deliberately
+    # out of scope (those are handled by the anti-loop steer). The existing consecutive
+    # filter still runs first; this generalises it to non-adjacent repeats for opted-in
+    # tools only. See RalphAgent._suppress_same_turn_duplicates.
+    #
+    # Stored as a frozenset of tool names (the persisted-settings path supplies a list,
+    # which the agent coerces with set(); membership is all that is required).
+    web_dedup_same_turn_tools: frozenset = frozenset()
+
     # VibeThinker advisor — periodic free-text hint injector (beta_qwen3coder only).
     # When advisor_enabled=True, every advisor_interval Qwen turns an advisor model is called
     # (free-text, no schema) and its advice is injected into Qwen's next turn user message
