@@ -1315,7 +1315,7 @@ class ClickTool(_WebTool):
     #   * _MAX_TOTAL_CLICKS — cap on the SUM of all per-item repeats, so even a small list of
     #     big counts can't wedge the turn (every physical click carries the 2s settle).
     _MAX_TARGETS = 20
-    _MAX_TOTAL_CLICKS = 200
+    _MAX_TOTAL_CLICKS = 100
 
     def __init__(self, cli, observation_limit):
         super().__init__(cli, observation_limit)
