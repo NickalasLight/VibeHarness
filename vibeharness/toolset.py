@@ -102,6 +102,23 @@ class ToolsetCatalog:
         return ToolRegistry(tools)
 
 
+def apply_model_toolset(full_registry: ToolRegistry, config: Config,
+                        spec: "ModelSpec") -> ToolRegistry:
+    """Return the per-MODEL view of ``full_registry`` for ``spec`` (issue #203).
+
+    Composes the run-loaded toolset (``full_registry``) with the active model's per-model
+    allowlist/denylist by SUBTRACTION only (see :meth:`ToolRegistry.filtered`), so the result
+    is always a subset of what the run loaded — a model can never invoke a tool the run did
+    not load. With no per-model fields set this returns the same tool set (backward
+    compatible). The CLI calls this for the BASE model; the agent re-calls it for the
+    escalator model on take-over."""
+    from .config import resolve_model_tool_allow, resolve_model_tool_omit
+    return full_registry.filtered(
+        allow=resolve_model_tool_allow(config, spec),
+        omit=resolve_model_tool_omit(config, spec),
+    )
+
+
 def default_catalog() -> ToolsetCatalog:
     from .validation import ValidatorToolset
     from .web import WebToolset

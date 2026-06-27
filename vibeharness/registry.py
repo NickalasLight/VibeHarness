@@ -21,6 +21,39 @@ class ToolRegistry:
     def get(self, name: str) -> Tool | None:
         return self._tools.get(name)
 
+    def filtered(self, allow: "frozenset[str] | set[str] | None" = None,
+                 omit: "frozenset[str] | set[str]" = frozenset(),
+                 always_keep: "tuple[str, ...]" = ("validate",)) -> "ToolRegistry":
+        """Return a NEW registry that is a per-MODEL subset of this one (issue #203).
+
+        The active model's exposure is computed by SUBTRACTION only, so the result is
+        ALWAYS a subset of the run-loaded registry — a model can therefore NEVER invoke a
+        tool the run did not load (the composition-safety invariant):
+
+            kept = (loaded ∩ allow_if_set) − omit   (∪ always_keep)
+
+        * ``allow`` (an allowlist) — when given, only tools whose name is in it survive;
+          ``None`` (the default) applies no allowlist restriction. An allow entry naming a
+          tool the run did NOT load simply adds nothing (we only ever filter the loaded set).
+        * ``omit`` (a denylist) — tool names removed from the model's view.
+        * ``always_keep`` — core tools never removed (``validate`` is required by every run
+          and by ``ToolRegistry``'s non-empty invariant).
+
+        Backward compatible: ``filtered()`` with the defaults (no allow, empty omit) keeps
+        every tool, so a model that declares no per-model toolset gets today's behaviour.
+        """
+        keep: list[Tool] = []
+        for t in self._tools.values():
+            if t.name in always_keep:
+                keep.append(t)
+                continue
+            if allow is not None and t.name not in allow:
+                continue
+            if t.name in omit:
+                continue
+            keep.append(t)
+        return ToolRegistry(keep)
+
     def names(self) -> list[str]:
         return list(self._tools)
 
