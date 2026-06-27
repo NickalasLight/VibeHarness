@@ -1309,20 +1309,76 @@ class ClickTool(_WebTool):
     # click carries a 2s settle). Generous enough for real multi-click widgets (a
     # 12-month date-picker rewind, a stepper) while still bounding a runaway.
     _MAX_REPEAT = 100
+    # ISSUE #222 — multi-target ceilings (only reachable on the flag-ON `targets` path):
+    #   * _MAX_TARGETS  — cap on how many distinct refs one `targets` list may hold, so a
+    #     misparsed list can't enumerate the whole page.
+    #   * _MAX_TOTAL_CLICKS — cap on the SUM of all per-item repeats, so even a small list of
+    #     big counts can't wedge the turn (every physical click carries the 2s settle).
+    _MAX_TARGETS = 20
+    _MAX_TOTAL_CLICKS = 200
+
+    def __init__(self, cli, observation_limit):
+        super().__init__(cli, observation_limit)
+        # ISSUE #222 — per-MODEL multi-target flag. False by default → the advertised schema
+        # AND run() behaviour are byte-identical to the single-target tool. cli._run_locked
+        # sets this from the ACTIVE base model (resolve_model_click_multi_target) and the
+        # agent re-resolves it on escalation take-over, so the `targets` array is advertised
+        # ONLY to the capable API models (GLM/DeepSeek) and tracks the active model.
+        self._multi_target: bool = False
+
+    # ISSUE #222 — the nested object-array `items` sub-schema for `targets`: each item is one
+    # {target, repeat?} click. This is the standard JSON-Schema / OpenAI / Anthropic shape for
+    # a list-of-objects (type:array + items:{type:object, properties, required}); it flows
+    # unchanged into the json-codec decode constraint, the hermes <tools> block, and the
+    # native Ollama tools: envelope (all built from Param.schema via _args_schema).
+    _TARGETS_ITEM_SCHEMA = {
+        "type": "object",
+        "properties": {
+            "target": {"type": "string",
+                       "description": "snapshot ref to click, e.g. 'e163' (never a guessed "
+                                      "CSS selector/class/id)."},
+            "repeat": {"type": "integer", "minimum": 1, "default": 1,
+                       "description": "times to click THIS ref in succession (default 1)."},
+        },
+        "required": ["target"],
+    }
 
     @property
     def parameters(self):
-        return [
-            Param("target", "string", "Element ref (e.g. 'e163') from the current page snapshot to "
-                  "click. Must be a ref from the snapshot — never a guessed CSS selector/class/id."),
-            Param("repeat", "integer",
-                  "How many times to click this SAME target in succession, in one call, with the "
-                  "standard ~2s settle after each click. Default 1. Use a count > 1 to drive a "
-                  "multi-click widget in a single call — e.g. a date-picker 'Previous month'/'Next "
-                  "month' button or a numeric stepper — instead of issuing many separate click "
-                  "calls. Stops early if a click fails (e.g. the target disappears).",
-                  required=False, default=1),
-        ]
+        # Single-target params: identical to today. When the per-model multi-target flag is
+        # OFF, ONLY these are advertised, so the schema is byte-identical to the pre-#222 tool.
+        target = Param(
+            "target", "string",
+            "Element ref (e.g. 'e163') from the current page snapshot to click. Must be a ref "
+            "from the snapshot — never a guessed CSS selector/class/id.",
+            required=not self._multi_target)
+        repeat = Param(
+            "repeat", "integer",
+            "How many times to click this SAME target in succession, in one call, with the "
+            "standard ~2s settle after each click. Default 1. Use a count > 1 to drive a "
+            "multi-click widget in a single call — e.g. a date-picker 'Previous month'/'Next "
+            "month' button or a numeric stepper — instead of issuing many separate click "
+            "calls. Stops early if a click fails (e.g. the target disappears).",
+            required=False, default=1)
+        if not self._multi_target:
+            return [target, repeat]
+        # ISSUE #222 — flag ON: also advertise a `targets` ARRAY so the model can click MANY
+        # refs in ONE call, each its own count, IN ORDER. The worked example lives in the
+        # description (best practice for tool schemas — JSON-Schema docs / OpenAI function
+        # calling): models that read only the Markdown tool docs still see the exact shape.
+        targets = Param(
+            "targets", "array",
+            "OPTIONAL list of clicks to perform IN ORDER, each item one snapshot ref clicked N "
+            "times — use this to click SEVERAL different controls (and/or the same control "
+            "several times) in ONE call, e.g. several fields of a form. Each item is "
+            "{\"target\": <ref>, \"repeat\": <int, default 1>}. Example: "
+            "targets=[{\"target\":\"e10\",\"repeat\":8},{\"target\":\"e22\",\"repeat\":2}] "
+            "clicks e10 eight times then e22 twice (the standard ~2s settle after EVERY "
+            "individual click). `target` must be a snapshot ref, never a guessed selector. "
+            "When `targets` is given it takes precedence over the single `target`/`repeat` "
+            "above. Stops early and reports progress if any click fails.",
+            required=False, items=self._TARGETS_ITEM_SCHEMA)
+        return [target, repeat, targets]
 
     def _build(self, args):
         return ["click", args["target"]]
@@ -1350,7 +1406,90 @@ class ClickTool(_WebTool):
             return 1
         return min(n, self._MAX_REPEAT)
 
+    def _parse_targets(self, raw) -> "list[tuple[str, int]] | ToolResult":
+        """Validate the multi-target ``targets`` arg into an ordered ``[(ref, repeat), …]``
+        plan, or a clear user ToolResult on any structural error (issue #222).
+
+        Each item must be an object with a non-empty string ``target`` and an optional
+        positive-int ``repeat`` (default 1, clamped to :attr:`_MAX_REPEAT`). The list itself
+        must be non-empty and at most :attr:`_MAX_TARGETS` long, and the TOTAL of all repeats
+        at most :attr:`_MAX_TOTAL_CLICKS` (every physical click carries the 2s settle). Refs
+        are NOT checked against the live snapshot here — that happens per click in
+        ``_run_impl`` (so a stale ref fails at its own item with the standard guidance)."""
+        if not isinstance(raw, list):
+            return ToolResult(False, f"you called `{self.name}` with `targets` that is not a "
+                              f"list. Pass a list of objects, e.g. "
+                              f'targets=[{{"target":"e10","repeat":8}},{{"target":"e22"}}].')
+        if not raw:
+            return ToolResult(False, f"you called `{self.name}` with an EMPTY `targets` list. "
+                              f"Provide at least one {{\"target\": <ref>}} item, or use the "
+                              f"single `target` arg.")
+        if len(raw) > self._MAX_TARGETS:
+            return ToolResult(False, f"you called `{self.name}` with {len(raw)} targets, more "
+                              f"than the {self._MAX_TARGETS} allowed in one call. Split it "
+                              f"across several click calls.")
+        plan: list[tuple[str, int]] = []
+        total = 0
+        for i, item in enumerate(raw):
+            if not isinstance(item, dict):
+                return ToolResult(False, f"targets[{i}] is not an object — each item must be "
+                                  f'{{"target": <ref>, "repeat": <optional int>}}.')
+            tgt = item.get("target")
+            if not tgt or not isinstance(tgt, str):
+                return ToolResult(False, f"targets[{i}] is missing a string `target` ref. Each "
+                                  f'item must name a snapshot ref, e.g. {{"target":"e10"}}.')
+            rep = self._parse_repeat(item.get("repeat"))
+            if isinstance(rep, ToolResult):
+                # Re-phrase the per-item non-integer repeat error with its index.
+                return ToolResult(False, f"targets[{i}] ('{tgt}'): {rep.observation}")
+            plan.append((tgt, rep))
+            total += rep
+        if total > self._MAX_TOTAL_CLICKS:
+            return ToolResult(False, f"you called `{self.name}` with {total} total clicks across "
+                              f"the list, more than the {self._MAX_TOTAL_CLICKS} allowed in one "
+                              f"call. Reduce the per-item repeats or split the call.")
+        return plan
+
+    def _run_multi(self, args: dict) -> ToolResult:
+        """Click a LIST of refs IN ORDER, each its own count (issue #222, flag ON).
+
+        Runs each physical click through the SAME ``_run_impl`` as the single-target path (so
+        per-ref validation, no-match handling and auto-recovery are identical), with the
+        ``_POST_CLICK_SETTLE_S`` settle after EVERY individual click — between repeats of one
+        ref AND between different refs. Stops at the first failing click and reports how far it
+        got (which item / iteration). On success the summary carries the END-DOM observation
+        of the last click so the model sees the resulting page state."""
+        plan = self._parse_targets(args.get("targets"))
+        if isinstance(plan, ToolResult):
+            return plan
+        last: ToolResult | None = None
+        done = 0  # physical clicks that landed
+        for i, (tgt, rep) in enumerate(plan):
+            for k in range(rep):
+                last = self._run_impl({"target": tgt})
+                if not last.ok:
+                    if done:
+                        return ToolResult(False, f"clicked {done} time(s) across "
+                                          f"{i} target(s), then targets[{i}] '{tgt}' click "
+                                          f"{k + 1} failed: {last.observation}")
+                    return ToolResult(False, f"targets[{i}] '{tgt}' failed on the first "
+                                      f"click: {last.observation}")
+                done += 1
+                # PRESERVE THE DELAY (#206/#222): settle after EVERY physical click, between
+                # repeats of one ref AND between different refs — one flat settle per click.
+                time.sleep(self._POST_CLICK_SETTLE_S)
+        summary = ", ".join(f"{t}×{r}" for t, r in plan)
+        return ToolResult(True, f"clicked {done} time(s) across {len(plan)} target(s) "
+                          f"({summary}). Last result:\n{last.observation if last else ''}")
+
     def run(self, args: dict) -> ToolResult:
+        # ISSUE #222 — multi-target path: when the per-MODEL flag is ON and a `targets` list
+        # is supplied, click each ref its own count IN ORDER (targets WINS over the single
+        # `target`/`repeat`). Flag OFF (or no `targets`) falls through to the byte-identical
+        # single-target path below. Re-checking `_multi_target` here means a model that emits
+        # `targets` while the flag is off is simply ignored (single-target behaviour kept).
+        if self._multi_target and args.get("targets") is not None:
+            return self._run_multi(args)
         # repeat (default 1): click the SAME target N times in succession in ONE tool call,
         # with the 2s settle AFTER EACH click (#206). Lets a capable model drive multi-click
         # widgets (date-picker "Previous month", steppers) in one call, and sidesteps the

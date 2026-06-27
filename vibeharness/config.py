@@ -69,6 +69,14 @@ class ModelSpec:
     # API models (GLM/DeepSeek) want the lossless raw ARIA snapshot instead (prose drops
     # alert/status text — see #218), so they resolve to False.
     snapshot_prose: bool | None = None
+    # ISSUE #222 — per-MODEL toggle for the multi-target click schema (ClickTool's `targets`
+    # array of {target, repeat?} objects). Optional per-role override of the registry value
+    # (resolve_model_click_multi_target): spec → MODEL_TOOL_POLICIES → config.
+    # web_click_multi_target. None inherits the per-model policy (so leaving it None is a
+    # no-op). The capable API models (GLM/DeepSeek) batch multi-target clicks reliably and
+    # resolve to True; the small local qwen3:4b (3-call accuracy peak, #206/#210) keeps the
+    # single-target schema (False).
+    web_click_multi_target: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -401,6 +409,13 @@ class Config:
     # deliberately preserved — position alone is never treated as hidden.
     web_snapshot_visibility_filter: bool = True
 
+    # ISSUE #222 — GLOBAL default for the multi-target click schema (ClickTool's `targets`
+    # array). False keeps the single-target schema + behaviour byte-identical for an
+    # UNCONFIGURED model; the per-model policy (MODEL_TOOL_POLICIES.web_click_multi_target)
+    # turns it ON for the capable API models (GLM/DeepSeek). This global remains the
+    # unconfigured-model fallback and the A/B seam (resolve_model_click_multi_target).
+    web_click_multi_target: bool = False
+
     # --- Escalation / API provider ---
     # When the local model gets stuck (same tool call repeated escalation_stuck_threshold
     # times in a row), the run escalates mid-session to an external API model — same
@@ -532,6 +547,15 @@ class ModelToolPolicy:
     # (resolve_model_snapshot_prose) reads the ACTIVE model's policy, so an escalation
     # take-over to a capable model also drops the compaction (cli._snapshot_provider re-resolve).
     snapshot_prose: bool = True
+    # ISSUE #222 — should the click tool advertise the multi-target `targets` array (a list
+    # of {target, repeat?} objects clicked in order, each its own count) for this model?
+    # TRUE only for the capable API models (GLM/DeepSeek) which batch multi-field-form clicks
+    # reliably; FALSE for the small local qwen3:4b (its 3-call accuracy peak — #206/#210 —
+    # favours the simpler single-target schema). Defaults to False so an unconfigured model
+    # keeps today's single-target behaviour byte-for-byte; the resolver
+    # (resolve_model_click_multi_target) reads the ACTIVE model's policy, so an escalation
+    # take-over to a capable model also turns the multi-target schema ON (cli re-resolve).
+    web_click_multi_target: bool = False
     rationale: str = ""
 
 
@@ -665,6 +689,7 @@ MODEL_TOOL_POLICIES: dict[str, ModelToolPolicy] = {
         #    either — it is not reliable at hand-writing DOM-mutating JS.
         tool_omit=frozenset({"navigate_back", "navigate_forward", "evaluate"}),
         snapshot_prose=True,  # #218: small local model NEEDS the ~2x snapshot compaction
+        web_click_multi_target=False,  # #222: 3-call accuracy peak — single-target only
         rationale="native Hermes dialect; sub-7B 3-call accuracy peak (arXiv:2602.07359); "
                   "ctx 32768 = GPU-pinned num_ctx (#77/#140), NOT a model limit; "
                   "cap restored to 3 — #197 wrongly conflated this per-turn batch cap with "
@@ -674,6 +699,7 @@ MODEL_TOOL_POLICIES: dict[str, ModelToolPolicy] = {
         codec="json", max_actions_per_turn=10, context_window=131072,
         collapse_consecutive_dup_tool_calls=False,  # #201: capable model; keep legit repeats
         snapshot_prose=False,  # #218: capable model; lossless raw ARIA (keeps alert text)
+        web_click_multi_target=True,  # #222: capable model batches multi-target clicks
         system_prompt_augmentation=_EVALUATE_GUIDANCE,  # #203: guide evaluate() for widgets
         rationale="API reasoning model; schema-constrained JSON; lighter flash tier; "
                   "128K ctx (GLM-4.5-Flash documented 128K); cap set to 10 (#206)"),
@@ -681,6 +707,7 @@ MODEL_TOOL_POLICIES: dict[str, ModelToolPolicy] = {
         codec="json", max_actions_per_turn=10, context_window=204800,
         collapse_consecutive_dup_tool_calls=False,  # #201: capable model; keep legit repeats
         snapshot_prose=False,  # #218: capable model; lossless raw ARIA (keeps alert text)
+        web_click_multi_target=True,  # #222: capable model batches multi-target clicks
         system_prompt_augmentation=_EVALUATE_GUIDANCE,  # #203: guide evaluate() for widgets
         rationale="flagship agentic-coding; 200K ctx (GLM-4.6 documented 200K) + native "
                   "parallel_tool_calls; cap set to 10 (#206)"),
@@ -688,6 +715,7 @@ MODEL_TOOL_POLICIES: dict[str, ModelToolPolicy] = {
         codec="json", max_actions_per_turn=10, context_window=1048576,
         collapse_consecutive_dup_tool_calls=False,  # #201: capable model; keep legit repeats
         snapshot_prose=False,  # #218: capable model; lossless raw ARIA (keeps alert text)
+        web_click_multi_target=True,  # #222: capable model batches multi-target clicks
         system_prompt_augmentation=_EVALUATE_GUIDANCE,  # #203: guide evaluate() for widgets
         rationale="newest flagship long-horizon agentic line; 1M lossless ctx "
                   "(z.ai release notes); cap set to 10 (#206)"),
@@ -695,6 +723,7 @@ MODEL_TOOL_POLICIES: dict[str, ModelToolPolicy] = {
         codec="json", max_actions_per_turn=10, context_window=131072,
         collapse_consecutive_dup_tool_calls=False,  # #201: capable model; keep legit repeats
         snapshot_prose=False,  # #218: capable model; lossless raw ARIA (keeps alert text)
+        web_click_multi_target=True,  # #222: capable model batches multi-target clicks
         system_prompt_augmentation=_EVALUATE_GUIDANCE,  # #203: guide evaluate() for widgets
         rationale="DeepSeek-V3.1 non-thinking; OpenAI-compat function calling; "
                   "128K ctx (V3.1 documented baseline); cap set to 10 (#206)"),
@@ -702,6 +731,7 @@ MODEL_TOOL_POLICIES: dict[str, ModelToolPolicy] = {
         codec="json", max_actions_per_turn=10, context_window=131072,
         collapse_consecutive_dup_tool_calls=False,  # #201: capable model; keep legit repeats
         snapshot_prose=False,  # #218: capable model; lossless raw ARIA (keeps alert text)
+        web_click_multi_target=True,  # #222: capable model batches multi-target clicks
         system_prompt_augmentation=_EVALUATE_GUIDANCE,  # #203: guide evaluate() for widgets
         rationale="DeepSeek-V3.1 thinking; tool calls supported since V3.1 (was unsupported "
                   "on legacy R1); reasoning_content consumed as reasoning; 128K ctx (V3.1 "
@@ -719,6 +749,7 @@ MODEL_TOOL_POLICIES: dict[str, ModelToolPolicy] = {
         codec="json", max_actions_per_turn=10, context_window=1_000_000,
         collapse_consecutive_dup_tool_calls=False,  # #201: capable model; keep legit repeats
         snapshot_prose=False,  # #218: capable model; lossless raw ARIA (keeps alert text)
+        web_click_multi_target=True,  # #222: capable model batches multi-target clicks
         system_prompt_augmentation=_EVALUATE_GUIDANCE,  # #203: guide evaluate() for widgets
         rationale="DeepSeek-V4-Flash (284B/13B-active); OpenAI-compat tool calling; native 1M "
                   "context (news260424); json single-shot codec; cap set to 10 (#206)"),
@@ -726,6 +757,7 @@ MODEL_TOOL_POLICIES: dict[str, ModelToolPolicy] = {
         codec="json", max_actions_per_turn=10, context_window=1_000_000,
         collapse_consecutive_dup_tool_calls=False,  # #201: capable model; keep legit repeats
         snapshot_prose=False,  # #218: capable model; lossless raw ARIA (keeps alert text)
+        web_click_multi_target=True,  # #222: capable model batches multi-target clicks
         system_prompt_augmentation=_EVALUATE_GUIDANCE,  # #203: guide evaluate() for widgets
         rationale="DeepSeek-V4-Pro (1.6T/49B-active); OpenAI-compat tool calling; native 1M "
                   "context (news260424); json single-shot codec; cap set to 10 (#206)"),
@@ -739,6 +771,7 @@ _GLM_FAMILY_POLICY = ModelToolPolicy(
     codec="json", max_actions_per_turn=10, context_window=131072,
     collapse_consecutive_dup_tool_calls=False,  # #201: capable GLM family; keep legit repeats
     snapshot_prose=False,  # #218: capable model; lossless raw ARIA (keeps alert text)
+    web_click_multi_target=True,  # #222: capable model batches multi-target clicks
     system_prompt_augmentation=_EVALUATE_GUIDANCE,  # #203: guide evaluate() for widgets
     rationale="unrecognised GLM/z.ai model: API JSON codec + 128K ctx; "
               "cap set to 10 (#206)")
@@ -752,6 +785,7 @@ _DEEPSEEK_FAMILY_POLICY = ModelToolPolicy(
     codec="json", max_actions_per_turn=10, context_window=131072,
     collapse_consecutive_dup_tool_calls=False,  # #201: capable DeepSeek family; keep repeats
     snapshot_prose=False,  # #218: capable model; lossless raw ARIA (keeps alert text)
+    web_click_multi_target=True,  # #222: capable model batches multi-target clicks
     system_prompt_augmentation=_EVALUATE_GUIDANCE,  # #203: guide evaluate() for widgets
     rationale="unrecognised DeepSeek model: API JSON codec + 128K ctx; "
               "cap set to 10 (#206)")
@@ -838,6 +872,30 @@ def resolve_model_snapshot_prose(config: Config, spec: ModelSpec) -> bool:
     if policy is not None:
         return policy.snapshot_prose
     return config.web_snapshot_prose
+
+
+def resolve_model_click_multi_target(config: Config, spec: ModelSpec) -> bool:
+    """Resolve whether the click tool advertises the multi-target ``targets`` array (a list of
+    ``{target, repeat?}`` objects clicked in order) for ``spec`` (issue #222).
+
+    Precedence (mirrors :func:`resolve_model_snapshot_prose`): the spec's explicit
+    ``web_click_multi_target`` field WINS; else the per-model registry
+    (:func:`model_tool_policy`); else ``config.web_click_multi_target`` — the GLOBAL default
+    (False) that keeps today's single-target schema for an UNCONFIGURED model and remains the
+    A/B seam. The ACTIVE model's spec drives this: ``cli`` sets the ClickTool's flag from the
+    base spec and the agent re-resolves it on escalation take-over, so the advertised schema
+    tracks the active model (a swap qwen3:4b → GLM/DeepSeek turns multi-target ON mid-run).
+
+    True  → GLM/DeepSeek (and their family fallbacks): capable API models that batch
+            multi-field-form clicks reliably.
+    False → qwen3:4b: the small local model's 3-call accuracy peak (#206/#210) favours the
+            simpler single-target schema."""
+    if spec.web_click_multi_target is not None:
+        return spec.web_click_multi_target
+    policy = model_tool_policy(spec.model)
+    if policy is not None:
+        return policy.web_click_multi_target
+    return config.web_click_multi_target
 
 
 def resolve_model_tool_omit(config: Config, spec: ModelSpec) -> frozenset[str]:
