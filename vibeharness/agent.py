@@ -160,7 +160,8 @@ class RalphAgent:
                  turn_input_logger: "Callable[[int, str, list, str, float], None] | None" = None,
                  turn_output_logger: "Callable[[int, str, str], None] | None" = None,
                  escalation_system_prompt_provider: Callable[[str], str] | None = None,
-                 full_registry: ToolRegistry | None = None):
+                 full_registry: ToolRegistry | None = None,
+                 snapshot_prose_on_escalate: "Callable[[ModelSpec], None] | None" = None):
         self._client = client
         self._registry = registry
         # ISSUE #203 — the FULL run-loaded registry (every tool the selected toolset(s)
@@ -237,6 +238,13 @@ class RalphAgent:
         # escalator's json codec, it is swapped in by ``_escalate`` when escalating to a
         # single-shot API model. None on the fs/test path (a static system prompt is used).
         self._escalation_system_provider = escalation_system_prompt_provider
+        # ISSUE #218 — optional callback to RE-RESOLVE the per-model snapshot-PROSE decision
+        # for the escalator model on take-over (``_escalate``). The prose toggle lives in a
+        # mutable cell inside the shared snapshot provider (built in cli._run_locked); this
+        # callback flips it so a swap qwen3:4b(prose ON) → GLM/DeepSeek(prose OFF) drops the
+        # prose compaction mid-run and hands the escalator the lossless raw ARIA snapshot
+        # (the #218 motivation — prose drops alert text). None on the fs/test path (no-op).
+        self._snapshot_prose_on_escalate = snapshot_prose_on_escalate
         # NATIVE stateful tool calling (issue #129/#130/#131). Active only when (a) the
         # run opts in (config.native_tools), (b) the model is single-phase (the native
         # path is for the non-thinking base agent, not VibeThinker's two-phase <think>
@@ -1204,6 +1212,18 @@ class RalphAgent:
         # model: escalating from qwen3:4b (collapse on) to a capable API model (GLM/DeepSeek,
         # collapse off) lifts the collapse mid-run, so legit repeats are no longer dropped.
         self._collapse_dup_tool_calls = resolve_model_collapse_dups(self._cfg, spec)
+        # ISSUE #218 — re-resolve the per-MODEL snapshot-PROSE decision for the NEW active
+        # model: escalating from qwen3:4b (prose ON, needed for its 32768 ctx) to a capable
+        # API model (GLM/DeepSeek, prose OFF) drops the compaction mid-run so the escalator
+        # gets the lossless raw ARIA snapshot (incl. the alert/status text prose strips — the
+        # #218 motivation for the qwen→deepseek stall). The callback (cli._run_locked) honours
+        # an explicit --web-snapshot-prose / saved setting across the swap. No-op when unset
+        # (fs/test path or web path off).
+        if self._snapshot_prose_on_escalate is not None:
+            try:
+                self._snapshot_prose_on_escalate(spec)
+            except Exception:
+                pass  # never block a take-over on the prose re-resolution
         # ISSUE #203 — re-derive the ACTIVE registry from the FULL run-loaded set for the
         # ESCALATOR model's per-model toolset view: escalating from qwen3:4b (nav-history
         # tools omitted) to a capable API model RESTORES those tools (the escalator's omit set
