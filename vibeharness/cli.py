@@ -43,9 +43,12 @@ from .toolset import (
     default_catalog,
 )
 from .validation import LLMValidator
-from .web import (annotate_filled_snapshot, live_control_values,
+from .web import (annotate_filled_snapshot,
                   make_raw_snapshot_provider, make_visibility_filter,
                   resolve_web_session)
+# NOTE: live_control_values is no longer used in cli.py since issue #227 switched the
+# annotation source from live DOM values to agent-committed fills (_fill_map_state).
+# It remains in vibeharness/web.py and can still be imported from there by tests.
 from .snapshot_prose import aria_yaml_to_prose
 from .advisor import VibeThinkerAdvisor
 
@@ -963,16 +966,23 @@ def _run_locked(args, task, config, registry, codec, names, workdir, logger,
     # the #218 motivation). The legacy global config.web_snapshot_prose remains the A/B
     # fallback for unconfigured models (resolve_model_snapshot_prose).
     _prose_state = {"on": resolve_run_snapshot_prose(args, config, base_spec)}
+    # ISSUE #227 — agent-action-based fill tracking. Created BEFORE the snapshot provider
+    # so the closure can close over it; the agent's ``_fill_map`` IS this dict (shared
+    # reference passed as ``fill_map=_fill_map_state`` to RalphAgent below). When the agent
+    # writes ``self._fill_map[ref] = turn_idx``, the snapshot provider sees the update
+    # immediately — no extra callback needed. The dict starts empty; prefilled/placeholder
+    # DOM values never enter it (they are never set by the agent, so never annotated).
+    _fill_map_state: dict[str, int] = {}
     if raw_snapshot_provider is not None:
         _raw_aria_provider = raw_snapshot_provider
         # ISSUE #223: pre-compaction VISIBILITY FILTER. Built ONCE (shares the run's web
         # session) and run on the RAW ARIA snapshot immediately after capture — BEFORE the
-        # prose transform AND before live_control_values/annotate — so aria-hidden / zero-
-        # size honeypot refs are gone from BOTH the prose (qwen3:4b) and raw (DeepSeek/GLM)
-        # paths and never carry a filled marker. GLOBAL flag, default ON for all models;
-        # --no-visibility-filter / web_snapshot_visibility_filter=False makes it a no-op so
-        # the snapshot is byte-identical to today. The filter itself falls back to the
-        # unfiltered raw on any error (never blanks the page).
+        # prose transform AND before annotation — so aria-hidden / zero-size honeypot refs
+        # are gone from BOTH the prose (qwen3:4b) and raw (DeepSeek/GLM) paths and never
+        # carry a filled marker. GLOBAL flag, default ON for all models; --no-visibility-filter
+        # / web_snapshot_visibility_filter=False makes it a no-op so the snapshot is
+        # byte-identical to pre-#223. The filter itself falls back to the unfiltered raw
+        # on any error (never blanks the page).
         _visibility_filter = (make_visibility_filter(config)
                               if config.web_snapshot_visibility_filter else None)
 
@@ -981,7 +991,8 @@ def _run_locked(args, task, config, registry, codec, names, workdir, logger,
             if _visibility_filter is not None:
                 raw = _visibility_filter(raw)
             display = aria_yaml_to_prose(raw) if _prose_state["on"] else raw
-            return annotate_filled_snapshot(display, live_control_values(raw))
+            # ISSUE #227: annotate with agent-committed fill_map (not live DOM values).
+            return annotate_filled_snapshot(display, _fill_map_state)
 
         raw_snapshot_provider = _snapshot_provider
 
@@ -1054,7 +1065,8 @@ def _run_locked(args, task, config, registry, codec, names, workdir, logger,
                        turn_output_logger=logger.dump_turn_output,
                        escalation_system_prompt_provider=escalation_system_prompt_provider,
                        snapshot_prose_on_escalate=_snapshot_prose_on_escalate,
-                       click_multi_target_on_escalate=_click_multi_target_on_escalate)
+                       click_multi_target_on_escalate=_click_multi_target_on_escalate,
+                       fill_map=_fill_map_state)  # issue #227: shared ref; agent writes, provider reads
 
     # Advisor advice buffer: the checkpoint populates it after N accumulated tool calls;
     # advice_provider drains it once at the start of the next turn.

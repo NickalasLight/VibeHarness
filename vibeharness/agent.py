@@ -162,7 +162,8 @@ class RalphAgent:
                  escalation_system_prompt_provider: Callable[[str], str] | None = None,
                  full_registry: ToolRegistry | None = None,
                  snapshot_prose_on_escalate: "Callable[[ModelSpec], None] | None" = None,
-                 click_multi_target_on_escalate: "Callable[[ModelSpec], None] | None" = None):
+                 click_multi_target_on_escalate: "Callable[[ModelSpec], None] | None" = None,
+                 fill_map: "dict[str, int] | None" = None):
         self._client = client
         self._registry = registry
         # ISSUE #203 — the FULL run-loaded registry (every tool the selected toolset(s)
@@ -252,6 +253,13 @@ class RalphAgent:
         # qwen3:4b(single-target) → GLM/DeepSeek(multi-target) advertises the `targets` array
         # mid-run. None on the fs/test path or when the web toolset is off (no-op).
         self._click_multi_target_on_escalate = click_multi_target_on_escalate
+        # ISSUE #227 — agent-action-based fill tracking. ``{ref: turn_index}`` populated
+        # when the agent SUCCESSFULLY runs a value-setting tool (fill/type/select_option/
+        # check) on a ref with a NON-EMPTY value. Closed over by the snapshot provider in
+        # cli._run_locked via the shared ``_fill_map_state`` dict (same object), so the
+        # annotation reflects committed agent fills only — never DOM placeholders. The
+        # empty-value guard is enforced at recording time in ``_record_fill_if_needed``.
+        self._fill_map: dict[str, int] = fill_map if fill_map is not None else {}
         # NATIVE stateful tool calling (issue #129/#130/#131). Active only when (a) the
         # run opts in (config.native_tools), (b) the model is single-phase (the native
         # path is for the non-thinking base agent, not VibeThinker's two-phase <think>
@@ -598,6 +606,7 @@ class RalphAgent:
                                 soft_repeat_counts[sig] = reps + 1
                                 action = self._execute(tool_name, args)
                                 self._record(turn, action, memory)
+                                self._record_fill_if_needed(tool_name, args, i, action.ok)
                                 attempted[sig] = action.ok
                                 if not action.ok and tgt:
                                     target_block_counts[tgt] = target_block_counts.get(tgt, 0) + 1
@@ -664,6 +673,7 @@ class RalphAgent:
                             continue
                         action = self._execute(tool_name, args)
                         self._record(turn, action, memory)
+                        self._record_fill_if_needed(tool_name, args, i, action.ok)
                         if sig is not None:
                             attempted[sig] = action.ok
                         if action.ok and isinstance(args.get("target"), str):
@@ -1314,6 +1324,12 @@ class RalphAgent:
     # are EXEMPT from the anti-loop guard.
     _LOOP_EXEMPT_TOOLS = frozenset({"navigate_back", "navigate_forward"})
 
+    # Value-setting tools tracked in ``_fill_map`` (issue #227). A successful call of any
+    # of these on a ref with a non-empty value records ``{ref: turn_index}`` so the snapshot
+    # provider can annotate ``[already filled on turn X]`` — keyed on committed agent fills,
+    # never on live DOM values (which would flag placeholders as "filled").
+    _FILL_TOOLS = frozenset({"fill", "type", "select_option", "check"})
+
     # Tools whose repetition is NOT a value-set no-op and must NOT be hard-blocked on the
     # second attempt. Includes navigation tools (goto, reload, open_browser): after a page
     # goes blank or a session dies the model MUST be allowed to re-navigate. We allow up to
@@ -1332,6 +1348,29 @@ class RalphAgent:
     # (ok=False, e.g. re-clicking an invalid ref) are caught separately and faster by the
     # escalating target_block_counts HARD STOP below, independent of this limit.
     _SOFT_REPEAT_LIMIT = 12
+
+    def _record_fill_if_needed(self, tool_name: str | None, args: dict,
+                               turn_idx: int, ok: bool) -> None:
+        """Record a committed agent fill in ``_fill_map`` when appropriate (issue #227).
+
+        Called after every ``_execute`` that may be a value-setting tool. Only
+        committed fills (``ok=True``) of the fill-tool set with a NON-EMPTY value enter
+        the map — the empty-value guard prevents a cleared or blank field from being
+        annotated as filled. ``check`` has no value arg and always records on success
+        (a checked checkbox is unambiguously non-empty state).
+        """
+        if not ok or tool_name not in self._FILL_TOOLS:
+            return
+        ref = args.get("target", "")
+        if not isinstance(ref, str) or not ref:
+            return
+        if tool_name == "check":
+            # check always sets a non-empty state (checked); no value to guard.
+            self._fill_map[ref] = turn_idx
+        else:
+            value = args.get("text") or args.get("value") or ""
+            if value:  # empty-value guard: never record fills with '' value
+                self._fill_map[ref] = turn_idx
 
     def _action_signature(self, tool_name: str | None, args: dict) -> str | None:
         """A stable signature for an executed action, or ``None`` if this tool is exempt
