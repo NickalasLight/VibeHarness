@@ -79,6 +79,13 @@ class ApiLLMClient(LLMClient):
         # cumulative token counters (updated after each call)
         self.tokens_in: int = 0
         self.tokens_out: int = 0
+        # ISSUE #214 — cumulative PROMPT-CACHE accounting so cache hits are verifiable. Of
+        # the ``tokens_in`` prompt tokens, ``cached_in`` were served from the provider's
+        # prompt cache (a HIT, billed far cheaper — DeepSeek ~50-120x, GLM ~5.4x). DeepSeek
+        # additionally splits the miss portion (``cache_miss_in``); GLM/OpenAI report only
+        # the cached portion. Read per-provider in :meth:`_read_cached_tokens`.
+        self.cached_in: int = 0
+        self.cache_miss_in: int = 0
         try:
             from openai import OpenAI
         except ImportError as e:   # pragma: no cover - exercised via providers tests
@@ -99,8 +106,50 @@ class ApiLLMClient(LLMClient):
         return {
             "tokens_in": self.tokens_in,
             "tokens_out": self.tokens_out,
+            # ISSUE #214 — prompt-cache accounting (HIT/MISS prompt tokens). See
+            # ``cached_in`` / ``cache_miss_in`` and :meth:`_read_cached_tokens`.
+            "cached_tokens_in": self.cached_in,
+            "cache_miss_tokens_in": self.cache_miss_in,
             "estimated_cost_usd": round(self.cost_usd(), 6),
         }
+
+    @staticmethod
+    def _read_cached_tokens(usage) -> "tuple[int, int]":
+        """Return ``(cache_hit_tokens, cache_miss_tokens)`` from a provider ``usage`` object
+        (issue #214). These fields are provider-specific and NOT on the base OpenAI
+        ``CompletionUsage`` dataclass, so they are read defensively via ``getattr`` /
+        ``prompt_tokens_details`` / ``model_extra``:
+
+          * **DeepSeek** — top-level ``usage.prompt_cache_hit_tokens`` /
+            ``usage.prompt_cache_miss_tokens`` (``prompt_tokens = hit + miss``).
+            Docs: https://api-docs.deepseek.com/guides/kv_cache
+          * **z.ai / GLM** and the OpenAI-compatible convention —
+            ``usage.prompt_tokens_details.cached_tokens`` (the cached portion of
+            ``prompt_tokens``; no separate miss field).
+            Docs: https://docs.z.ai/guides/capabilities/cache ,
+            https://developers.openai.com/api/docs/guides/prompt-caching
+
+        Returns ``(0, 0)`` when no cached-token field is present (no cache hit, or a provider
+        that does not report one)."""
+        if usage is None:
+            return 0, 0
+        extra = getattr(usage, "model_extra", None) or {}
+
+        def _pick(attr: str):
+            val = getattr(usage, attr, None)
+            if val is None and isinstance(extra, dict):
+                val = extra.get(attr)
+            return val
+
+        hit = _pick("prompt_cache_hit_tokens")          # DeepSeek
+        miss = _pick("prompt_cache_miss_tokens")        # DeepSeek
+        if hit is None:                                  # GLM / OpenAI-compatible nesting
+            details = getattr(usage, "prompt_tokens_details", None)
+            cached = getattr(details, "cached_tokens", None) if details is not None else None
+            if cached is None and isinstance(details, dict):
+                cached = details.get("cached_tokens")
+            hit = cached
+        return int(hit or 0), int(miss or 0)
 
     def supports_structured_history(self) -> bool:
         """ISSUE #207: the OpenAI-compatible client CAN replay a real multi-turn structured
@@ -252,6 +301,9 @@ class ApiLLMClient(LLMClient):
                 if usage and not usage_seen:
                     self.tokens_in += (getattr(usage, "prompt_tokens", 0) or 0)
                     self.tokens_out += (getattr(usage, "completion_tokens", 0) or 0)
+                    hit, miss = self._read_cached_tokens(usage)   # issue #214 prompt-cache
+                    self.cached_in += hit
+                    self.cache_miss_in += miss
                     usage_seen = True
                 if not chunk.choices:
                     continue
@@ -298,6 +350,9 @@ class ApiLLMClient(LLMClient):
         if usage:
             self.tokens_in += (getattr(usage, "prompt_tokens", 0) or 0)
             self.tokens_out += (getattr(usage, "completion_tokens", 0) or 0)
+            hit, miss = self._read_cached_tokens(usage)           # issue #214 prompt-cache
+            self.cached_in += hit
+            self.cache_miss_in += miss
         message = resp.choices[0].message if resp.choices else None
         text = (getattr(message, "content", "") or "") if message else ""
         reasoning = (getattr(message, "reasoning_content", "") or "") if message else ""

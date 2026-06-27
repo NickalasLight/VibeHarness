@@ -185,6 +185,138 @@ class ApiStructuredHistoryTest(unittest.TestCase):
         self.assertEqual(assistant["content"].count("write_file"), 2)
 
 
+class ApiPromptCachePrefixTest(unittest.TestCase):
+    """ISSUE #214 — the API structured path must be PROMPT-CACHE-FRIENDLY: the serialized
+    prefix (system + every frozen prior message) is BYTE-IDENTICAL across turns; only the
+    TAIL user turn changes (it carries the live page snapshot + schema instruction). No
+    prior message is ever mid-mutated, and the volatile snapshot is NEVER committed to the
+    frozen history."""
+
+    def setUp(self):
+        self.reg = _registry()
+        self.cfg = Config(max_steps=8, escalation_enabled=False, validation_provider="")
+
+    def _agent_with_snapshots(self, client):
+        # A snapshot provider that returns a DISTINCT page each turn — the only per-turn
+        # volatile content. It must land at the TAIL only, never in the frozen prefix.
+        counter = iter(range(1, 999))
+        provider = lambda: f"PAGE_SNAPSHOT_BODY_{next(counter)}"
+        return RalphAgent(client, self.reg, "SYS", self.cfg,
+                          FakeValidator(passed=True), codec=get_codec("json"),
+                          raw_snapshot_provider=provider)
+
+    def _run_three_plus(self, client):
+        return self._agent_with_snapshots(client).run("cache work")
+
+    def test_prefix_is_byte_identical_across_turns_only_tail_changes(self):
+        client = _ScriptedApiClient([
+            Decision("", _act("create_file", path="a.txt", content="hi")),
+            Decision("", _act("list_directory", path=".")),
+            Decision("", _act("read_file", path="a.txt")),
+            Decision("", VALIDATE),
+        ])
+        result = self._run_three_plus(client)
+        self.assertTrue(result.finished)
+        self.assertGreaterEqual(len(client.seen_messages), 3)
+
+        # For every consecutive pair of turns, the EARLIER turn's full message array must be
+        # a byte-identical PREFIX of the later turn's array EXCEPT for its own live tail
+        # (the last user message). i.e. messages_t[:-1] == messages_{t+1}[:len(messages_t)-1].
+        for a, b in zip(client.seen_messages, client.seen_messages[1:]):
+            prefix = a[:-1]                       # everything but turn a's live tail
+            self.assertTrue(len(b) >= len(prefix))
+            for i, msg in enumerate(prefix):
+                self.assertEqual(
+                    msg, b[i],
+                    f"frozen prefix message {i} changed between turns "
+                    f"(mid-array mutation / cache bust): {msg!r} != {b[i]!r}")
+
+        # The system message (position 0) is byte-identical every turn (stable prefix root).
+        systems = {m[0]["content"] for m in client.seen_messages}
+        self.assertEqual(len(systems), 1)
+
+    def test_snapshot_rides_tail_only_never_frozen(self):
+        client = _ScriptedApiClient([
+            Decision("", _act("create_file", path="a.txt", content="hi")),
+            Decision("", _act("list_directory", path=".")),
+            Decision("", _act("read_file", path="a.txt")),
+            Decision("", VALIDATE),
+        ])
+        self._run_three_plus(client)
+        for msgs in client.seen_messages:
+            # The live snapshot may appear ONLY in the last (tail) user message.
+            for m in msgs[:-1]:
+                self.assertNotIn("PAGE_SNAPSHOT_BODY", (m.get("content") or ""),
+                                 "the volatile page snapshot leaked into the frozen prefix")
+            # No committed message carries the snapshot HEADER either (Rule C).
+            for m in msgs[:-1]:
+                self.assertNotIn("## Latest page state", (m.get("content") or ""))
+
+        # From turn 2 on, the tail DOES carry the latest snapshot (the agent's eyes).
+        tail2 = client.seen_messages[1][-1]["content"]
+        self.assertIn("## Latest page state", tail2)
+        self.assertIn("PAGE_SNAPSHOT_BODY", tail2)
+        # And consecutive tails differ (only the tail changes, and it changes every turn).
+        tails = [m[-1]["content"] for m in client.seen_messages]
+        self.assertEqual(len(set(tails)), len(tails))
+
+    def test_committed_history_has_no_page_snapshot_tool_response(self):
+        # The frozen <tool_response> batches carry ACTION outcomes only — the page_snapshot
+        # observation is excluded from committed history on the API path (Rule C).
+        client = _ScriptedApiClient([
+            Decision("", _act("create_file", path="a.txt", content="hi")),
+            Decision("", _act("list_directory", path=".")),
+            Decision("", VALIDATE),
+        ])
+        self._run_three_plus(client)
+        final = client.seen_messages[-1]
+        tool_resps = [m for m in final[:-1] if m.get("role") == "user"
+                      and "<tool_response>" in (m.get("content") or "")]
+        self.assertTrue(tool_resps)                       # action outcomes are committed
+        for m in tool_resps:
+            self.assertNotIn("## Latest page state", m["content"])
+
+
+class ApiPromptCacheBudgetTest(unittest.TestCase):
+    """ISSUE #214 — the tail snapshot is budgeted through the shared #193 fitter: eviction
+    of OLDEST history still fires when over budget, and the snapshot is truncated only as a
+    last resort (now against the tail copy, not an in-history message)."""
+
+    def test_tail_snapshot_truncated_as_last_resort_when_over_budget(self):
+        from vibeharness.snapshot_budget import fit_chat_history
+        cfg = Config(num_ctx=200, reason_tokens=20, action_tokens=20,
+                     snapshot_safety_margin_tokens=0, snapshot_chars_per_token=4.0)
+        # Empty history: the only trimmable thing is the tail snapshot itself.
+        history: list[dict] = []
+        huge = "S" * 4000
+        rep = fit_chat_history(history, "sys", "user", cfg, tail_snapshot=huge)
+        self.assertTrue(rep.over_budget)
+        self.assertTrue(rep.snapshot_truncated or rep.snapshot_dropped)
+        # The trimmed tail is returned for the caller to append to the live user turn,
+        # and is SHORTER than the raw snapshot (history was never touched / mutated).
+        self.assertLess(len(rep.tail_snapshot_out), len(huge))
+        self.assertEqual(history, [])
+
+    def test_tail_mode_evicts_oldest_history_before_truncating_snapshot(self):
+        from vibeharness.snapshot_budget import fit_chat_history
+        # in_budget = 400 - (20+20) = 360 tok; cpt=4 → ~90 chars/tok. Three ~150-tok history
+        # messages (450 tok) + ~50-tok snapshot overflow; evicting ONE oldest message fits
+        # with the snapshot preserved whole.
+        cfg = Config(num_ctx=400, reason_tokens=20, action_tokens=20,
+                     snapshot_safety_margin_tokens=0, snapshot_chars_per_token=4.0)
+        history = [{"role": "user", "content": "O" * 600},
+                   {"role": "assistant", "content": "A" * 600},
+                   {"role": "user", "content": "<tool_response>\n" + "K" * 580
+                    + "\n</tool_response>"}]
+        snap = "P" * 200
+        rep = fit_chat_history(history, "sys", "user", cfg, tail_snapshot=snap)
+        # Oldest history was evicted to make room (history shrank)…
+        self.assertGreater(rep.evicted_msgs, 0)
+        # …and the snapshot was preserved whole (eviction sufficed, no truncation).
+        self.assertFalse(rep.snapshot_truncated)
+        self.assertEqual(rep.tail_snapshot_out, snap)
+
+
 class ApiHistorySanitizeTest(unittest.TestCase):
     """The native -> API escalation sanitizer keeps a carried-over history valid for an
     OpenAI-compatible provider (issue #207)."""
