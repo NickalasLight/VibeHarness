@@ -214,6 +214,12 @@ class BudgetFitReport:
     num_ctx: int
     history_msgs_after: int
     history_tokens_after: int
+    # ISSUE #214 — on the API structured path the live page snapshot rides the TAIL user
+    # message (a cache-stable prefix; it is never committed to history), so the snapshot
+    # this budgeter may truncate is NOT an in-history message but the tail copy passed via
+    # ``tail_snapshot``. ``tail_snapshot_out`` is the (possibly last-resort-truncated) tail
+    # snapshot the caller should actually append to the live user turn; "" in native mode.
+    tail_snapshot_out: str = ""
 
     @property
     def acted(self) -> bool:
@@ -242,7 +248,8 @@ def _latest_snapshot_index(chat_history: list[dict]) -> int | None:
 
 
 def fit_chat_history(chat_history: list[dict], system: str, user: str,
-                     config: Config, window: int | None = None) -> BudgetFitReport:
+                     config: Config, window: int | None = None,
+                     tail_snapshot: str | None = None) -> BudgetFitReport:
     """Trim ``chat_history`` IN PLACE so ``[system] + chat_history + [user]`` fits the
     input window, evicting OLDEST history first and truncating the latest snapshot only
     as a last resort (issue #173). Returns a :class:`BudgetFitReport`.
@@ -252,36 +259,57 @@ def fit_chat_history(chat_history: list[dict], system: str, user: str,
     role's window). The report's ``num_ctx`` field carries that EFFECTIVE window so the
     loud CONTEXT-OVERRUN line reflects the model actually in use, not a flat 32768.
 
+    ISSUE #214 — TAIL-SNAPSHOT mode (the API prompt-cache-friendly path). When
+    ``tail_snapshot`` is given, the live page snapshot is NOT a committed history message
+    (so the prefix stays byte-stable for prompt caching) but rides the TAIL user turn. It
+    is budgeted here exactly like the in-history snapshot on the native path: every history
+    message is evictable (oldest first), and only as a LAST resort is the tail snapshot
+    truncated — returned via ``report.tail_snapshot_out`` for the caller to append to the
+    live user message. In native (in-history) mode ``tail_snapshot`` is ``None`` and the
+    behaviour is unchanged: the latest in-history snapshot is preserved/last-truncated.
+
     Pure except for the in-place mutation of ``chat_history`` (and the snapshot message's
     ``content`` when truncation is the last resort), so it is unit-testable without a
     model or a browser."""
     cpt = config.snapshot_chars_per_token
     eff_window = window if window is not None else effective_context_window(config)
     in_budget = input_budget_tokens(config, eff_window)
-    fixed = estimate_tokens(system, cpt) + estimate_tokens(user, cpt)
+    tail_mode = tail_snapshot is not None
+    snap_text = tail_snapshot or ""               # the tail snapshot (#214), "" in native mode
+    base_fixed = estimate_tokens(system, cpt) + estimate_tokens(user, cpt)
 
     def hist_tokens() -> int:
         return sum(message_tokens(m, cpt) for m in chat_history)
 
     def request_tokens() -> int:
-        return fixed + hist_tokens()
+        # In tail-snapshot mode the snapshot tokens ride ``fixed`` (the tail user turn),
+        # not a history message — so they shrink only when the snapshot itself is truncated.
+        return base_fixed + estimate_tokens(snap_text, cpt) + hist_tokens()
 
     req_before = request_tokens()
     over = req_before > in_budget
 
-    snap_idx = _latest_snapshot_index(chat_history)
-    snapshot_raw_chars = (
-        len(chat_history[snap_idx].get("content") or "") if snap_idx is not None else 0)
+    if tail_mode:
+        # The snapshot is NOT in history: every history message is freely evictable, and the
+        # snapshot to preserve/last-truncate is ``snap_text`` (the tail copy).
+        snapshot_raw_chars = len(snap_text)
+
+        def _oldest_evictable() -> int | None:
+            return 0 if chat_history else None
+    else:
+        snap_idx = _latest_snapshot_index(chat_history)
+        snapshot_raw_chars = (
+            len(chat_history[snap_idx].get("content") or "") if snap_idx is not None else 0)
+
+        def _oldest_evictable() -> int | None:
+            si = _latest_snapshot_index(chat_history)
+            for i in range(len(chat_history)):
+                if i != si:
+                    return i
+            return None  # nothing left but the snapshot itself
 
     evicted_msgs = 0
     evicted_tokens = 0
-
-    def _oldest_evictable() -> int | None:
-        si = _latest_snapshot_index(chat_history)
-        for i in range(len(chat_history)):
-            if i != si:
-                return i
-        return None  # nothing left but the snapshot itself
 
     # (1a) Coarse fixed message cap (chat_history_max_turns; 0 = off). Never evicts the
     # latest snapshot — it is the agent's current view of the page.
@@ -310,35 +338,57 @@ def fit_chat_history(chat_history: list[dict], system: str, user: str,
     snapshot_dropped = False
     snapshot_dropped_chars = 0
     snapshot_kept_chars = snapshot_raw_chars
-    snap_idx = _latest_snapshot_index(chat_history)
-    if request_tokens() > in_budget and snap_idx is not None:
-        snap_msg = chat_history[snap_idx]
-        content = snap_msg.get("content") or ""
-        snap_tok = message_tokens(snap_msg, cpt)
-        other_tok = request_tokens() - snap_tok           # everything but the snapshot
-        allow_tok = in_budget - other_tok                 # tokens the snapshot may use
+    if tail_mode and request_tokens() > in_budget and snap_text:
+        # TAIL-snapshot last resort (#214): truncate ``snap_text`` itself; the trimmed
+        # value is returned to the caller (never written into a history message).
+        snap_tok = estimate_tokens(snap_text, cpt)
+        other_tok = request_tokens() - snap_tok
+        allow_tok = in_budget - other_tok
         allow_chars = max(0, int(allow_tok * cpt)) if cpt > 0 else max(0, allow_tok)
-        # The truncation marker is appended to the kept body, so it MUST be reserved
-        # against the char budget — otherwise the message re-tokenises to more than
-        # ``allow_tok`` and the request creeps back over ``num_ctx``. We reserve the
-        # marker at its longest (the full ``dropped`` count) so the bound always holds.
-        marker = "\n" + _HISTORY_TRUNC_MARKER.format(dropped=len(content))
+        marker = "\n" + _HISTORY_TRUNC_MARKER.format(dropped=len(snap_text))
         body_budget = allow_chars - len(marker)
         if body_budget <= 0:
-            # Nothing meaningful fits — drop the snapshot body but keep a LOUD
-            # blind-this-turn note so the model (and the logs) know the page is
-            # unavailable, not empty.
-            snapshot_dropped_chars = len(content)
+            snapshot_dropped_chars = len(snap_text)
             snapshot_kept_chars = 0
-            snap_msg["content"] = _SNAPSHOT_DROPPED_BODY
+            snap_text = _SNAPSHOT_DROPPED_BODY
             snapshot_dropped = True
         else:
-            body, dropped = truncate_snapshot(content, body_budget)
+            body, dropped = truncate_snapshot(snap_text, body_budget)
             if dropped > 0:
                 snapshot_dropped_chars = dropped
                 snapshot_kept_chars = len(body)
-                snap_msg["content"] = body + marker
+                snap_text = body + marker
                 snapshot_truncated = True
+    elif not tail_mode:
+        snap_idx = _latest_snapshot_index(chat_history)
+        if request_tokens() > in_budget and snap_idx is not None:
+            snap_msg = chat_history[snap_idx]
+            content = snap_msg.get("content") or ""
+            snap_tok = message_tokens(snap_msg, cpt)
+            other_tok = request_tokens() - snap_tok           # everything but the snapshot
+            allow_tok = in_budget - other_tok                 # tokens the snapshot may use
+            allow_chars = max(0, int(allow_tok * cpt)) if cpt > 0 else max(0, allow_tok)
+            # The truncation marker is appended to the kept body, so it MUST be reserved
+            # against the char budget — otherwise the message re-tokenises to more than
+            # ``allow_tok`` and the request creeps back over ``num_ctx``. We reserve the
+            # marker at its longest (the full ``dropped`` count) so the bound always holds.
+            marker = "\n" + _HISTORY_TRUNC_MARKER.format(dropped=len(content))
+            body_budget = allow_chars - len(marker)
+            if body_budget <= 0:
+                # Nothing meaningful fits — drop the snapshot body but keep a LOUD
+                # blind-this-turn note so the model (and the logs) know the page is
+                # unavailable, not empty.
+                snapshot_dropped_chars = len(content)
+                snapshot_kept_chars = 0
+                snap_msg["content"] = _SNAPSHOT_DROPPED_BODY
+                snapshot_dropped = True
+            else:
+                body, dropped = truncate_snapshot(content, body_budget)
+                if dropped > 0:
+                    snapshot_dropped_chars = dropped
+                    snapshot_kept_chars = len(body)
+                    snap_msg["content"] = body + marker
+                    snapshot_truncated = True
 
     return BudgetFitReport(
         over_budget=over,
@@ -356,4 +406,5 @@ def fit_chat_history(chat_history: list[dict], system: str, user: str,
         num_ctx=eff_window,
         history_msgs_after=len(chat_history),
         history_tokens_after=hist_tokens(),
+        tail_snapshot_out=snap_text if tail_mode else "",
     )

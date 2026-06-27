@@ -79,6 +79,13 @@ class ApiLLMClient(LLMClient):
         # cumulative token counters (updated after each call)
         self.tokens_in: int = 0
         self.tokens_out: int = 0
+        # ISSUE #214 — cumulative PROMPT-CACHE accounting so cache hits are verifiable. Of
+        # the ``tokens_in`` prompt tokens, ``cached_in`` were served from the provider's
+        # prompt cache (a HIT, billed far cheaper — DeepSeek ~50-120x, GLM ~5.4x). DeepSeek
+        # additionally splits the miss portion (``cache_miss_in``); GLM/OpenAI report only
+        # the cached portion. Read per-provider in :meth:`_read_cached_tokens`.
+        self.cached_in: int = 0
+        self.cache_miss_in: int = 0
         try:
             from openai import OpenAI
         except ImportError as e:   # pragma: no cover - exercised via providers tests
@@ -99,8 +106,60 @@ class ApiLLMClient(LLMClient):
         return {
             "tokens_in": self.tokens_in,
             "tokens_out": self.tokens_out,
+            # ISSUE #214 — prompt-cache accounting (HIT/MISS prompt tokens). See
+            # ``cached_in`` / ``cache_miss_in`` and :meth:`_read_cached_tokens`.
+            "cached_tokens_in": self.cached_in,
+            "cache_miss_tokens_in": self.cache_miss_in,
             "estimated_cost_usd": round(self.cost_usd(), 6),
         }
+
+    @staticmethod
+    def _read_cached_tokens(usage) -> "tuple[int, int]":
+        """Return ``(cache_hit_tokens, cache_miss_tokens)`` from a provider ``usage`` object
+        (issue #214). These fields are provider-specific and NOT on the base OpenAI
+        ``CompletionUsage`` dataclass, so they are read defensively via ``getattr`` /
+        ``prompt_tokens_details`` / ``model_extra``:
+
+          * **DeepSeek** — top-level ``usage.prompt_cache_hit_tokens`` /
+            ``usage.prompt_cache_miss_tokens`` (``prompt_tokens = hit + miss``).
+            Docs: https://api-docs.deepseek.com/guides/kv_cache
+          * **z.ai / GLM** and the OpenAI-compatible convention —
+            ``usage.prompt_tokens_details.cached_tokens`` (the cached portion of
+            ``prompt_tokens``; no separate miss field).
+            Docs: https://docs.z.ai/guides/capabilities/cache ,
+            https://developers.openai.com/api/docs/guides/prompt-caching
+
+        Returns ``(0, 0)`` when no cached-token field is present (no cache hit, or a provider
+        that does not report one)."""
+        if usage is None:
+            return 0, 0
+        extra = getattr(usage, "model_extra", None) or {}
+
+        def _pick(attr: str):
+            val = getattr(usage, attr, None)
+            if val is None and isinstance(extra, dict):
+                val = extra.get(attr)
+            return val
+
+        hit = _pick("prompt_cache_hit_tokens")          # DeepSeek
+        miss = _pick("prompt_cache_miss_tokens")        # DeepSeek
+        if hit is None:                                  # GLM / OpenAI-compatible nesting
+            details = getattr(usage, "prompt_tokens_details", None)
+            cached = getattr(details, "cached_tokens", None) if details is not None else None
+            if cached is None and isinstance(details, dict):
+                cached = details.get("cached_tokens")
+            hit = cached
+        return int(hit or 0), int(miss or 0)
+
+    def supports_structured_history(self) -> bool:
+        """ISSUE #207: the OpenAI-compatible client CAN replay a real multi-turn structured
+        message array (``system``/``user``/``assistant``/``user`` observations) via
+        :meth:`decide_messages` — that is the standard chat-completion shape. Reported
+        ``True`` so the agent drives a GLM/DeepSeek run with the structured stateful history
+        instead of the flattened prose narrative (when ``config.api_stateful_chat_history``
+        is on and the active codec constrains JSON). Independent of native tool calling,
+        which this single-shot client does NOT speak (see :meth:`supports_native_tools`)."""
+        return True
 
     def supports_native_tools(self) -> bool:
         """The OpenAI-compatible client is SINGLE-SHOT (issue #163): it does not speak
@@ -140,19 +199,56 @@ class ApiLLMClient(LLMClient):
             {"role": "system", "content": system},
             {"role": "user", "content": instructed_user},
         ], on_token=on_action, on_reason=on_reason, stop=stop)
-        # The action is parsed ONLY from the constrained ``content`` (issue #179): the
-        # model's thinking trace is streamed to ``on_reason`` and stored in
-        # ``Decision.reasoning`` SEPARATELY, so it never reaches the tool-call parser. With
-        # a JSON-schema constraint present (the json codec for GLM) the model emits the
-        # tool-call JSON as ``content`` and its thinking as ``reasoning_content`` — the
-        # #179 root cause (thinking prose landing in the action channel) cannot recur.
+        return self._finish(text, reasoning)
+
+    def decide_messages(self, messages: list[dict],
+                        constraint: "DecodeConstraint | dict | None",
+                        on_reason: TokenSink | None = None,
+                        on_action: TokenSink | None = None) -> Decision:
+        """Single-shot decide over a FULL structured message history (issue #207).
+
+        ``messages`` is the agent's real ``[system] + chat_history + [current user]`` array
+        — the same shape :meth:`decide_chat` receives on the native path, MINUS the
+        enveloped ``tools:`` field. The constrained-JSON ``schema`` instruction is appended
+        ONLY to the LAST ``user`` message (the live turn), so the stored history keeps the
+        plain user turn while the model is still told the exact action shape — identical
+        constrained decoding to :meth:`decide`. Parsing of ``content`` vs the
+        ``reasoning_content`` trace (issue #179) is shared via :meth:`_finish`."""
+        schema, stop = _unpack_constraint(constraint)
+        msgs = self._instruct_last_user(messages, schema)
+        text, reasoning = self._chat(
+            msgs, on_token=on_action, on_reason=on_reason, stop=stop)
+        return self._finish(text, reasoning)
+
+    @staticmethod
+    def _instruct_last_user(messages: list[dict], schema: "dict | None") -> list[dict]:
+        """Return a shallow copy of ``messages`` with the JSON-schema action instruction
+        appended to the LAST ``user`` message (issue #207). When no ``user`` message is
+        present a final instruction-only user turn is added. With ``schema`` ``None`` the
+        messages are returned copied but unchanged (an unconstrained codec)."""
+        msgs = [dict(m) for m in messages]
+        if schema is None:
+            return msgs
+        instr = "\n\n" + _ACTION_INSTRUCTION.format(
+            schema=json.dumps(schema, ensure_ascii=False))
+        for m in reversed(msgs):
+            if m.get("role") == "user":
+                m["content"] = (m.get("content") or "") + instr
+                return msgs
+        msgs.append({"role": "user", "content": instr.strip()})
+        return msgs
+
+    def _finish(self, text: str, reasoning: str) -> Decision:
+        """Build the :class:`Decision` from a chat completion's ``(content, reasoning)``.
+
+        The action is parsed ONLY from the constrained ``content`` (issue #179): the model's
+        thinking trace is streamed to ``on_reason`` and stored in ``Decision.reasoning``
+        SEPARATELY, so it never reaches the tool-call parser. When ``content`` is empty (a
+        GLM reasoning model occasionally streams the WHOLE answer as ``reasoning_content``)
+        we recover the schema-shaped JSON value embedded in the reasoning, falling back to
+        the raw reasoning only if none is found (preserving the prior behaviour)."""
         action = text
         if not action.strip():
-            # GLM reasoning models occasionally stream the WHOLE answer as
-            # reasoning_content and leave content empty (e.g. the validator's verdict). To
-            # avoid losing it WITHOUT feeding free-form thinking to the parser, recover the
-            # schema-shaped JSON value embedded in the reasoning; only if none is found do
-            # we fall back to the raw reasoning (preserving the prior behaviour).
             action = _recover_json(reasoning) or reasoning
         return Decision(reasoning=reasoning, action_json=_strip_fences(action))
 
@@ -205,6 +301,9 @@ class ApiLLMClient(LLMClient):
                 if usage and not usage_seen:
                     self.tokens_in += (getattr(usage, "prompt_tokens", 0) or 0)
                     self.tokens_out += (getattr(usage, "completion_tokens", 0) or 0)
+                    hit, miss = self._read_cached_tokens(usage)   # issue #214 prompt-cache
+                    self.cached_in += hit
+                    self.cache_miss_in += miss
                     usage_seen = True
                 if not chunk.choices:
                     continue
@@ -251,6 +350,9 @@ class ApiLLMClient(LLMClient):
         if usage:
             self.tokens_in += (getattr(usage, "prompt_tokens", 0) or 0)
             self.tokens_out += (getattr(usage, "completion_tokens", 0) or 0)
+            hit, miss = self._read_cached_tokens(usage)           # issue #214 prompt-cache
+            self.cached_in += hit
+            self.cache_miss_in += miss
         message = resp.choices[0].message if resp.choices else None
         text = (getattr(message, "content", "") or "") if message else ""
         reasoning = (getattr(message, "reasoning_content", "") or "") if message else ""

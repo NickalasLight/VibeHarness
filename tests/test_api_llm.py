@@ -123,6 +123,44 @@ class ApiLLMClientTest(unittest.TestCase):
         self.assertIn("ORIGINAL_USER", sent[1]["content"])
         self.assertIn("JSON Schema", sent[1]["content"])
 
+    # ---- issue #207: structured multi-turn decide_messages ----
+    def test_supports_structured_history(self):
+        client, _ = _client(FakeCompletions(stream_pieces=["[]"]))
+        self.assertTrue(client.supports_structured_history())
+
+    def test_decide_messages_sends_full_history_and_instructs_last_user(self):
+        comp = FakeCompletions(stream_pieces=['[{"tool":"validate","args":{}}]'])
+        client, _ = _client(comp)
+        history = [
+            {"role": "system", "content": "SYS"},
+            {"role": "user", "content": "TURN1"},
+            {"role": "assistant", "content": '[{"tool":"click","args":{"target":"e1"}}]'},
+            {"role": "user", "content": "<tool_response>\nclicked e1\n</tool_response>"},
+            {"role": "user", "content": "TURN2"},
+        ]
+        d = client.decide_messages(history, SCHEMA)
+        self.assertEqual(d.action_json, '[{"tool":"validate","args":{}}]')
+        sent = comp.calls[0]["messages"]
+        # the FULL multi-turn array is sent (system/user/assistant/user/user), not a
+        # flattened [system, user] pair.
+        self.assertEqual([m["role"] for m in sent],
+                         ["system", "user", "assistant", "user", "user"])
+        # the schema instruction is appended ONLY to the LAST user turn (the live turn)…
+        self.assertIn("JSON Schema", sent[-1]["content"])
+        self.assertIn("TURN2", sent[-1]["content"])
+        # …and NOT to the earlier user turn (so stored history stays clean).
+        self.assertNotIn("JSON Schema", sent[1]["content"])
+        self.assertEqual(sent[1]["content"], "TURN1")
+
+    def test_decide_messages_does_not_mutate_caller_history(self):
+        comp = FakeCompletions(stream_pieces=["[]"])
+        client, _ = _client(comp)
+        history = [{"role": "system", "content": "S"},
+                   {"role": "user", "content": "U"}]
+        client.decide_messages(history, SCHEMA)
+        # the caller's list/messages are untouched (schema appended on a copy).
+        self.assertEqual(history[1]["content"], "U")
+
     def test_decide_strips_markdown_fences(self):
         comp = FakeCompletions(stream_pieces=['```json\n[{"tool":"x"}]\n```'])
         client, _ = _client(comp)
@@ -200,6 +238,60 @@ class UsageAccountingTest(unittest.TestCase):
         client.decide("S", "U", SCHEMA)
         self.assertEqual(client.tokens_in, 17)
         self.assertEqual(client.tokens_out, 8)
+
+    def test_deepseek_cached_tokens_captured_and_surfaced(self):
+        # ISSUE #214 — DeepSeek reports top-level prompt_cache_hit_tokens /
+        # prompt_cache_miss_tokens (prompt_tokens = hit + miss). Both must be captured and
+        # surfaced in usage_summary so prompt-cache HITS are verifiable.
+        ds_usage = types.SimpleNamespace(prompt_tokens=100, completion_tokens=10,
+                                         prompt_cache_hit_tokens=64,
+                                         prompt_cache_miss_tokens=36)
+        chunks = [_stream_chunk("[]"),
+                  types.SimpleNamespace(choices=[], usage=ds_usage)]
+        client, _ = _client(FakeChunkCompletions(chunks))
+        client.decide("S", "U", SCHEMA)
+        self.assertEqual(client.tokens_in, 100)
+        self.assertEqual(client.cached_in, 64)
+        self.assertEqual(client.cache_miss_in, 36)
+        summ = client.usage_summary()
+        self.assertEqual(summ["cached_tokens_in"], 64)
+        self.assertEqual(summ["cache_miss_tokens_in"], 36)
+
+    def test_glm_cached_tokens_captured_from_prompt_tokens_details(self):
+        # ISSUE #214 — z.ai/GLM (OpenAI convention) reports the cached portion at
+        # usage.prompt_tokens_details.cached_tokens, with NO separate miss field.
+        details = types.SimpleNamespace(cached_tokens=50)
+        glm_usage = types.SimpleNamespace(prompt_tokens=80, completion_tokens=12,
+                                          prompt_tokens_details=details)
+        chunks = [_stream_chunk("[]"),
+                  types.SimpleNamespace(choices=[], usage=glm_usage)]
+        client, _ = _client(FakeChunkCompletions(chunks))
+        client.decide("S", "U", SCHEMA)
+        self.assertEqual(client.tokens_in, 80)
+        self.assertEqual(client.cached_in, 50)
+        self.assertEqual(client.cache_miss_in, 0)
+        self.assertEqual(client.usage_summary()["cached_tokens_in"], 50)
+
+    def test_no_cached_fields_defaults_to_zero(self):
+        # A provider/response with no cached-token field tallies cached_in=0 (no hit).
+        chunks = [_stream_chunk("[]"), _openai_usage_chunk(120, 34)]
+        client, _ = _client(FakeChunkCompletions(chunks))
+        client.decide("S", "U", SCHEMA)
+        self.assertEqual(client.cached_in, 0)
+        self.assertEqual(client.cache_miss_in, 0)
+        self.assertEqual(client.usage_summary()["cached_tokens_in"], 0)
+
+    def test_cached_tokens_via_model_extra_fallback(self):
+        # The installed openai SDK may surface provider-only fields under usage.model_extra
+        # rather than as direct attributes; _read_cached_tokens must still find them.
+        usage = types.SimpleNamespace(
+            prompt_tokens=90, completion_tokens=8,
+            model_extra={"prompt_cache_hit_tokens": 40, "prompt_cache_miss_tokens": 50})
+        chunks = [_stream_chunk("[]"), types.SimpleNamespace(choices=[], usage=usage)]
+        client, _ = _client(FakeChunkCompletions(chunks))
+        client.decide("S", "U", SCHEMA)
+        self.assertEqual(client.cached_in, 40)
+        self.assertEqual(client.cache_miss_in, 50)
 
     def test_non_streaming_fallback_tallies_usage(self):
         # The non-stream fallback path reads resp.usage (issue #187 parity).
