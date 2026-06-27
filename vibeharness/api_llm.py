@@ -1,0 +1,479 @@
+"""External-API LLM client (OpenAI-compatible).
+
+A drop-in :class:`~vibeharness.llm.LLMClient` that talks to any OpenAI-compatible
+HTTP API (default provider: ZhipuAI / z.ai ``glm-5.2``) instead of the local
+Ollama backend. It is used in two places:
+
+  - escalation — the agent swaps its client to this mid-run when it detects a
+    stuck loop, keeping the same browser/session (see :mod:`vibeharness.escalation`);
+  - validation — the validator can always run on the API model for a stronger,
+    independent second opinion.
+
+Design notes / clean-architecture rules honoured here:
+  - This module imports NOTHING from ``agent.py`` or ``web.py``; the dependency
+    direction is ``agent -> api_llm <- providers <- config``.
+  - The api key is passed in (read from the environment by :mod:`providers`); it is
+    never read, logged, or stored by this module beyond the live client object.
+  - The harness speaks a constrained JSON-array action protocol (not provider-native
+    tool calls), so :meth:`decide` asks the model to emit exactly that JSON, matching
+    :class:`vibeharness.llm.OllamaClient` semantics and the existing agent loop.
+"""
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass
+
+from .codec import DecodeConstraint
+from .config import BROWSER_USER_AGENT
+from .llm import Decision, LLMClient, TokenSink
+from .providers import ApiProviderConfig
+from .retry import RetryPolicy, TRANSIENT_STATUS, parse_retry_after, retry_request
+
+
+class ApiUnavailable(RuntimeError):
+    """Raised when the external API cannot be reached or returns an error."""
+
+
+# --- Ollama-shaped tool_call adapters -------------------------------------
+# The agent dispatch path (in feature-rich harnesses) reads ``tc.function.name``
+# and ``dict(tc.function.arguments)``. These adapters satisfy that shape so a
+# provider-native tool call can be surfaced identically. This barebones harness
+# parses a JSON-array action instead, but the adapters are kept for parity and so
+# future native-tool wiring needs no client changes.
+@dataclass
+class _ApiFunction:
+    name: str
+    arguments: dict          # already parsed from the JSON string
+
+
+@dataclass
+class _ApiToolCall:
+    function: _ApiFunction
+
+
+_ACTION_INSTRUCTION = (
+    "Respond with ONLY a JSON value that conforms to this JSON Schema — no prose, "
+    "no markdown fences, no explanation:\n{schema}\n"
+    "Output the JSON value and nothing else."
+)
+
+
+class ApiLLMClient(LLMClient):
+    """:class:`LLMClient` backed by an OpenAI-compatible API (e.g. z.ai GLM)."""
+
+    def __init__(self, provider: ApiProviderConfig, api_key: str, model: str,
+                 temperature: float = 0.3, timeout: int = 600,
+                 price_per_1k_in: float = 0.00015,
+                 price_per_1k_out: float = 0.00015,
+                 user_agent: str | None = None,
+                 retry_policy: "RetryPolicy | None" = None):
+        self._provider = provider
+        self._model = model
+        self._temperature = temperature
+        self._timeout = timeout
+        self._price_per_1k_in = price_per_1k_in
+        self._price_per_1k_out = price_per_1k_out
+        # ISSUE #198: browser-like UA (reduces z.ai 429s) + universal transient-error retry.
+        self._user_agent = user_agent or BROWSER_USER_AGENT
+        self._retry_policy = retry_policy or RetryPolicy()
+        # cumulative token counters (updated after each call)
+        self.tokens_in: int = 0
+        self.tokens_out: int = 0
+        # ISSUE #214 — cumulative PROMPT-CACHE accounting so cache hits are verifiable. Of
+        # the ``tokens_in`` prompt tokens, ``cached_in`` were served from the provider's
+        # prompt cache (a HIT, billed far cheaper — DeepSeek ~50-120x, GLM ~5.4x). DeepSeek
+        # additionally splits the miss portion (``cache_miss_in``); GLM/OpenAI report only
+        # the cached portion. Read per-provider in :meth:`_read_cached_tokens`.
+        self.cached_in: int = 0
+        self.cache_miss_in: int = 0
+        try:
+            from openai import OpenAI
+        except ImportError as e:   # pragma: no cover - exercised via providers tests
+            raise ImportError(
+                "the 'openai' package is required for the API LLM client; "
+                "install it with `pip install openai` (or `pip install vibeharness[api]`)."
+            ) from e
+        self._client = OpenAI(api_key=api_key, base_url=provider.base_url,
+                              timeout=timeout,
+                              default_headers={"User-Agent": self._user_agent})
+
+    def cost_usd(self) -> float:
+        """Estimated USD cost for all API calls made via this client so far."""
+        return (self.tokens_in / 1000.0 * self._price_per_1k_in
+                + self.tokens_out / 1000.0 * self._price_per_1k_out)
+
+    def usage_summary(self) -> dict:
+        return {
+            "tokens_in": self.tokens_in,
+            "tokens_out": self.tokens_out,
+            # ISSUE #214 — prompt-cache accounting (HIT/MISS prompt tokens). See
+            # ``cached_in`` / ``cache_miss_in`` and :meth:`_read_cached_tokens`.
+            "cached_tokens_in": self.cached_in,
+            "cache_miss_tokens_in": self.cache_miss_in,
+            "estimated_cost_usd": round(self.cost_usd(), 6),
+        }
+
+    @staticmethod
+    def _read_cached_tokens(usage) -> "tuple[int, int]":
+        """Return ``(cache_hit_tokens, cache_miss_tokens)`` from a provider ``usage`` object
+        (issue #214). These fields are provider-specific and NOT on the base OpenAI
+        ``CompletionUsage`` dataclass, so they are read defensively via ``getattr`` /
+        ``prompt_tokens_details`` / ``model_extra``:
+
+          * **DeepSeek** — top-level ``usage.prompt_cache_hit_tokens`` /
+            ``usage.prompt_cache_miss_tokens`` (``prompt_tokens = hit + miss``).
+            Docs: https://api-docs.deepseek.com/guides/kv_cache
+          * **z.ai / GLM** and the OpenAI-compatible convention —
+            ``usage.prompt_tokens_details.cached_tokens`` (the cached portion of
+            ``prompt_tokens``; no separate miss field).
+            Docs: https://docs.z.ai/guides/capabilities/cache ,
+            https://developers.openai.com/api/docs/guides/prompt-caching
+
+        Returns ``(0, 0)`` when no cached-token field is present (no cache hit, or a provider
+        that does not report one)."""
+        if usage is None:
+            return 0, 0
+        extra = getattr(usage, "model_extra", None) or {}
+
+        def _pick(attr: str):
+            val = getattr(usage, attr, None)
+            if val is None and isinstance(extra, dict):
+                val = extra.get(attr)
+            return val
+
+        hit = _pick("prompt_cache_hit_tokens")          # DeepSeek
+        miss = _pick("prompt_cache_miss_tokens")        # DeepSeek
+        if hit is None:                                  # GLM / OpenAI-compatible nesting
+            details = getattr(usage, "prompt_tokens_details", None)
+            cached = getattr(details, "cached_tokens", None) if details is not None else None
+            if cached is None and isinstance(details, dict):
+                cached = details.get("cached_tokens")
+            hit = cached
+        return int(hit or 0), int(miss or 0)
+
+    def supports_structured_history(self) -> bool:
+        """ISSUE #207: the OpenAI-compatible client CAN replay a real multi-turn structured
+        message array (``system``/``user``/``assistant``/``user`` observations) via
+        :meth:`decide_messages` — that is the standard chat-completion shape. Reported
+        ``True`` so the agent drives a GLM/DeepSeek run with the structured stateful history
+        instead of the flattened prose narrative (when ``config.api_stateful_chat_history``
+        is on and the active codec constrains JSON). Independent of native tool calling,
+        which this single-shot client does NOT speak (see :meth:`supports_native_tools`)."""
+        return True
+
+    def supports_native_tools(self) -> bool:
+        """The OpenAI-compatible client is SINGLE-SHOT (issue #163): it does not speak
+        Ollama's native ``tools:`` /api/chat protocol, so it reports ``False``. The agent
+        therefore routes API-backed roles to ``_decide`` (single-shot) and the harness
+        auto-selects a constrained-JSON codec for them, rather than the stateful
+        ``decide_chat`` path. ``decide_chat`` stays inherited from the base default
+        (flatten → ``decide``) for any caller that still invokes it."""
+        return False
+
+    # ---- LLMClient interface ----
+    def decide(self, system: str, user: str,
+               constraint: "DecodeConstraint | dict | None",
+               on_reason: TokenSink | None = None,
+               on_action: TokenSink | None = None) -> Decision:
+        """Single-shot decision matching the real :class:`~vibeharness.llm.LLMClient`
+        interface (issue #163 — repairs the stale ``action_schema`` signature that broke
+        the validator and escalation API paths).
+
+        ``constraint`` is a :class:`~vibeharness.codec.DecodeConstraint`. Its
+        ``json_schema`` (when not ``None``) becomes the JSON-instruction appended to the
+        user turn so the model emits exactly that shape — the agent's constrained-action
+        array, or the validator's verdict schema; the schema clause is OMITTED when
+        ``json_schema`` is ``None`` (an unconstrained codec). Its ``stop`` strings are
+        forwarded to the API's ``stop`` parameter.
+
+        For backward compatibility a bare ``dict`` (a raw JSON schema) or ``None`` is also
+        accepted, so historical callers/tests that passed a schema directly keep working.
+        Returns the emitted text as ``action_json``; ``reasoning`` carries any
+        reasoning-trace tokens the model exposed separately (see :meth:`_chat`)."""
+        schema, stop = _unpack_constraint(constraint)
+        instructed_user = user
+        if schema is not None:
+            instructed_user = f"{user}\n\n" + _ACTION_INSTRUCTION.format(
+                schema=json.dumps(schema, ensure_ascii=False))
+        text, reasoning = self._chat([
+            {"role": "system", "content": system},
+            {"role": "user", "content": instructed_user},
+        ], on_token=on_action, on_reason=on_reason, stop=stop)
+        return self._finish(text, reasoning)
+
+    def decide_messages(self, messages: list[dict],
+                        constraint: "DecodeConstraint | dict | None",
+                        on_reason: TokenSink | None = None,
+                        on_action: TokenSink | None = None) -> Decision:
+        """Single-shot decide over a FULL structured message history (issue #207).
+
+        ``messages`` is the agent's real ``[system] + chat_history + [current user]`` array
+        — the same shape :meth:`decide_chat` receives on the native path, MINUS the
+        enveloped ``tools:`` field. The constrained-JSON ``schema`` instruction is appended
+        ONLY to the LAST ``user`` message (the live turn), so the stored history keeps the
+        plain user turn while the model is still told the exact action shape — identical
+        constrained decoding to :meth:`decide`. Parsing of ``content`` vs the
+        ``reasoning_content`` trace (issue #179) is shared via :meth:`_finish`."""
+        schema, stop = _unpack_constraint(constraint)
+        msgs = self._instruct_last_user(messages, schema)
+        text, reasoning = self._chat(
+            msgs, on_token=on_action, on_reason=on_reason, stop=stop)
+        return self._finish(text, reasoning)
+
+    @staticmethod
+    def _instruct_last_user(messages: list[dict], schema: "dict | None") -> list[dict]:
+        """Return a shallow copy of ``messages`` with the JSON-schema action instruction
+        appended to the LAST ``user`` message (issue #207). When no ``user`` message is
+        present a final instruction-only user turn is added. With ``schema`` ``None`` the
+        messages are returned copied but unchanged (an unconstrained codec)."""
+        msgs = [dict(m) for m in messages]
+        if schema is None:
+            return msgs
+        instr = "\n\n" + _ACTION_INSTRUCTION.format(
+            schema=json.dumps(schema, ensure_ascii=False))
+        for m in reversed(msgs):
+            if m.get("role") == "user":
+                m["content"] = (m.get("content") or "") + instr
+                return msgs
+        msgs.append({"role": "user", "content": instr.strip()})
+        return msgs
+
+    def _finish(self, text: str, reasoning: str) -> Decision:
+        """Build the :class:`Decision` from a chat completion's ``(content, reasoning)``.
+
+        The action is parsed ONLY from the constrained ``content`` (issue #179): the model's
+        thinking trace is streamed to ``on_reason`` and stored in ``Decision.reasoning``
+        SEPARATELY, so it never reaches the tool-call parser. When ``content`` is empty (a
+        GLM reasoning model occasionally streams the WHOLE answer as ``reasoning_content``)
+        we recover the schema-shaped JSON value embedded in the reasoning, falling back to
+        the raw reasoning only if none is found (preserving the prior behaviour)."""
+        action = text
+        if not action.strip():
+            action = _recover_json(reasoning) or reasoning
+        return Decision(reasoning=reasoning, action_json=_strip_fences(action))
+
+    # ---- transport ----
+    def _chat(self, messages: list[dict], on_token: TokenSink | None,
+              on_reason: TokenSink | None = None,
+              stop: "tuple[str, ...]" = ()) -> "tuple[str, str]":
+        """Stream a chat completion, returning ``(content, reasoning)``.
+
+        ``content`` is the visible answer; ``reasoning`` accumulates any
+        ``delta.reasoning_content`` a reasoning model (GLM-4.x) streams separately — those
+        tokens go to ``on_reason`` and never pollute the JSON answer. Visible content goes
+        to ``on_token``. Falls back to a non-streaming call if the provider rejects
+        streaming. ``stop`` is forwarded as the API ``stop`` parameter when non-empty."""
+        kwargs: dict = {"model": self._model, "messages": messages,
+                        "temperature": self._temperature}
+        if stop:
+            kwargs["stop"] = list(stop)
+        try:
+            # ISSUE #198: retry the request on transient failures (429/5xx/408 + transport
+            # errors) with exponential backoff + jitter, honoring Retry-After. We retry the
+            # *create* call (where the provider returns a 429/5xx status, before any tokens
+            # stream) so the token tally is never double-counted on a retry.
+            stream = retry_request(
+                lambda: self._client.chat.completions.create(
+                    stream=True, stream_options={"include_usage": True}, **kwargs),
+                is_retryable=_is_retryable, retry_after=_retry_after_of,
+                status_of=_status_of, policy=self._retry_policy,
+                description=f"{self._provider.name} chat (stream, model={self._model})")
+            parts: list[str] = []
+            reasoning_parts: list[str] = []
+            usage_seen = False
+            for chunk in stream:
+                # Usage tally (issue #187). With ``stream_options={"include_usage": True}``
+                # the API reports a ``usage`` object exactly once, on the FINAL chunk. The
+                # shape differs by provider, so we MUST NOT gate the tally on empty
+                # ``choices``: OpenAI/z.ai send usage on a trailing chunk whose ``choices``
+                # is ``[]``, but DeepSeek attaches usage to the LAST CONTENT chunk (which
+                # still carries ``choices`` with ``finish_reason="stop"``). Verified live
+                # (DeepSeek chunk#7: ``choices_len=1`` + ``CompletionUsage(...)``). The old
+                # ``not chunk.choices`` guard therefore dropped DeepSeek's usage entirely,
+                # logging ``tokens_in=0``. We tally whenever usage is present and STILL fall
+                # through to process any ``choices`` on the same chunk. ``usage_seen`` guards
+                # against a misbehaving provider emitting usage more than once. Docs:
+                # https://platform.openai.com/docs/api-reference/chat/streaming (usage as a
+                # final chunk with empty ``choices``); DeepSeek shape confirmed empirically.
+                # ``completion_tokens`` already includes reasoning tokens where a reasoning
+                # model (DeepSeek/GLM ``reasoning_content``) reports them in its usage object.
+                usage = getattr(chunk, "usage", None)
+                if usage and not usage_seen:
+                    self.tokens_in += (getattr(usage, "prompt_tokens", 0) or 0)
+                    self.tokens_out += (getattr(usage, "completion_tokens", 0) or 0)
+                    hit, miss = self._read_cached_tokens(usage)   # issue #214 prompt-cache
+                    self.cached_in += hit
+                    self.cache_miss_in += miss
+                    usage_seen = True
+                if not chunk.choices:
+                    continue
+                delta = chunk.choices[0].delta
+                think = getattr(delta, "reasoning_content", None)
+                if think:
+                    reasoning_parts.append(think)
+                    if on_reason:
+                        on_reason(think)
+                piece = getattr(delta, "content", None)
+                if piece:
+                    parts.append(piece)
+                    if on_token:
+                        on_token(piece)
+            return "".join(parts), "".join(reasoning_parts)
+        except Exception as e:   # openai.APIError, connection errors, etc.
+            # Some endpoints/models reject streaming; retry once non-streamed.
+            if _is_streaming_unsupported(e):
+                return self._chat_once(messages, on_token, on_reason, stop)
+            raise ApiUnavailable(
+                f"{self._provider.name} API call failed "
+                f"(model={self._model}): {type(e).__name__}: {e}"
+            ) from e
+
+    def _chat_once(self, messages: list[dict], on_token: TokenSink | None,
+                   on_reason: TokenSink | None = None,
+                   stop: "tuple[str, ...]" = ()) -> "tuple[str, str]":
+        kwargs: dict = {"model": self._model, "messages": messages,
+                        "temperature": self._temperature, "stream": False}
+        if stop:
+            kwargs["stop"] = list(stop)
+        try:
+            resp = retry_request(
+                lambda: self._client.chat.completions.create(**kwargs),
+                is_retryable=_is_retryable, retry_after=_retry_after_of,
+                status_of=_status_of, policy=self._retry_policy,
+                description=f"{self._provider.name} chat (model={self._model})")
+        except Exception as e:
+            raise ApiUnavailable(
+                f"{self._provider.name} API call failed "
+                f"(model={self._model}): {type(e).__name__}: {e}"
+            ) from e
+        usage = getattr(resp, "usage", None)
+        if usage:
+            self.tokens_in += (getattr(usage, "prompt_tokens", 0) or 0)
+            self.tokens_out += (getattr(usage, "completion_tokens", 0) or 0)
+            hit, miss = self._read_cached_tokens(usage)           # issue #214 prompt-cache
+            self.cached_in += hit
+            self.cache_miss_in += miss
+        message = resp.choices[0].message if resp.choices else None
+        text = (getattr(message, "content", "") or "") if message else ""
+        reasoning = (getattr(message, "reasoning_content", "") or "") if message else ""
+        if reasoning and on_reason:
+            on_reason(reasoning)
+        if text and on_token:
+            on_token(text)
+        return text, reasoning
+
+
+def _unpack_constraint(
+    constraint: "DecodeConstraint | dict | None",
+) -> "tuple[dict | None, tuple[str, ...]]":
+    """Return ``(json_schema, stop)`` from a decode constraint (issue #163).
+
+    The agent and validator pass a :class:`~vibeharness.codec.DecodeConstraint`; we read
+    its ``json_schema`` (the shape to instruct, or ``None`` for an unconstrained codec) and
+    its ``stop`` strings. For backward compatibility a bare schema ``dict`` is treated as
+    the json_schema with no stop strings, and ``None`` means "no schema, no stop"."""
+    if constraint is None:
+        return None, ()
+    if isinstance(constraint, DecodeConstraint):
+        return constraint.json_schema, tuple(constraint.stop or ())
+    if isinstance(constraint, dict):
+        return constraint, ()
+    # Duck-typed fallback: anything exposing the two attributes.
+    return getattr(constraint, "json_schema", None), tuple(getattr(constraint, "stop", ()) or ())
+
+
+def _recover_json(text: str) -> str:
+    """Extract the first complete top-level JSON object/array embedded in ``text``.
+
+    Used only as the empty-``content`` fallback (issue #179): a GLM reasoning model may put
+    the whole schema-shaped answer in ``reasoning_content`` with content empty. A
+    brace/bracket-balanced, string-aware scan recovers the JSON value so the constrained
+    answer is not lost, while free-form thinking prose (no JSON) yields ``""`` and is NOT
+    treated as a tool call. Returns the matched JSON substring, or ``""`` if none parses."""
+    s = (text or "").strip()
+    if not s:
+        return ""
+    for opener, closer in (("{", "}"), ("[", "]")):
+        start = s.find(opener)
+        if start < 0:
+            continue
+        depth = 0
+        in_str = False
+        esc = False
+        for i in range(start, len(s)):
+            ch = s[i]
+            if in_str:
+                if esc:
+                    esc = False
+                elif ch == "\\":
+                    esc = True
+                elif ch == '"':
+                    in_str = False
+                continue
+            if ch == '"':
+                in_str = True
+            elif ch == opener:
+                depth += 1
+            elif ch == closer:
+                depth -= 1
+                if depth == 0:
+                    candidate = s[start:i + 1]
+                    try:
+                        json.loads(candidate)
+                    except json.JSONDecodeError:
+                        break
+                    return candidate
+    return ""
+
+
+# --- openai-SDK exception classification for retry.retry_request (issue #198) ----------
+# Ground-truthed against the installed openai==1.63.2: APIStatusError carries
+# ``.status_code`` and ``.response`` (an httpx.Response with ``.headers``); RateLimitError
+# (429), InternalServerError (5xx) and the 4xx errors are its subclasses. APIConnectionError
+# / APITimeoutError are transport failures with no status. We retry transient statuses
+# (TRANSIENT_STATUS) + transport errors and surface real 4xx client errors immediately.
+def _status_of(exc: Exception) -> "int | None":
+    return getattr(exc, "status_code", None)
+
+
+def _is_retryable(exc: Exception) -> bool:
+    try:
+        import openai
+    except ImportError:   # pragma: no cover - openai always present where this runs
+        return False
+    if isinstance(exc, (openai.APITimeoutError, openai.APIConnectionError)):
+        return True   # transport: read timeout / connection reset
+    if isinstance(exc, openai.APIStatusError):
+        return exc.status_code in TRANSIENT_STATUS
+    return False
+
+
+def _retry_after_of(exc: Exception) -> "float | None":
+    resp = getattr(exc, "response", None)
+    headers = getattr(resp, "headers", None)
+    if not headers:
+        return None
+    try:
+        value = headers.get("retry-after")
+    except Exception:
+        return None
+    return parse_retry_after(value)
+
+
+def _is_streaming_unsupported(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return "stream" in msg and ("unsupported" in msg or "not support" in msg
+                                or "must be" in msg or "disabled" in msg)
+
+
+def _strip_fences(text: str) -> str:
+    """Strip a leading ```json / ``` fence the model may have added despite the
+    instruction, so the agent's JSON parser sees a clean payload."""
+    s = text.strip()
+    if s.startswith("```"):
+        s = s[3:]
+        if s[:4].lower() == "json":
+            s = s[4:]
+        if s.endswith("```"):
+            s = s[:-3]
+    return s.strip()

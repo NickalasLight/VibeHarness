@@ -40,10 +40,19 @@ class RegistryTest(unittest.TestCase):
         schema = self.registry.action_schema()
         self.assertEqual(schema["type"], "array")
         self.assertEqual(schema["minItems"], 1)
+        self.assertNotIn("maxItems", schema)   # no cap unless one is requested
         one_of = schema["items"]["oneOf"]
         self.assertEqual(len(one_of), len(self.registry.all()))
         consts = {b["properties"]["tool"]["const"] for b in one_of}
         self.assertEqual(consts, set(self.registry.names()))
+
+    def test_action_schema_max_items_caps_the_array(self):
+        schema = self.registry.action_schema(max_items=4)
+        self.assertEqual(schema["maxItems"], 4)
+        self.assertEqual(schema["minItems"], 1)
+        # the rest of the schema is unchanged
+        self.assertEqual(schema["type"], "array")
+        self.assertEqual(len(schema["items"]["oneOf"]), len(self.registry.all()))
 
     def test_each_branch_requires_tool_and_args(self):
         for branch in self.registry.action_schema()["items"]["oneOf"]:

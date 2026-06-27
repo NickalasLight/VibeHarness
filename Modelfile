@@ -1,6 +1,19 @@
-# Ollama model definition for the harness.
-# Build it with:  ollama create vibethinker -f Modelfile
+# Ollama model definition for the harness (branch beta_qwen3coder, issue #123).
 #
-# The harness sets sampling parameters (temperature, top_p, top_k, num_ctx,
-# num_gpu) per request, so this only needs to point at the GGUF weights.
-FROM hf.co/mradermacher/VibeThinker-3B-GGUF:Q8_0
+# This branch runs a ~3B Qwen2.5-Coder in place of VibeThinker-3B. The official
+# Ollama library tag is used directly, so a Modelfile build is OPTIONAL — the
+# default config (vibeharness/config.py) points at `qwen2.5-coder:3b-instruct`,
+# which you just pull:
+#
+#     ollama pull qwen2.5-coder:3b-instruct        # ~1.9 GB (Q4_K_M), fits 8 GB GPU
+#
+# ⚠️ 3B-PARITY: there is NO dense ~3B *Qwen3-Coder* — that line is MoE only (smallest
+# 30B-A3B, then 80B-A3B "Next", then 480B-A35B), which breaks apples-to-apples parity
+# with the 3B-dense VibeThinker and won't fit an 8 GB card. Qwen2.5-Coder-3B-Instruct
+# is the closest true ~3B dense coder (VibeThinker itself derives from Qwen2.5-(Coder-)3B).
+# See QWEN3CODER_ANALYSIS.md / QWEN3CODER_DIVERGENCE.md.
+#
+# Build a custom-named copy with:  ollama create vibe-qwen3coder -f Modelfile
+# The harness sets sampling parameters (temperature, top_p, top_k, num_ctx, num_gpu)
+# per request, so this only needs to point at the weights.
+FROM qwen2.5-coder:3b-instruct

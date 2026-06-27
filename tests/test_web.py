@@ -1,71 +1,1307 @@
+"""Unit tests for the discrete web subtools' pure error/guard surface (issue #51).
+
+The monolithic ``browse(action=...)`` tool was split into one first-class Tool per
+playwright-cli operation (goto, click, fill, type, press_key, select_option, …) and
+the agent-facing ``snapshot`` tool was removed entirely. The ``evaluate`` (run-JS)
+tool was also removed (issue #67) so the limited agent can never execute arbitrary
+JavaScript. The arg-mapping happy paths
+are proven end to end in tests/integration/test_web_live.py; what remains here are the
+pure-unit paths a live browser can't cheaply force: the missing-required-param guard,
+the CLI->argv mapping (against a recorder, since there is no single dispatcher to
+prove anymore), output truncation, error-observation phrasing, and the per-tool
+call schema.
+"""
+import subprocess
+import sys
+import time
 import unittest
+from unittest import mock
 
-from vibeharness.web import BrowseTool
+from vibeharness.config import Config
+from vibeharness.web import (
+    PlaywrightCli, WebToolset,
+    GotoTool, ClickTool, FillTool, TypeTool, PressKeyTool, SelectOptionTool,
+    SetSpinbuttonTool,
+    CheckTool, UncheckTool, HoverTool, DragTool, UploadTool,
+    ScreenshotTool, NavigateBackTool, NavigateForwardTool, ReloadTool,
+    _WEB_TOOL_CLASSES,
+)
+
+from tests._fakes import FakeCli
 
 
-class FakeCli:
-    """Stand-in for PlaywrightCli: records calls, returns a scripted result."""
-    def __init__(self, ok=True, output="### Page\nok"):
-        self.ok, self.output = ok, output
+class _SnapshotThenResultCli:
+    """A PlaywrightCli stand-in that answers `snapshot` with one canned page and
+    every other (action) command with a separate canned result. Lets a test set up
+    the live page the issue-#73 target guard validates against independently of what
+    the action itself returns. Records every call for argv assertions."""
+
+    def __init__(self, snapshot="", result_ok=True, result_output="### Page\nok"):
+        self._snapshot = snapshot
+        self._result_ok = result_ok
+        self._result_output = result_output
         self.calls = []
 
     def run(self, *args):
         self.calls.append(list(args))
-        return self.ok, self.output
+        if args and args[0] == "snapshot":
+            return (bool(self._snapshot), self._snapshot)
+        return (self._result_ok, self._result_output)
 
 
-class BrowseToolTest(unittest.TestCase):
-    def _tool(self, ok=True, output="### Page URL: https://example.com"):
-        self.cli = FakeCli(ok=ok, output=output)
-        return BrowseTool(self.cli, observation_limit=1000)
+class SubtoolMappingTest(unittest.TestCase):
+    """Each discrete subtool maps its validated args to the right playwright-cli argv,
+    phrases a clear past-tense observation, and surfaces CLI failures as ok=False."""
 
-    def test_goto_maps_to_cli_args(self):
-        res = self._tool().run({"action": "goto", "url": "https://example.com"})
+    # A snapshot listing every ref the mapping tests target, so the issue-#73
+    # target guard (which captures a fresh snapshot and checks the ref is present)
+    # lets these happy-path calls proceed to the CLI argv mapping.
+    _SNAPSHOT_WITH_REFS = (
+        "Page: \"Example\"\n"
+        "[e1] checkbox\n[e2] button\n[e3] textbox\n"
+        "[e5] link\n[e6] button\n[e9] dropdown\n"
+    )
+
+    def _make(self, cls, ok=True, output=None):
+        if output is None:
+            output = self._SNAPSHOT_WITH_REFS
+        cli = FakeCli(ok=ok, output=output)
+        return cls(cli, observation_limit=1000), cli
+
+    def test_goto_maps_to_goto_url(self):
+        tool, cli = self._make(GotoTool)
+        res = tool.run({"url": "https://example.com"})
         self.assertTrue(res.ok)
-        self.assertEqual(self.cli.calls, [["goto", "https://example.com"]])
+        self.assertEqual(cli.calls, [["goto", "https://example.com"]])
         self.assertIn("navigated to", res.observation)
-        self.assertIn("https://example.com", res.observation)
 
-    def test_snapshot_needs_no_params(self):
-        res = self._tool(output="- heading 'Example'").run({"action": "snapshot"})
+    def test_click_maps_to_click_target(self):
+        tool, cli = self._make(ClickTool)
+        tool.run({"target": "e6"})
+        # Targeted tools snapshot first to validate the ref (issue #73), then act.
+        self.assertEqual(cli.calls[-1], ["click", "e6"])
+        self.assertIn(["snapshot"], cli.calls)
+
+    def test_fill_maps_to_fill_target_text(self):
+        tool, cli = self._make(FillTool)
+        tool.run({"target": "e3", "text": "John"})
+        self.assertEqual(cli.calls[-1], ["fill", "e3", "John"])
+
+    def test_type_maps_to_type_text(self):
+        tool, cli = self._make(TypeTool)
+        tool.run({"text": "hello"})
+        self.assertEqual(cli.calls, [["type", "hello"]])
+
+    def test_press_key_maps_to_press_key(self):
+        tool, cli = self._make(PressKeyTool)
+        tool.run({"key": "Enter"})
+        self.assertEqual(cli.calls, [["press", "Enter"]])
+
+    def test_select_option_maps_to_select(self):
+        tool, cli = self._make(SelectOptionTool)
+        tool.run({"target": "e9", "value": "TX"})
+        self.assertEqual(cli.calls[-1], ["select", "e9", "TX"])
+
+    def test_check_and_uncheck_map_through(self):
+        t1, c1 = self._make(CheckTool)
+        t1.run({"target": "e1"})
+        self.assertEqual(c1.calls[-1], ["check", "e1"])
+        t2, c2 = self._make(UncheckTool)
+        t2.run({"target": "e1"})
+        self.assertEqual(c2.calls[-1], ["uncheck", "e1"])
+
+    def test_hover_maps_to_hover(self):
+        tool, cli = self._make(HoverTool)
+        tool.run({"target": "e5"})
+        self.assertEqual(cli.calls[-1], ["hover", "e5"])
+
+    def test_drag_maps_to_drag_start_end(self):
+        tool, cli = self._make(DragTool)
+        tool.run({"target": "e1", "end": "e2"})
+        self.assertEqual(cli.calls[-1], ["drag", "e1", "e2"])
+
+    def test_upload_clicks_trigger_then_uploads_file(self):
+        # The current upload contract requires a `target` ref AND a `file`, and
+        # performs a click-then-upload sequence on that ref. Use a CLI whose
+        # snapshot lists the target so the issue-#73 target guard lets it through.
+        cli = _SnapshotThenResultCli(
+            snapshot="Page: \"X\"\n[e163] button \"Upload CV\"\n",
+            result_ok=True, result_output="### Page\nuploaded")
+        tool = UploadTool(cli, observation_limit=1000)
+        res = tool.run({"target": "e163", "file": "/tmp/cv.pdf"})
         self.assertTrue(res.ok)
-        self.assertEqual(self.cli.calls, [["snapshot"]])
+        # The action commands (ignoring the snapshot reads the guard/delta take) are
+        # a click on the trigger followed by the upload of the file.
+        action_calls = [c for c in cli.calls if c and c[0] != "snapshot"]
+        self.assertEqual(action_calls, [["click", "e163"], ["upload", "/tmp/cv.pdf"]])
+
+    def test_upload_requires_target(self):
+        # Without a target ref the tool must refuse and never touch the CLI.
+        tool, cli = self._make(UploadTool)
+        res = tool.run({"file": "/tmp/cv.pdf"})       # missing target
+        self.assertFalse(res.ok)
+        self.assertIn("target", res.observation)
+        self.assertEqual(cli.calls, [])
+
+    def test_upload_js_index_path(self):
+        # target='js:0' clicks the first hidden <input type=file> via an eval, then
+        # uploads — no ARIA target guard, so no snapshot ref is required.
+        cli = FakeCli(ok=True, output="### Page\nuploaded")
+        tool = UploadTool(cli, observation_limit=1000)
+        res = tool.run({"target": "js:0", "file": "/tmp/cv.pdf"})
+        self.assertTrue(res.ok)
+        action_calls = [c for c in cli.calls if c and c[0] != "snapshot"]
+        self.assertEqual(action_calls[0][0], "eval")          # clicks hidden input 0
+        self.assertEqual(action_calls[-1], ["upload", "/tmp/cv.pdf"])
+
+    def test_navigate_back_forward_reload_map_through(self):
+        for cls, expect in ((NavigateBackTool, ["go-back"]),
+                            (NavigateForwardTool, ["go-forward"]),
+                            (ReloadTool, ["reload"])):
+            tool, cli = self._make(cls)
+            tool.run({})
+            self.assertEqual(cli.calls, [expect])
+
+    def test_screenshot_optional_target(self):
+        t1, c1 = self._make(ScreenshotTool)
+        t1.run({})
+        self.assertEqual(c1.calls, [["screenshot"]])
+        t2, c2 = self._make(ScreenshotTool)
+        t2.run({"target": "e7"})
+        self.assertEqual(c2.calls, [["screenshot", "e7"]])
 
     def test_fill_requires_target_and_text(self):
-        res = self._tool().run({"action": "fill", "target": "e3"})
+        # Issue #166: a missing-required-param fill is rejected BEFORE any browser
+        # contact — FillTool.run validates required params before capturing its
+        # DOM-delta before-snapshot, so an invalid call never touches the CLI.
+        tool, cli = self._make(FillTool)
+        res = tool.run({"target": "e3"})         # missing text
         self.assertFalse(res.ok)
         self.assertIn("text", res.observation)
-        self.assertEqual(self.cli.calls, [])  # never reached the CLI
+        self.assertEqual(cli.calls, [])          # never reached the CLI (no snapshot either)
 
-    def test_click_maps_target(self):
-        self._tool().run({"action": "click", "target": "e6"})
-        self.assertEqual(self.cli.calls, [["click", "e6"]])
+    def test_fill_valid_call_still_captures_dom_delta_snapshot(self):
+        # The validate-before-snapshot reorder must NOT break DOM-delta detection for
+        # a VALID fill: it still snapshots (before + delta) around the fill action.
+        tool, cli = self._make(FillTool)
+        res = tool.run({"target": "e3", "text": "John"})
+        self.assertTrue(res.ok)
+        verbs = [c[0] for c in cli.calls]
+        self.assertIn("snapshot", verbs)         # before/after DOM-delta snapshot taken
+        self.assertIn(["fill", "e3", "John"], cli.calls)
 
-    def test_eval_maps_expression(self):
-        self._tool().run({"action": "eval", "expression": "() => document.title"})
-        self.assertEqual(self.cli.calls, [["eval", "() => document.title"]])
-
-    def test_unknown_action_is_error(self):
-        res = self._tool().run({"action": "teleport"})
+    def test_goto_requires_url(self):
+        tool, cli = self._make(GotoTool)
+        res = tool.run({})
         self.assertFalse(res.ok)
-        self.assertIn("unknown browser action", res.observation)
-
-    def test_cli_failure_is_reported(self):
-        res = self._tool(ok=False, output="net::ERR_NAME_NOT_RESOLVED").run(
-            {"action": "goto", "url": "https://nope.invalid"})
-        self.assertFalse(res.ok)
-        self.assertIn("failed", res.observation)
+        self.assertIn("url", res.observation)
+        self.assertEqual(cli.calls, [])
 
     def test_output_is_truncated(self):
-        tool = BrowseTool(FakeCli(output="x" * 5000), observation_limit=100)
-        res = tool.run({"action": "snapshot"})
+        tool = GotoTool(FakeCli(output="x" * 5000), observation_limit=100)
+        res = tool.run({"url": "https://example.com"})
         self.assertIn("truncated", res.observation)
 
-    def test_browse_schema_branch_present(self):
-        tool = self._tool()
-        schema = tool.call_schema()
-        self.assertEqual(schema["properties"]["tool"]["const"], "browse")
-        self.assertIn("action", schema["properties"]["args"]["properties"])
+    def test_failed_action_surfaces_as_error_observation(self):
+        # A failing CLI action (exits non-zero) must come back as a normal ok=False
+        # observation the agent can adapt to — not a hang (issue #4). The ref IS on
+        # the page (so the issue-#73 guard lets it through) but the CLI run fails.
+        cli = _SnapshotThenResultCli(
+            snapshot="Page: \"X\"\n[e404] button \"Boom\"\n",
+            result_ok=False, result_output="Error: element not found")
+        tool = ClickTool(cli, observation_limit=1000)
+        res = tool.run({"target": "e404"})
+        self.assertFalse(res.ok)
+        self.assertIn("failed", res.observation)
+        self.assertIn("not found", res.observation)
+
+
+class ClickRepeatAndBackGuardTest(unittest.TestCase):
+    """Issue #206: `click` gains a `repeat` count (N clicks in one call, 2s settle
+    after each) and the old back-button guard is gone (clicking a "Previous month"/
+    "Back" element is no longer rejected)."""
+
+    # A snapshot whose only interactable is a date-picker "Previous month" control —
+    # exactly the label the deleted _BACK_BUTTON_RE used to block.
+    _PREV_SNAP = (
+        'Page: "Calendar"\n'
+        '  - button "Previous month" [ref=e192] [cursor=pointer]: ‹\n'
+        '  - button "Next month" [ref=e193] [cursor=pointer]: ›\n'
+    )
+
+    def _click(self, output=None):
+        out = output if output is not None else self._PREV_SNAP
+        cli = FakeCli(ok=True, output=out)
+        return ClickTool(cli, observation_limit=2000), cli
+
+    def test_repeat_param_declared_optional_default_1(self):
+        tool, _ = self._click()
+        repeat = next(p for p in tool.parameters if p.name == "repeat")
+        self.assertEqual(repeat.type, "integer")
+        self.assertFalse(repeat.required)
+        self.assertEqual(repeat.default, 1)
+        # repeat is NOT in the required list of the derived schema.
+        self.assertNotIn("repeat", tool._args_schema().get("required", []))
+
+    def test_default_is_single_click_with_one_settle(self):
+        tool, cli = self._click()
+        with mock.patch("vibeharness.web.time.sleep") as slp:
+            res = tool.run({"target": "e192"})       # no repeat -> default 1
+        self.assertTrue(res.ok)
+        self.assertEqual([c for c in cli.calls if c and c[0] == "click"],
+                         [["click", "e192"]])
+        slp.assert_called_once_with(2.0)
+
+    def test_repeat_clicks_n_times_with_settle_after_each(self):
+        tool, cli = self._click()
+        with mock.patch("vibeharness.web.time.sleep") as slp:
+            res = tool.run({"target": "e192", "repeat": 5})
+        self.assertTrue(res.ok)
+        clicks = [c for c in cli.calls if c and c[0] == "click"]
+        self.assertEqual(clicks, [["click", "e192"]] * 5)        # 5 real clicks
+        # 2s settle AFTER each of the 5 clicks (commit 6a131bf preserved).
+        self.assertEqual(slp.call_args_list, [mock.call(2.0)] * 5)
+        self.assertIn("5 times", res.observation)
+
+    def test_repeat_accepts_string_integer(self):
+        # Models often emit numbers as JSON strings; "3" must coerce to 3 clicks.
+        tool, cli = self._click()
+        with mock.patch("vibeharness.web.time.sleep"):
+            res = tool.run({"target": "e192", "repeat": "3"})
+        self.assertTrue(res.ok)
+        self.assertEqual(len([c for c in cli.calls if c and c[0] == "click"]), 3)
+
+    def test_repeat_zero_or_negative_is_single_click(self):
+        for val in (0, -4):
+            tool, cli = self._click()
+            with mock.patch("vibeharness.web.time.sleep"):
+                res = tool.run({"target": "e192", "repeat": val})
+            self.assertTrue(res.ok)
+            self.assertEqual(len([c for c in cli.calls if c and c[0] == "click"]), 1, val)
+
+    def test_repeat_non_integer_rejected_without_clicking(self):
+        tool, cli = self._click()
+        with mock.patch("vibeharness.web.time.sleep") as slp:
+            res = tool.run({"target": "e192", "repeat": "lots"})
+        self.assertFalse(res.ok)
+        self.assertIn("repeat", res.observation)
+        self.assertEqual([c for c in cli.calls if c and c[0] == "click"], [])
+        slp.assert_not_called()
+
+    def test_repeat_clamped_to_max(self):
+        tool, cli = self._click()
+        with mock.patch("vibeharness.web.time.sleep"):
+            tool.run({"target": "e192", "repeat": 10_000})
+        self.assertEqual(len([c for c in cli.calls if c and c[0] == "click"]),
+                         ClickTool._MAX_REPEAT)
+
+    # --- _parse_repeat boundary tests (cap = 9) ---
+
+    def test_parse_repeat_above_cap_clamped_to_9(self):
+        """repeat > 9 (e.g. 100) must clamp to exactly 9."""
+        tool, _ = self._click()
+        self.assertEqual(tool._parse_repeat(100), 9)
+
+    def test_parse_repeat_at_cap_unchanged(self):
+        """repeat == 9 must be returned as-is (inclusive ceiling)."""
+        tool, _ = self._click()
+        self.assertEqual(tool._parse_repeat(9), 9)
+
+    def test_parse_repeat_default_none_is_1(self):
+        """None (no repeat arg) must resolve to the default of 1."""
+        tool, _ = self._click()
+        self.assertEqual(tool._parse_repeat(None), 1)
+
+    def test_repeat_stops_early_on_failure(self):
+        # The first click succeeds, the second fails -> stop, report progress.
+        cli = _SnapshotThenResultCli(snapshot=self._PREV_SNAP, result_ok=True,
+                                     result_output="### Page\nclicked")
+        calls = {"n": 0}
+        orig_run = cli.run
+
+        def flaky(*args):
+            if args and args[0] == "click":
+                calls["n"] += 1
+                if calls["n"] == 2:
+                    return (False, "Error: element not found")
+            return orig_run(*args)
+        cli.run = flaky
+        tool = ClickTool(cli, observation_limit=2000)
+        with mock.patch("vibeharness.web.time.sleep"):
+            res = tool.run({"target": "e192", "repeat": 4})
+        self.assertFalse(res.ok)
+        self.assertEqual(calls["n"], 2)                 # stopped after the failing 2nd
+        self.assertIn("1 time", res.observation)         # reports the 1 that landed
+
+    def test_previous_month_click_no_longer_rejected(self):
+        # The old _BACK_BUTTON_RE guard would have refused this; now it proceeds.
+        tool, cli = self._click()
+        with mock.patch("vibeharness.web.time.sleep"):
+            res = tool.run({"target": "e192"})           # "Previous month"
+        self.assertTrue(res.ok)
+        self.assertIn(["click", "e192"], cli.calls)
+        self.assertNotIn("BACK/Previous", res.observation)
+
+    def test_back_button_re_symbol_removed(self):
+        import vibeharness.web as web
+        self.assertFalse(hasattr(web, "_BACK_BUTTON_RE"))
+
+
+class SnapshotRefEnforcementTest(unittest.TestCase):
+    """Issue #73: a targeted web tool must validate its `target` against the CURRENT
+    live snapshot's refs (rejecting guessed CSS selectors before any browser call),
+    and must report a no-match as ok=False (the ok-on-no-match status bug)."""
+
+    # A realistic YouTube-consent snapshot (the exact shape from the ground-truth
+    # run): refs appear as [eN] tokens.
+    _SNAPSHOT = (
+        "Page: \"YouTube\"\n"
+        "URL: https://www.youtube.com/watch?v=2K9V8y4gZ3c\n"
+        "[e18] button \"Guide\"\n"
+        "[e87] dialog \"Before you continue to YouTube\" [active]\n"
+        "  [e156] button \"Reject the use of cookies\"\n"
+        "  [e163] button \"Accept the use of cookies\"\n"
+    )
+
+    def test_guessed_css_selector_rejected_and_lists_available_refs(self):
+        # The exact bug trigger from the ground-truth run: a guessed class selector.
+        cli = _SnapshotThenResultCli(snapshot=self._SNAPSHOT)
+        tool = ClickTool(cli, observation_limit=2000)
+        res = tool.run({"target": ".ytd-play-button"})
+        self.assertFalse(res.ok)
+        # The browser was never asked to click — only the validating snapshot ran.
+        self.assertNotIn(["click", ".ytd-play-button"], cli.calls)
+        self.assertEqual([c for c in cli.calls if c[0] == "click"], [])
+        # The message names the offending target and lists the real refs.
+        self.assertIn(".ytd-play-button", res.observation)
+        for ref in ("e18", "e87", "e156", "e163"):
+            self.assertIn(ref, res.observation)
+
+    def test_unknown_ref_rejected(self):
+        # A ref-shaped target that isn't on the page is still rejected.
+        cli = _SnapshotThenResultCli(snapshot=self._SNAPSHOT)
+        tool = ClickTool(cli, observation_limit=2000)
+        res = tool.run({"target": "e999"})
+        self.assertFalse(res.ok)
+        self.assertEqual([c for c in cli.calls if c[0] == "click"], [])
+        self.assertIn("e163", res.observation)  # available refs listed
+
+    def test_valid_ref_proceeds_to_cli(self):
+        # A ref that IS in the snapshot is allowed through to the playwright call.
+        cli = _SnapshotThenResultCli(snapshot=self._SNAPSHOT,
+                                     result_output="### Page\nclicked")
+        tool = ClickTool(cli, observation_limit=2000)
+        res = tool.run({"target": "e163"})
+        self.assertTrue(res.ok)
+        self.assertEqual(cli.calls[-1], ["click", "e163"])
+
+    def test_bracketed_ref_form_is_accepted(self):
+        # The snapshot prints [e163]; accept that bracketed form too.
+        cli = _SnapshotThenResultCli(snapshot=self._SNAPSHOT,
+                                     result_output="### Page\nclicked")
+        tool = ClickTool(cli, observation_limit=2000)
+        res = tool.run({"target": "[e163]"})
+        self.assertTrue(res.ok)
+        self.assertEqual(cli.calls[-1], ["click", "[e163]"])
+
+    def test_no_match_result_is_ok_false_regression(self):
+        # THE bug: playwright-cli exits 0 but its output says the target matched
+        # nothing. That must surface as ok=False, not ok=true-with-an-error.
+        # (Ref is present so it passes the guard and reaches the CLI.)
+        no_match = ('### Error\nError: ".ytd-play-button" does not match any elements.')
+        cli = _SnapshotThenResultCli(snapshot=self._SNAPSHOT,
+                                     result_ok=True, result_output=no_match)
+        tool = ClickTool(cli, observation_limit=2000)
+        res = tool.run({"target": "e163"})
+        self.assertFalse(res.ok, "a no-match must be ok=False (issue #73)")
+        self.assertIn("does not match any elements", res.observation)
+
+    def test_no_match_detection_helper(self):
+        from vibeharness.web import output_signals_no_match
+        self.assertTrue(output_signals_no_match(
+            '### Error\nError: ".x" does not match any elements.'))
+        self.assertTrue(output_signals_no_match("Error: ref not found"))
+        self.assertFalse(output_signals_no_match("### Page\n- Page Title: YouTube"))
+        self.assertFalse(output_signals_no_match(""))
+
+    def test_parse_snapshot_refs(self):
+        from vibeharness.web import parse_snapshot_refs
+        self.assertEqual(parse_snapshot_refs(self._SNAPSHOT),
+                         {"e18", "e87", "e156", "e163"})
+
+    def test_normalize_ref(self):
+        from vibeharness.web import normalize_ref
+        self.assertEqual(normalize_ref("e163"), "e163")
+        self.assertEqual(normalize_ref("[e163]"), "e163")
+        self.assertEqual(normalize_ref(" e163 "), "e163")
+        self.assertIsNone(normalize_ref(".ytd-play-button"))
+        self.assertIsNone(normalize_ref("#play"))
+        self.assertIsNone(normalize_ref("button"))
+
+    def test_guard_fails_open_when_snapshot_unavailable(self):
+        # If the snapshot can't be captured, don't block a legitimate action.
+        cli = _SnapshotThenResultCli(snapshot="", result_output="### Page\nok")
+        tool = ClickTool(cli, observation_limit=2000)
+        res = tool.run({"target": "e5"})
+        self.assertTrue(res.ok)
+        self.assertEqual(cli.calls[-1], ["click", "e5"])
+
+    def test_drag_validates_both_endpoints(self):
+        cli = _SnapshotThenResultCli(snapshot=self._SNAPSHOT)
+        tool = DragTool(cli, observation_limit=2000)
+        # e163 is valid, e999 is not -> reject, never drag.
+        res = tool.run({"target": "e163", "end": "e999"})
+        self.assertFalse(res.ok)
+        self.assertEqual([c for c in cli.calls if c[0] == "drag"], [])
+        self.assertIn("e999", res.observation)
+
+
+class SubtoolGuidanceTest(unittest.TestCase):
+    """Issue #73: descriptions and system guidance must require a snapshot ref and
+    forbid guessing a CSS selector."""
+
+    def test_click_description_requires_snapshot_ref(self):
+        tool = ClickTool(FakeCli(), 1000)
+        desc = tool.description.lower()
+        self.assertIn("ref", desc)
+        self.assertIn("never guess", desc)
+        # and the param doc spells out "never a guessed CSS selector".
+        target_doc = tool.parameters[0].description.lower()
+        self.assertIn("never", target_doc)
+        self.assertIn("css selector", target_doc)
+
+    def test_system_guidance_forbids_guessing_selectors(self):
+        guidance = WebToolset().system_guidance().lower()
+        self.assertIn("ref", guidance)
+        self.assertIn("never guess", guidance)
+        self.assertIn("css selector", guidance)
+
+
+class CalendarHelperTest(unittest.TestCase):
+    """iter-1: deterministic custom-calendar (DatePicker) navigation helpers."""
+
+    SNAP = (
+        '- dialog "Earliest available start date calendar" [ref=e189]:\n'
+        '  - button "Previous year" [ref=e191] [cursor=pointer]: «\n'
+        '  - button "Previous month" [ref=e192] [cursor=pointer]: ‹\n'
+        '  - generic [ref=e193]: July 2026\n'
+        '  - button "Next month" [ref=e194] [cursor=pointer]: ›\n'
+        '  - button "Next year" [ref=e195] [cursor=pointer]: »\n'
+        '  - button "2026-07-21" [ref=e221] [cursor=pointer]: "21"\n'
+        '  - button "2026-07-22" [ref=e222] [cursor=pointer]: "22"\n'
+    )
+
+    def test_calendar_view_month_parses_header(self):
+        from vibeharness.web import calendar_view_month
+        self.assertEqual(calendar_view_month(self.SNAP), (2026, 6))  # 0-based July
+        self.assertIsNone(calendar_view_month('- listbox "State":\n  - option "TX"'))
+
+    def test_find_day_button_ref_matches_iso(self):
+        from vibeharness.web import find_day_button_ref
+        self.assertEqual(find_day_button_ref(self.SNAP, "2026-07-21"), "e221")
+        self.assertEqual(find_day_button_ref(self.SNAP, "2026-07-22"), "e222")
+        self.assertIsNone(find_day_button_ref(self.SNAP, "2026-07-30"))
+
+    def test_find_nav_button_ref(self):
+        from vibeharness.web import find_nav_button_ref
+        self.assertEqual(find_nav_button_ref(self.SNAP, "Next year"), "e195")
+        self.assertEqual(find_nav_button_ref(self.SNAP, "Previous month"), "e192")
+        self.assertIsNone(find_nav_button_ref(self.SNAP, "Next decade"))
+
+
+class ValidationAlertTest(unittest.TestCase):
+    """iter-2 fix: a rejected Continue click leaves `alert` nodes in the snapshot; the
+    harness must surface them so the model fixes the named fields instead of re-clicking
+    Continue blindly (iter-2 turns 16-19 wasted 4 Continue clicks on Step 2)."""
+
+    SNAP = (
+        '- alert [ref=e189]: Invalid enum value. Expected \'Onsite\' | \'Hybrid\' | \'Remote\', received \'\'\n'
+        '- alert [ref=e190]: Please choose a valid date\n'
+        '- button "Continue →" [ref=e81] [cursor=pointer]\n'
+    )
+
+    def test_extracts_alert_text(self):
+        from vibeharness.web import _extract_validation_alerts
+        alerts = _extract_validation_alerts(self.SNAP)
+        self.assertEqual(len(alerts), 2)
+        self.assertIn("Please choose a valid date", alerts)
+        self.assertTrue(any("Invalid enum value" in a for a in alerts))
+
+    def test_no_alerts_in_clean_snapshot(self):
+        from vibeharness.web import _extract_validation_alerts
+        self.assertEqual(_extract_validation_alerts('- button "Continue" [ref=e81]'), [])
+        self.assertEqual(_extract_validation_alerts(''), [])
+
+
+class OpenListboxTargetTest(unittest.TestCase):
+    """iter-4 fix (root cause 2): select_option called on the already-OPEN listbox container
+    (or an option) instead of the combobox trigger must be detected, so the harness clicks the
+    option directly rather than pressing Escape (which would close the listbox unselected)."""
+
+    LISTBOX_SNAP = (
+        '- button "Country" [ref=e73] [cursor=pointer]\n'
+        '- listbox [ref=e188]:\n'
+        '  - option "United States" [ref=e189] [cursor=pointer]\n'
+        '  - option "Canada" [ref=e190] [cursor=pointer]\n'
+    )
+
+    def test_listbox_container_is_open_listbox(self):
+        from vibeharness.web import target_is_open_listbox
+        self.assertTrue(target_is_open_listbox(self.LISTBOX_SNAP, "e188"))
+
+    def test_option_ref_is_open_listbox(self):
+        from vibeharness.web import target_is_open_listbox
+        self.assertTrue(target_is_open_listbox(self.LISTBOX_SNAP, "e189"))
+
+    def test_trigger_button_is_not_open_listbox(self):
+        from vibeharness.web import target_is_open_listbox
+        # e73 is the combobox TRIGGER (a plain button line) -> normal Escape+click path.
+        self.assertFalse(target_is_open_listbox(self.LISTBOX_SNAP, "e73"))
+
+    def test_missing_ref_is_not_open_listbox(self):
+        from vibeharness.web import target_is_open_listbox
+        self.assertFalse(target_is_open_listbox(self.LISTBOX_SNAP, "e999"))
+        self.assertFalse(target_is_open_listbox("", "e1"))
+
+
+class SetSpinbuttonTest(unittest.TestCase):
+    """iter-5: SetSpinbuttonTool sets a numeric stepper to a target value in ONE call by
+    clicking its Increase/Decrease sibling button (current->target) times in Python, so the
+    model no longer needs N LLM roundtrips (one per click) to reach e.g. 9 years."""
+
+    # A spinbutton at value 0 ("0 yrs") with adjacent Increase/Decrease buttons.
+    SNAP = (
+        '- spinbutton "Total years of professional experience" [ref=e730]: "0 yrs"\n'
+        '- button "Increase Total years of professional experience" [ref=e731] [cursor=pointer]\n'
+        '- button "Decrease Total years of professional experience" [ref=e732] [cursor=pointer]\n'
+    )
+    # A spinbutton already at value 2 (the iter-4 stall state).
+    SNAP_AT_2 = (
+        '- spinbutton "Total years of professional experience" [ref=e730]: "2 yrs"\n'
+        '- button "Increase Total years of professional experience" [ref=e731] [cursor=pointer]\n'
+        '- button "Decrease Total years of professional experience" [ref=e732] [cursor=pointer]\n'
+    )
+
+    class _SpinCli:
+        """Answers `snapshot` with a canned page; records every other call."""
+
+        def __init__(self, snapshot):
+            self._snapshot = snapshot
+            self.calls = []
+
+        def run(self, *args):
+            self.calls.append(list(args))
+            if args and args[0] == "snapshot":
+                return (True, self._snapshot)
+            return (True, "### Page\nok")
+
+    def _make(self, snapshot):
+        cli = self._SpinCli(snapshot)
+        return SetSpinbuttonTool(cli, observation_limit=1000), cli
+
+    def test_value_helper_reads_yrs_display(self):
+        from vibeharness.web import spinbutton_current_value
+        self.assertEqual(spinbutton_current_value(self.SNAP, "e730"), 0)
+        self.assertEqual(spinbutton_current_value(self.SNAP_AT_2, "e730"), 2)
+        self.assertIsNone(spinbutton_current_value(self.SNAP, "e999"))
+
+    def test_value_helper_reads_aria_valuenow(self):
+        from vibeharness.web import spinbutton_current_value
+        snap = '- spinbutton "Years" [ref=e5] [valuenow="7"]\n'
+        self.assertEqual(spinbutton_current_value(snap, "e5"), 7)
+
+    def test_find_increase_button(self):
+        from vibeharness.web import find_stepper_button_ref
+        self.assertEqual(find_stepper_button_ref(self.SNAP, "e730", "increase"), "e731")
+        self.assertEqual(find_stepper_button_ref(self.SNAP, "e730", "decrease"), "e732")
+
+    def test_sets_from_zero_clicks_increase_n_times(self):
+        tool, cli = self._make(self.SNAP)
+        res = tool.run({"target": "e730", "value": 9})
+        self.assertTrue(res.ok)
+        clicks = [c for c in cli.calls if c[:1] == ["click"]]
+        self.assertEqual(clicks, [["click", "e731"]] * 9)
+        self.assertIn("9", res.observation)
+
+    def test_sets_from_current_value_clicks_delta_only(self):
+        # Already at 2 -> needs only 7 more Increase clicks to reach 9 (iter-4 recovery).
+        tool, cli = self._make(self.SNAP_AT_2)
+        res = tool.run({"target": "e730", "value": 9})
+        self.assertTrue(res.ok)
+        clicks = [c for c in cli.calls if c[:1] == ["click"]]
+        self.assertEqual(clicks, [["click", "e731"]] * 7)
+
+    def test_decrease_when_target_below_current(self):
+        tool, cli = self._make(self.SNAP_AT_2)
+        res = tool.run({"target": "e730", "value": 0})
+        self.assertTrue(res.ok)
+        clicks = [c for c in cli.calls if c[:1] == ["click"]]
+        self.assertEqual(clicks, [["click", "e732"]] * 2)
+
+    def test_no_clicks_when_already_at_target(self):
+        tool, cli = self._make(self.SNAP_AT_2)
+        res = tool.run({"target": "e730", "value": 2})
+        self.assertTrue(res.ok)
+        self.assertEqual([c for c in cli.calls if c[:1] == ["click"]], [])
+
+    def test_rejects_runaway_delta(self):
+        tool, cli = self._make(self.SNAP)
+        res = tool.run({"target": "e730", "value": 999})
+        self.assertFalse(res.ok)
+        self.assertEqual([c for c in cli.calls if c[:1] == ["click"]], [])
+
+    def test_rejects_missing_ref_on_page(self):
+        tool, cli = self._make(self.SNAP)
+        res = tool.run({"target": "e999", "value": 9})
+        self.assertFalse(res.ok)
+        self.assertEqual([c for c in cli.calls if c[:1] == ["click"]], [])
+
+    def test_missing_value_param_guarded(self):
+        tool, cli = self._make(self.SNAP)
+        res = tool.run({"target": "e730"})
+        self.assertFalse(res.ok)
+        self.assertIn("value", res.observation)
+
+    def test_registered_in_toolset(self):
+        self.assertIn(SetSpinbuttonTool, _WEB_TOOL_CLASSES)
+
+
+class CalendarNavigationTest(unittest.TestCase):
+    """iter-1: SelectOptionTool._select_calendar_date drives a custom calendar to the
+    target ISO date by stepping the month/year nav buttons, then clicking the day."""
+
+    MONTHS = ["January", "February", "March", "April", "May", "June", "July",
+              "August", "September", "October", "November", "December"]
+
+    class _CalCli:
+        """A fake calendar: starts at Jan 2020, responds to nav-button and day clicks."""
+
+        def __init__(self):
+            self.y, self.m = 2020, 0       # 0-based month
+            self.clicked_day = None
+
+        def _snap(self):
+            label = f"{CalendarNavigationTest.MONTHS[self.m]} {self.y}"
+            iso = lambda d: f"{self.y:04d}-{self.m + 1:02d}-{d:02d}"
+            days = "\n".join(
+                f'  - button "{iso(d)}" [ref=e2{d:02d}] [cursor=pointer]: "{d}"'
+                for d in range(1, 29))
+            return (
+                '- dialog "calendar" [ref=e189]:\n'
+                '  - button "Previous year" [ref=e191]: «\n'
+                '  - button "Previous month" [ref=e192]: ‹\n'
+                f'  - generic [ref=e193]: {label}\n'
+                '  - button "Next month" [ref=e194]: ›\n'
+                '  - button "Next year" [ref=e195]: »\n'
+                f'{days}\n')
+
+        def run(self, *args):
+            verb = args[0]
+            if verb == "snapshot":
+                return True, f"```yaml\n{self._snap()}\n```"
+            if verb == "click":
+                ref = args[1]
+                if ref == "e194":
+                    self.m += 1
+                    if self.m > 11:
+                        self.m, self.y = 0, self.y + 1
+                elif ref == "e192":
+                    self.m -= 1
+                    if self.m < 0:
+                        self.m, self.y = 11, self.y - 1
+                elif ref == "e195":
+                    self.y += 1
+                elif ref == "e191":
+                    self.y -= 1
+                else:
+                    self.clicked_day = ref
+                return True, "### Ran Playwright code"
+            return True, ""
+
+        def snapshot(self):
+            return True, f"```yaml\n{self._snap()}\n```"
+
+    def test_navigates_forward_to_target_and_clicks_day(self):
+        from vibeharness.web import SelectOptionTool, capture_page_snapshot_raw
+        cli = self._CalCli()
+        tool = SelectOptionTool(cli, observation_limit=2000)
+        snap = capture_page_snapshot_raw(cli)
+        result = tool._select_calendar_date("e166", "2026-07-21", snap)
+        self.assertTrue(result.ok, result.observation)
+        self.assertIn("2026-07-21", result.observation)
+        self.assertEqual((cli.y, cli.m), (2026, 6))      # reached July 2026
+        self.assertEqual(cli.clicked_day, "e221")        # clicked the 21st
+
+
+class SubtoolSchemaTest(unittest.TestCase):
+    def test_each_subtool_call_schema_names_itself(self):
+        for cls in _WEB_TOOL_CLASSES:
+            tool = cls(FakeCli(), observation_limit=1000)
+            schema = tool.call_schema()
+            self.assertEqual(schema["properties"]["tool"]["const"], tool.name)
+            # args is an object schema derived from the tool's params.
+            self.assertEqual(schema["properties"]["args"]["type"], "object")
+
+    def test_no_subtool_is_named_browse_or_snapshot(self):
+        names = {cls.name for cls in _WEB_TOOL_CLASSES}
+        self.assertNotIn("browse", names)
+        self.assertNotIn("snapshot", names)
+
+    def test_required_params_marked_in_schema(self):
+        schema = FillTool(FakeCli(), 1000).call_schema()
+        required = schema["properties"]["args"].get("required", [])
+        self.assertIn("target", required)
+        self.assertIn("text", required)
+
+
+class _SleepCli(PlaywrightCli):
+    """A REAL PlaywrightCli whose command is a Python child that sleeps far
+    longer than the configured timeout. Drives the actual bounded-execution path
+    (Popen + communicate(timeout) + kill-tree) in ``run`` — only the program
+    being launched stands in for the live browser CLI (issue #4)."""
+
+    def __init__(self, timeout, sleep_seconds=30):
+        super().__init__(session="test", timeout=timeout)
+        self._binary = sys.executable          # python is a real, on-PATH binary
+        self._sleep = sleep_seconds
+
+    def _command(self, *args):
+        # Ignore the playwright args; just sleep so the command outlives timeout.
+        return [self._binary, "-c", f"import time; time.sleep({self._sleep})"]
+
+
+class TimeoutTest(unittest.TestCase):
+    """Real-behavior tests for issue #4: a web action must be HARD-BOUNDED by the
+    configured timeout and must never hang the agent turn."""
+
+    def test_slow_command_returns_timeout_error_without_hanging(self):
+        # A real child that sleeps 30s, bounded by a 1s timeout. If the bug
+        # regressed (the timeout did not bound the call, or the post-kill drain
+        # blocked on a child holding the captured pipe), this would hang ~30s;
+        # instead it must return promptly with a clear timeout error.
+        cli = _SleepCli(timeout=1, sleep_seconds=30)
+        start = time.monotonic()
+        ok, out = cli.run("goto", "https://example.com")
+        elapsed = time.monotonic() - start
+
+        self.assertFalse(ok)
+        self.assertIn("timed out after 1s", out)
+        # Returns well inside the sleep window (1s timeout + a few s kill grace),
+        # proving the call did NOT hang past the bound.
+        self.assertLess(elapsed, 15, "web action hung past its timeout (issue #4)")
+
+    def test_timeout_error_surfaces_as_web_tool_observation(self):
+        # The agent only ever sees a ToolResult; assert the timeout becomes a
+        # clear ok=False observation naming the action, so the agent can adapt.
+        cli = _SleepCli(timeout=1, sleep_seconds=30)
+        tool = GotoTool(cli, observation_limit=1000)
+        start = time.monotonic()
+        res = tool.run({"url": "https://example.com"})
+        elapsed = time.monotonic() - start
+
+        self.assertFalse(res.ok)
+        self.assertIn("navigated to", res.observation)  # the 'goto' verb
+        self.assertIn("timed out after 1s", res.observation)
+        self.assertLess(elapsed, 15, "web tool hung past its timeout (issue #4)")
+
+    def test_timeout_expired_is_caught_not_propagated(self):
+        # If communicate() raises TimeoutExpired (the documented timeout signal),
+        # run() must catch it and return an error tuple, never let it propagate.
+        import vibeharness.web as web_mod
+
+        class FakeProc:
+            pid = 999999
+            returncode = None
+
+            def communicate(self, timeout=None):
+                raise subprocess.TimeoutExpired(cmd="fake", timeout=timeout or 1)
+
+            def kill(self):
+                pass
+
+        cli = PlaywrightCli(session="test", timeout=1)
+        cli._binary = "fake-binary"
+        orig = web_mod.subprocess.Popen
+        web_mod.subprocess.Popen = lambda *a, **k: FakeProc()
+        try:
+            ok, out = cli.run("goto", "https://example.com")
+        finally:
+            web_mod.subprocess.Popen = orig
+        self.assertFalse(ok)
+        self.assertIn("timed out after 1s", out)
+
+
+class _FakeProc:
+    """Stand-in for a spawned Popen: just carries a pid and records kill()."""
+
+    def __init__(self, pid=424242):
+        self.pid = pid
+        self.killed = False
+
+    def kill(self):
+        self.killed = True
+
+
+class CloseReapsTreeTest(unittest.TestCase):
+    """Issue #15: closing a session must run the graceful `close` AND tree-kill the
+    spawned daemon/chrome tree, be idempotent, and never raise. No live browser: a
+    fake child proc + a stubbed `_kill_tree` prove the tree-kill path is taken."""
+
+    def _cli_with_fake_proc(self):
+        cli = PlaywrightCli(session="test", timeout=5)
+        cli._binary = "fake-binary"          # mark "installed" so run() proceeds
+        cli._last_proc = _FakeProc()         # pretend setup's `open` spawned this
+        runs = []
+        # Stub run() so no real subprocess launches; record the CLI verbs issued.
+        cli.run = lambda *a: (runs.append(list(a)) or (True, "ok"))
+        killed = []
+        cli._kill_tree = lambda proc: killed.append(proc)
+        return cli, runs, killed
+
+    def test_close_issues_close_command_and_kills_tree(self):
+        cli, runs, killed = self._cli_with_fake_proc()
+        proc = cli._last_proc
+        cli.close()
+        self.assertIn(["close"], runs)             # graceful close ran
+        self.assertEqual(killed, [proc])           # whole tree reaped
+        self.assertIsNone(cli._last_proc)          # handle cleared
+
+    def test_close_is_idempotent(self):
+        cli, runs, killed = self._cli_with_fake_proc()
+        cli.close()
+        cli.close()                                # second call: no proc left
+        self.assertEqual(len(killed), 1)           # tree killed exactly once
+        # Both calls still issue the graceful close (harmless no-op CLI call).
+        self.assertEqual(runs.count(["close"]), 2)
+
+    def test_close_kills_tree_even_when_graceful_close_raises(self):
+        # A crashed/wedged session may make `close` raise; the tree must STILL be
+        # reaped so no chrome/node leaks.
+        cli = PlaywrightCli(session="test", timeout=5)
+        cli._binary = "fake-binary"
+        proc = _FakeProc()
+        cli._last_proc = proc
+        def boom(*a):
+            raise RuntimeError("cli exploded")
+        cli.run = boom
+        killed = []
+        cli._kill_tree = lambda p: killed.append(p)
+        cli.close()                                # must not raise
+        self.assertEqual(killed, [proc])
+
+    def test_close_never_raises_with_no_proc(self):
+        cli = PlaywrightCli(session="test", timeout=5)
+        cli._binary = "fake-binary"
+        cli.run = lambda *a: (True, "ok")
+        cli._last_proc = None
+        cli.close()                                # no handle: graceful close only
+
+
+class WebToolsetTeardownTest(unittest.TestCase):
+    """Issue #15: WebToolset.teardown closes the run's CLI (which reaps the tree),
+    runs even when the run body raised (cli.py's finally path), and swallows its own
+    errors. Driven with a fake CLI — no browser involved."""
+
+    class _RecordingCli:
+        def __init__(self):
+            self.closed = 0
+            self.opened = []
+        def run(self, *a):
+            self.opened.append(list(a))
+            return True, "ok"
+        def close(self):
+            self.closed += 1
+
+    def test_teardown_closes_the_run_cli(self):
+        ts = WebToolset()
+        cli = self._RecordingCli()
+        ts._cli = cli                              # stand in for setup()'s CLI
+        ts.teardown(Config())
+        self.assertEqual(cli.closed, 1)            # close() -> tree reap invoked
+        self.assertIsNone(ts._cli)                 # state cleared (idempotent-friendly)
+
+    def test_teardown_runs_after_run_body_raised(self):
+        # Reproduce cli.py's finally path: setup, run body raises, finally tears down.
+        ts = WebToolset()
+        cli = self._RecordingCli()
+        ts._cli = cli
+        try:
+            raise RuntimeError("run crashed mid-stream")
+        except RuntimeError:
+            pass
+        finally:
+            ts.teardown(Config())
+        self.assertEqual(cli.closed, 1)            # browser reaped despite the crash
+
+    def test_teardown_swallows_close_errors(self):
+        ts = WebToolset()
+        class _Boom:
+            def close(self):
+                raise RuntimeError("close blew up")
+        ts._cli = _Boom()
+        ts.teardown(Config())                      # must NOT raise
+        self.assertIsNone(ts._cli)
+
+    def test_teardown_without_setup_still_best_effort_closes(self):
+        # No prior setup (e.g. setup failed early): teardown must not raise and must
+        # attempt a by-name close rather than crash on a missing CLI.
+        ts = WebToolset()                          # _cli is None
+        ts.teardown(Config())                      # exercises the fallback PlaywrightCli
+
+    def test_teardown_is_idempotent(self):
+        ts = WebToolset()
+        cli = self._RecordingCli()
+        ts._cli = cli
+        ts.teardown(Config())
+        ts.teardown(Config())                      # second call: _cli is None now
+        self.assertEqual(cli.closed, 1)            # original CLI closed exactly once
+
+
+class CliFinallyTeardownContractTest(unittest.TestCase):
+    """Issue #15: reproduce cli._run_locked's setup-inside-try / teardown-in-finally
+    loop with fake toolsets to prove the browser is reaped on ANY termination — a
+    crashing run body, or a LATER toolset's setup raising after web already opened —
+    and that one failing teardown never blocks the others."""
+
+    class _FakeToolset:
+        def __init__(self, name, setup_raises=False, teardown_raises=False):
+            self.name = name
+            self._setup_raises = setup_raises
+            self._teardown_raises = teardown_raises
+            self.torn_down = False
+        def setup(self, config):
+            if self._setup_raises:
+                raise RuntimeError(f"{self.name} setup failed")
+        def teardown(self, config):
+            self.torn_down = True
+            if self._teardown_raises:
+                raise RuntimeError(f"{self.name} teardown failed")
+
+    @staticmethod
+    def _run_loop(toolsets, run_body):
+        """Verbatim shape of cli._run_locked's setup/run/finally block."""
+        try:
+            for ts in toolsets:
+                ts.setup(None)
+            run_body()
+        finally:
+            for ts in reversed(toolsets):
+                try:
+                    ts.teardown(None)
+                except Exception:
+                    pass
+
+    def test_crashing_run_body_still_tears_down_web(self):
+        web = self._FakeToolset("web")
+        with self.assertRaises(RuntimeError):
+            self._run_loop([web], lambda: (_ for _ in ()).throw(RuntimeError("crash")))
+        self.assertTrue(web.torn_down)   # browser reaped despite uncaught crash
+
+    def test_later_setup_failure_still_tears_down_already_opened_web(self):
+        web = self._FakeToolset("web")
+        bad = self._FakeToolset("fs", setup_raises=True)
+        with self.assertRaises(RuntimeError):
+            self._run_loop([web, bad], lambda: None)
+        self.assertTrue(web.torn_down)   # web opened first, must be torn down
+
+    def test_one_failing_teardown_does_not_block_others(self):
+        web = self._FakeToolset("web", teardown_raises=True)
+        fs = self._FakeToolset("fs")
+        self._run_loop([web, fs], lambda: None)   # no exception escapes the finally
+        self.assertTrue(web.torn_down)
+        self.assertTrue(fs.torn_down)             # reached despite web's teardown raising
+
+
+class _ReopenableCli(PlaywrightCli):
+    """A PlaywrightCli stand-in modelling a session whose persistent daemon has
+    DIED: until ``open`` is called, every command (snapshot included) fails with the
+    real "browser is not open" text; after ``open`` it answers normally.
+
+    It is a REAL ``PlaywrightCli`` subclass overriding only the low-level
+    ``_run_once`` seam, so the genuine self-healing ``run`` (detect close -> reopen
+    -> re-navigate -> retry) is exercised end to end (issues #101/#75/#102). Records
+    every low-level command for sequence assertions."""
+
+    NOT_OPEN = "The browser 'vibe' is not open, please run open first playwright-cli -s=vibe open"
+
+    def __init__(self, snapshot_after_open="Page: \"X\"\n[e1] textbox\n",
+                 result_after_open="### Page\nok", *, open_succeeds=True,
+                 open_flags=("--headed",)):
+        super().__init__(session="vibe", timeout=5, open_flags=list(open_flags))
+        self._binary = "fake-binary"          # mark installed so _run_once is reached
+        self._is_open = False
+        self._open_succeeds = open_succeeds
+        self._snapshot = snapshot_after_open
+        self._result = result_after_open
+        self.calls = []
+
+    def _run_once(self, *args):
+        self.calls.append(list(args))
+        cmd = args[0] if args else ""
+        if cmd == "open":
+            if not self._open_succeeds:
+                return (False, "open failed: could not launch browser")
+            self._is_open = True
+            return (True, "### Browser `vibe` opened with pid 1234.")
+        if cmd == "close":
+            self._is_open = False
+            return (True, "Browser 'vibe' closed")
+        if not self._is_open:
+            return (False, self.NOT_OPEN)
+        if cmd == "snapshot":
+            return (True, self._snapshot)
+        return (True, self._result)
+
+
+class SessionClosedDetectionTest(unittest.TestCase):
+    """The session-death signal (#101) is distinct from a per-element no-match (#73)."""
+
+    def test_output_signals_session_closed(self):
+        from vibeharness.web import output_signals_session_closed
+        self.assertTrue(output_signals_session_closed(
+            "The browser 'vibe' is not open, please run open first playwright-cli -s=vibe open"))
+        self.assertTrue(output_signals_session_closed("Error: session closed"))
+        self.assertFalse(output_signals_session_closed("### Page\n- Page Title: YouTube"))
+        self.assertFalse(output_signals_session_closed(""))
+
+    def test_no_match_is_not_a_session_close(self):
+        # A per-element miss (#73) must NOT be mistaken for the daemon dying, or we
+        # would needlessly reopen on every bad ref.
+        from vibeharness.web import output_signals_session_closed
+        self.assertFalse(output_signals_session_closed(
+            '### Error\nError: ".x" does not match any elements.'))
+
+
+class RootCauseDaemonSurvivesTimeoutTest(unittest.TestCase):
+    """Issue #101 root cause: a SINGLE per-command timeout/kill must NOT tear down
+    the shared persistent daemon. The harness's per-command kill path
+    (``_kill_tree``) acts only on that command's own spawned process; it must never
+    issue a session `close`/`stop`, which is what actually kills the daemon."""
+
+    def test_timed_out_command_does_not_close_the_session(self):
+        # Drive the REAL bounded-execution path with a child that outlives the
+        # timeout, then assert the wrapper never asked playwright to `close`/`stop`
+        # the session — i.e. one slow command cannot take down the daemon.
+        closed = {"count": 0}
+
+        class _SleepCliNoClose(_SleepCli):
+            def close(self):
+                closed["count"] += 1
+                super().close()
+
+        cli = _SleepCliNoClose(timeout=1, sleep_seconds=30)
+        ok, out = cli.run("snapshot")
+        self.assertFalse(ok)
+        self.assertIn("timed out", out)
+        # The timeout path tree-kills only THIS command's own child; it must not have
+        # invoked the session-closing close() at all.
+        self.assertEqual(closed["count"], 0,
+                         "a per-command timeout must not close/stop the shared daemon (#101)")
+
+    def test_kill_tree_targets_only_the_commands_own_proc(self):
+        # The kill on timeout is scoped to the timed-out command's Popen handle, NOT
+        # a broadcast daemon kill: assert _kill_tree is handed exactly that proc.
+        import vibeharness.web as web_mod
+        killed = []
+
+        class FakeProc:
+            pid = 555
+            returncode = None
+            def communicate(self, timeout=None):
+                raise subprocess.TimeoutExpired(cmd="x", timeout=timeout or 1)
+            def kill(self):
+                pass
+
+        the_proc = FakeProc()
+        cli = PlaywrightCli(session="vibe", timeout=1)
+        cli._binary = "fake"
+        orig_popen = web_mod.subprocess.Popen
+        # Restore the staticmethod via the class __dict__ so we don't accidentally
+        # rebind it as an instance method (which would feed `self` and break later
+        # tests that exercise the real kill path).
+        orig_kill = PlaywrightCli.__dict__["_kill_tree"]
+        web_mod.subprocess.Popen = lambda *a, **k: the_proc
+        cli._kill_tree = lambda p: killed.append(p)   # per-instance override only
+        try:
+            cli.run("snapshot")
+        finally:
+            web_mod.subprocess.Popen = orig_popen
+        # Exactly the command's own proc was killed — nothing broader.
+        self.assertEqual(killed, [the_proc])
+        self.assertIs(PlaywrightCli.__dict__["_kill_tree"], orig_kill)  # class untouched
+
+
+class OpenBrowserToolTest(unittest.TestCase):
+    """Issue #75: an agent-callable open_browser tool that (re)opens the session."""
+
+    def test_open_browser_is_not_registered_and_goto_is_first(self):
+        # Simplified tool interface (issue #166): open_browser is NOT agent-callable —
+        # `goto` opens a session automatically when none is open, and navigates an
+        # existing one otherwise, so it is the FIRST / opening tool. OpenBrowserTool
+        # the class still exists for internal session recovery (tests below).
+        from vibeharness.web import OpenBrowserTool
+        names = [c.name for c in _WEB_TOOL_CLASSES]
+        self.assertNotIn("open_browser", names)
+        self.assertNotIn(OpenBrowserTool, _WEB_TOOL_CLASSES)
+        self.assertIs(_WEB_TOOL_CLASSES[0], GotoTool)
+        self.assertEqual(_WEB_TOOL_CLASSES[0].name, "goto")
+
+    def test_open_browser_opens_the_session(self):
+        from vibeharness.web import OpenBrowserTool
+        cli = _ReopenableCli()
+        tool = OpenBrowserTool(cli, observation_limit=1000)
+        res = tool.run({})
+        self.assertTrue(res.ok)
+        self.assertIn("open", res.observation.lower())
+        # It used cli.open() (carrying the run's flags), not a bare run("open").
+        self.assertEqual(cli.calls[0][0], "open")
+
+    def test_open_browser_surfaces_failure_clearly(self):
+        from vibeharness.web import OpenBrowserTool
+        cli = _ReopenableCli(open_succeeds=False)
+        tool = OpenBrowserTool(cli, observation_limit=1000)
+        res = tool.run({})
+        self.assertFalse(res.ok)
+        self.assertIn("failed", res.observation.lower())
+
+    def test_open_uses_captured_flags_on_real_cli(self):
+        # PlaywrightCli.open() defaults to the session's captured open flags so a
+        # reopen restores the same headed/channel browser (#101/#75). It goes through
+        # the low-level _run_once seam (never the self-healing run, to avoid recursion).
+        recorded = []
+        cli = PlaywrightCli(session="vibe", timeout=5, open_flags=["--headed", "--browser", "chrome"])
+        cli._run_once = lambda *a: (recorded.append(list(a)) or (True, "ok"))
+        cli.open()
+        self.assertEqual(recorded, [["open", "--headed", "--browser", "chrome"]])
+
+
+class AutoRecoveryTest(unittest.TestCase):
+    """Issue #101/#75/#102: a web action against a CLOSED session transparently
+    reopens (and re-navigates to the last URL) and retries once, at the CLI seam —
+    the agent sees success, not a dead-end "not open" loop."""
+
+    def test_fill_reopens_and_retries_on_dead_session(self):
+        cli = _ReopenableCli(snapshot_after_open="Page: \"X\"\n[e1] textbox\n",
+                             result_after_open="### Page\nfilled")
+        tool = FillTool(cli, observation_limit=1000)
+        res = tool.run({"target": "e1", "text": "hi"})
+        self.assertTrue(res.ok, "auto-recovery should make the retried action succeed")
+        # Proof of the sequence: the daemon was reopened, then the action replayed.
+        verbs = [c[0] for c in cli.calls]
+        self.assertIn("open", verbs)
+        self.assertEqual(verbs[-1], "fill")        # last call is the successful replay
+
+    def test_goto_reopens_and_retries_on_dead_session(self):
+        # goto has no target guard, so it's the cleanest proof of the action-level path.
+        cli = _ReopenableCli(result_after_open="### Page\nnavigated")
+        tool = GotoTool(cli, observation_limit=1000)
+        res = tool.run({"url": "https://example.com"})
+        self.assertTrue(res.ok)
+        opens = [c for c in cli.calls if c[0] == "open"]
+        self.assertEqual(len(opens), 1)                  # reopened exactly once
+        self.assertEqual(opens[0], ["open", "--headed"])  # with the run's captured flags
+        self.assertEqual(cli.calls[-1], ["goto", "https://example.com"])
+
+    def test_resume_renavigates_to_last_url(self):
+        # After a successful goto, last_url is tracked; a later dead-session command
+        # re-navigates there as part of resume (issue #102) so the page is restored.
+        cli = _ReopenableCli(snapshot_after_open="Page: \"X\"\nPage URL: https://example.com/app\n",
+                             result_after_open="### Page\nfilled")
+        # First, a live goto records last_url.
+        cli._is_open = True
+        GotoTool(cli, 1000).run({"url": "https://example.com/app"})
+        self.assertEqual(cli.state.last_url, "https://example.com/app")
+        # Now the session dies; a fill triggers resume which must re-goto last_url.
+        cli._is_open = False
+        FillTool(cli, 1000).run({"target": "e1", "text": "hi"})
+        self.assertIn(["goto", "https://example.com/app"], cli.calls[-3:])
+
+    def test_resume_is_bounded(self):
+        # If reopen never sticks (open "succeeds" but the session stays dead), resume
+        # must be capped across the run so a broken environment terminates instead of
+        # re-opening on every single command forever. Each run() does at most one
+        # resume; once the cap is hit, further dead-session commands stop resuming.
+        cli = _ReopenableCli()
+        # open() claims success but the session stays "closed", forcing repeated death.
+        def _broken(*args):
+            cli.calls.append(list(args))
+            cmd = args[0] if args else ""
+            if cmd in ("open", "close"):
+                return (True, f"{cmd} ok")
+            return (False, _ReopenableCli.NOT_OPEN)
+        cli._run_once = _broken
+        cli._state.max_resumes = 3
+        for _ in range(6):                              # many commands, all dead
+            cli.run("goto", "https://example.com")
+        self.assertEqual(cli._state.resumes, 3)         # capped, did not spin forever
+        # Once capped, later dead-session commands no longer trigger an open.
+        before = sum(1 for c in cli.calls if c[0] == "open")
+        cli.run("goto", "https://example.com")
+        after = sum(1 for c in cli.calls if c[0] == "open")
+        self.assertEqual(before, after)                 # no further reopen attempts
+
+    def test_reopen_failure_returns_clear_recovery_path_not_bare_error(self):
+        # If the session is dead AND reopening fails, the agent must get an
+        # actionable "call open_browser" message, never a silent dead-end.
+        cli = _ReopenableCli(open_succeeds=False)
+        tool = GotoTool(cli, observation_limit=1000)
+        res = tool.run({"url": "https://example.com"})
+        self.assertFalse(res.ok)
+        self.assertIn("open_browser", res.observation)
+
+    def test_recovery_only_triggers_on_session_close_not_no_match(self):
+        # A per-element no-match (#73) must NOT trigger a reopen — only a genuine
+        # session death does. Use a live (open) session whose action no-matches.
+        cli = _SnapshotThenResultCli(
+            snapshot="Page: \"X\"\n[e1] button\n",
+            result_ok=True,
+            result_output='### Error\nError: "e1" does not match any elements.')
+        tool = ClickTool(cli, observation_limit=1000)
+        res = tool.run({"target": "e1"})
+        self.assertFalse(res.ok)
+        self.assertNotIn(["open"], cli.calls)      # never tried to reopen
+        self.assertIn("does not match", res.observation)
+
+
+class WebToolsetGuidanceRecoveryTest(unittest.TestCase):
+    """Issue #166 / PR #167: system guidance must steer the agent to open a page with
+    `goto` (which starts the browser automatically) — it must NOT reference the
+    removed agent-callable `open_browser` tool."""
+
+    def test_guidance_directs_goto_to_open_and_omits_open_browser(self):
+        guidance = WebToolset().system_guidance().lower()
+        self.assertIn("goto", guidance)
+        # Guidance tells the agent goto opens/starts the browser automatically.
+        self.assertIn("goto <url>", guidance)
+        self.assertIn("automatically", guidance)
+        # The simplified interface has no agent-callable open_browser tool.
+        self.assertNotIn("open_browser", guidance)
+
+
+class FindOptionRefTest(unittest.TestCase):
+    """#125: match an OPEN custom-combobox option by its visible text (combobox fallback)."""
+
+    SNAP = (
+        '- combobox "State" [ref=e82]\n'
+        '- listbox [ref=e90]:\n'
+        '  - option "Alabama" [ref=e91]\n'
+        '  - option "Texas" [ref=e92]\n'
+        '  - option "TX" [ref=e93]\n'
+    )
+
+    def test_exact_match_wins_over_substring(self):
+        from vibeharness.web import find_option_ref_by_text
+        self.assertEqual(find_option_ref_by_text(self.SNAP, "TX"), "e93")
+
+    def test_case_insensitive_and_startswith(self):
+        from vibeharness.web import find_option_ref_by_text
+        self.assertEqual(find_option_ref_by_text(self.SNAP, "texas"), "e92")
+        self.assertEqual(find_option_ref_by_text(self.SNAP, "Tex"), "e92")
+
+    def test_no_match_returns_none(self):
+        from vibeharness.web import find_option_ref_by_text
+        self.assertIsNone(find_option_ref_by_text(self.SNAP, "Wyoming"))
+        self.assertIsNone(find_option_ref_by_text(self.SNAP, ""))
 
 
 if __name__ == "__main__":

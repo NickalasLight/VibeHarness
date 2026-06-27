@@ -9,10 +9,24 @@ from __future__ import annotations
 import fnmatch
 import os
 import shutil
+from dataclasses import dataclass
 
 
 class FileSystemError(Exception):
     """Raised for any filesystem operation failure, with a readable message."""
+
+
+# One page of a paged read. Pages are fixed-size windows over the file's text.
+PAGE_SIZE = 10000
+
+
+@dataclass(frozen=True)
+class Page:
+    """A single window of a file's text, plus where it sits in the whole."""
+    text: str
+    page_number: int
+    total_pages: int
+    total_chars: int
 
 
 # Files we won't try to read/search as text.
@@ -55,6 +69,29 @@ class FileSystem:
         if max_chars is not None and len(data) > max_chars:
             return data[:max_chars] + f"\n... [truncated, {len(data)} chars total]"
         return data
+
+    def read_page(self, path: str, page: int = 1) -> Page:
+        """Read one PAGE_SIZE-char window of a file.
+
+        Pages are 1-indexed. An empty file is a single (empty) page so callers
+        always get page 1 of 1. Out-of-range pages raise FileSystemError.
+        """
+        full = self.resolve(path)
+        if not os.path.isfile(full):
+            raise FileSystemError(f"'{path}' does not exist or is not a file")
+        try:
+            with open(full, "r", encoding="utf-8", errors="replace") as f:
+                data = f.read()
+        except OSError as e:
+            raise FileSystemError(f"could not read '{path}': {e}")
+        total_chars = len(data)
+        total_pages = max(1, (total_chars + PAGE_SIZE - 1) // PAGE_SIZE)
+        if page < 1 or page > total_pages:
+            raise FileSystemError(
+                f"page {page} is out of range for '{path}' "
+                f"(it has {total_pages} page(s))")
+        start = (page - 1) * PAGE_SIZE
+        return Page(data[start:start + PAGE_SIZE], page, total_pages, total_chars)
 
     def search(self, query: str, path: str = ".", target: str = "content",
                max_results: int = 50) -> list[str]:
@@ -136,6 +173,88 @@ class FileSystem:
             shutil.move(src_full, self.resolve(dst))
         except OSError as e:
             raise FileSystemError(f"could not move '{src}' to '{dst}': {e}")
+
+    def copy(self, src: str, dst: str) -> None:
+        """Copy a file or directory, preserving content + metadata and the
+        original. Auto-creates the destination's parent dir; refuses if the
+        destination already exists."""
+        src_full = self.resolve(src)
+        dst_full = self.resolve(dst)
+        if not os.path.exists(src_full):
+            raise FileSystemError(f"source '{src}' does not exist")
+        if os.path.exists(dst_full):
+            raise FileSystemError(f"destination '{dst}' already exists")
+        parent = os.path.dirname(dst_full)
+        if parent and not os.path.isdir(parent):
+            os.makedirs(parent, exist_ok=True)
+        try:
+            if os.path.isdir(src_full):
+                shutil.copytree(src_full, dst_full)
+            else:
+                shutil.copy2(src_full, dst_full)
+        except OSError as e:
+            raise FileSystemError(f"could not copy '{src}' to '{dst}': {e}")
+
+    # ---- compact tree summary (for prompt context) ----
+    def tree(self, path: str = ".", max_depth: int = 3, max_entries: int = 100) -> str:
+        """A compact directory listing for embedding in a prompt.
+
+        Lists dirs (with a trailing ``/``) and files (with their byte size),
+        dirs first then files, alphabetical within each group. Recurses up to
+        ``max_depth`` and emits at most ``max_entries`` lines total, appending
+        ``… (N more)`` when either cap truncates the listing. Kept deliberately
+        terse — it is refreshed into the system prompt every turn.
+
+        Hidden (dot-prefixed) files and directories — ``.vibe``, ``.git``,
+        ``.playwright-cli``, nested ``.foo/``, … — are EXCLUDED at every level.
+        They are harness/tooling artifacts (the ``.vibe`` diagnostics dir grows
+        every turn) that only bloat and pollute the per-turn prompt.
+        """
+        root = self.resolve(path)
+        if not os.path.isdir(root):
+            raise FileSystemError(f"'{path}' is not a directory or does not exist")
+        lines: list[str] = []
+        truncated = [0]  # entries not shown (depth/cap)
+
+        def walk(base: str, depth: int, indent: str) -> None:
+            try:
+                names = os.listdir(base)
+            except OSError:
+                return
+            # Drop dot-prefixed entries (both dirs and files) at every level, so
+            # nested hidden dirs are pruned too.
+            names = [n for n in names if not n.startswith(".")]
+            dirs = sorted(n for n in names if os.path.isdir(os.path.join(base, n)))
+            files = sorted(n for n in names if not os.path.isdir(os.path.join(base, n)))
+            for d in dirs:
+                if len(lines) >= max_entries:
+                    truncated[0] += 1
+                    continue
+                lines.append(f"{indent}{d}/")
+                if depth + 1 < max_depth:
+                    walk(os.path.join(base, d), depth + 1, indent + "  ")
+                else:
+                    sub = os.path.join(base, d)
+                    try:
+                        truncated[0] += len(os.listdir(sub))
+                    except OSError:
+                        pass
+            for f in files:
+                if len(lines) >= max_entries:
+                    truncated[0] += 1
+                    continue
+                try:
+                    size = os.path.getsize(os.path.join(base, f))
+                except OSError:
+                    size = 0
+                lines.append(f"{indent}{f} ({size}B)")
+
+        walk(root, 0, "")
+        if not lines:
+            return "(empty)"
+        if truncated[0]:
+            lines.append(f"… ({truncated[0]} more)")
+        return "\n".join(lines)
 
     @staticmethod
     def _read_or_empty(full: str) -> str:
