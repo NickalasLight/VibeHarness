@@ -61,6 +61,14 @@ class ModelSpec:
     tool_omit: frozenset[str] | None = None
     tool_allow: frozenset[str] | None = None
     system_prompt_augmentation: str | None = None
+    # ISSUE #218 — per-MODEL toggle for the live-page snapshot PROSE compaction
+    # (snapshot_prose.aria_yaml_to_prose, wired in cli._snapshot_provider). Optional per-role
+    # override of the registry value (resolve_model_snapshot_prose): spec → MODEL_TOOL_POLICIES
+    # → config.web_snapshot_prose. None inherits the per-model policy (so leaving it None is a
+    # no-op). The small local qwen3:4b NEEDS the ~2x compaction (32768-ctx, #77/#140); capable
+    # API models (GLM/DeepSeek) want the lossless raw ARIA snapshot instead (prose drops
+    # alert/status text — see #218), so they resolve to False.
+    snapshot_prose: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -499,6 +507,16 @@ class ModelToolPolicy:
     tool_omit: frozenset[str] = frozenset()
     tool_allow: frozenset[str] | None = None
     system_prompt_augmentation: str = ""
+    # ISSUE #218 — should the live page snapshot be rendered as pruned, ref-keyed prose
+    # (snapshot_prose.aria_yaml_to_prose) for this model? TRUE only for the small local
+    # qwen3:4b, whose 32768-token window (#77/#140) NEEDS the ~2x compaction; FALSE for the
+    # capable API models (GLM/DeepSeek, 128K-1M ctx) which can afford the fuller, LOSSLESS raw
+    # ARIA snapshot — prose drops alert/status/log node text (snapshot_prose.py:384) and the
+    # capable models have evaluate() to recover DOM text anyway (#218). Defaults to True so an
+    # unconfigured (likely small/local) model keeps today's behaviour; the resolver
+    # (resolve_model_snapshot_prose) reads the ACTIVE model's policy, so an escalation
+    # take-over to a capable model also drops the compaction (cli._snapshot_provider re-resolve).
+    snapshot_prose: bool = True
     rationale: str = ""
 
 
@@ -631,6 +649,7 @@ MODEL_TOOL_POLICIES: dict[str, ModelToolPolicy] = {
         #    exposure is UNCHANGED while capable models gain it. qwen gets no evaluate guidance
         #    either — it is not reliable at hand-writing DOM-mutating JS.
         tool_omit=frozenset({"navigate_back", "navigate_forward", "evaluate"}),
+        snapshot_prose=True,  # #218: small local model NEEDS the ~2x snapshot compaction
         rationale="native Hermes dialect; sub-7B 3-call accuracy peak (arXiv:2602.07359); "
                   "ctx 32768 = GPU-pinned num_ctx (#77/#140), NOT a model limit; "
                   "cap restored to 3 — #197 wrongly conflated this per-turn batch cap with "
@@ -639,30 +658,35 @@ MODEL_TOOL_POLICIES: dict[str, ModelToolPolicy] = {
     "glm-4.7-flash": ModelToolPolicy(
         codec="json", max_actions_per_turn=10, context_window=131072,
         collapse_consecutive_dup_tool_calls=False,  # #201: capable model; keep legit repeats
+        snapshot_prose=False,  # #218: capable model; lossless raw ARIA (keeps alert text)
         system_prompt_augmentation=_EVALUATE_GUIDANCE,  # #203: guide evaluate() for widgets
         rationale="API reasoning model; schema-constrained JSON; lighter flash tier; "
                   "128K ctx (GLM-4.5-Flash documented 128K); cap set to 10 (#206)"),
     "glm-4.7": ModelToolPolicy(
         codec="json", max_actions_per_turn=10, context_window=204800,
         collapse_consecutive_dup_tool_calls=False,  # #201: capable model; keep legit repeats
+        snapshot_prose=False,  # #218: capable model; lossless raw ARIA (keeps alert text)
         system_prompt_augmentation=_EVALUATE_GUIDANCE,  # #203: guide evaluate() for widgets
         rationale="flagship agentic-coding; 200K ctx (GLM-4.6 documented 200K) + native "
                   "parallel_tool_calls; cap set to 10 (#206)"),
     "glm-5.2": ModelToolPolicy(
         codec="json", max_actions_per_turn=10, context_window=1048576,
         collapse_consecutive_dup_tool_calls=False,  # #201: capable model; keep legit repeats
+        snapshot_prose=False,  # #218: capable model; lossless raw ARIA (keeps alert text)
         system_prompt_augmentation=_EVALUATE_GUIDANCE,  # #203: guide evaluate() for widgets
         rationale="newest flagship long-horizon agentic line; 1M lossless ctx "
                   "(z.ai release notes); cap set to 10 (#206)"),
     "deepseek-chat": ModelToolPolicy(
         codec="json", max_actions_per_turn=10, context_window=131072,
         collapse_consecutive_dup_tool_calls=False,  # #201: capable model; keep legit repeats
+        snapshot_prose=False,  # #218: capable model; lossless raw ARIA (keeps alert text)
         system_prompt_augmentation=_EVALUATE_GUIDANCE,  # #203: guide evaluate() for widgets
         rationale="DeepSeek-V3.1 non-thinking; OpenAI-compat function calling; "
                   "128K ctx (V3.1 documented baseline); cap set to 10 (#206)"),
     "deepseek-reasoner": ModelToolPolicy(
         codec="json", max_actions_per_turn=10, context_window=131072,
         collapse_consecutive_dup_tool_calls=False,  # #201: capable model; keep legit repeats
+        snapshot_prose=False,  # #218: capable model; lossless raw ARIA (keeps alert text)
         system_prompt_augmentation=_EVALUATE_GUIDANCE,  # #203: guide evaluate() for widgets
         rationale="DeepSeek-V3.1 thinking; tool calls supported since V3.1 (was unsupported "
                   "on legacy R1); reasoning_content consumed as reasoning; 128K ctx (V3.1 "
@@ -679,12 +703,14 @@ MODEL_TOOL_POLICIES: dict[str, ModelToolPolicy] = {
     "deepseek-v4-flash": ModelToolPolicy(
         codec="json", max_actions_per_turn=10, context_window=1_000_000,
         collapse_consecutive_dup_tool_calls=False,  # #201: capable model; keep legit repeats
+        snapshot_prose=False,  # #218: capable model; lossless raw ARIA (keeps alert text)
         system_prompt_augmentation=_EVALUATE_GUIDANCE,  # #203: guide evaluate() for widgets
         rationale="DeepSeek-V4-Flash (284B/13B-active); OpenAI-compat tool calling; native 1M "
                   "context (news260424); json single-shot codec; cap set to 10 (#206)"),
     "deepseek-v4-pro": ModelToolPolicy(
         codec="json", max_actions_per_turn=10, context_window=1_000_000,
         collapse_consecutive_dup_tool_calls=False,  # #201: capable model; keep legit repeats
+        snapshot_prose=False,  # #218: capable model; lossless raw ARIA (keeps alert text)
         system_prompt_augmentation=_EVALUATE_GUIDANCE,  # #203: guide evaluate() for widgets
         rationale="DeepSeek-V4-Pro (1.6T/49B-active); OpenAI-compat tool calling; native 1M "
                   "context (news260424); json single-shot codec; cap set to 10 (#206)"),
@@ -697,6 +723,7 @@ MODEL_TOOL_POLICIES: dict[str, ModelToolPolicy] = {
 _GLM_FAMILY_POLICY = ModelToolPolicy(
     codec="json", max_actions_per_turn=10, context_window=131072,
     collapse_consecutive_dup_tool_calls=False,  # #201: capable GLM family; keep legit repeats
+    snapshot_prose=False,  # #218: capable model; lossless raw ARIA (keeps alert text)
     system_prompt_augmentation=_EVALUATE_GUIDANCE,  # #203: guide evaluate() for widgets
     rationale="unrecognised GLM/z.ai model: API JSON codec + 128K ctx; "
               "cap set to 10 (#206)")
@@ -709,6 +736,7 @@ _GLM_FAMILY_POLICY = ModelToolPolicy(
 _DEEPSEEK_FAMILY_POLICY = ModelToolPolicy(
     codec="json", max_actions_per_turn=10, context_window=131072,
     collapse_consecutive_dup_tool_calls=False,  # #201: capable DeepSeek family; keep repeats
+    snapshot_prose=False,  # #218: capable model; lossless raw ARIA (keeps alert text)
     system_prompt_augmentation=_EVALUATE_GUIDANCE,  # #203: guide evaluate() for widgets
     rationale="unrecognised DeepSeek model: API JSON codec + 128K ctx; "
               "cap set to 10 (#206)")
@@ -769,6 +797,32 @@ def resolve_model_collapse_dups(config: Config, spec: ModelSpec) -> bool:
     if policy is not None:
         return policy.collapse_consecutive_dup_tool_calls
     return True
+
+
+def resolve_model_snapshot_prose(config: Config, spec: ModelSpec) -> bool:
+    """Resolve whether the live page snapshot is rendered as pruned, ref-keyed PROSE for
+    ``spec`` (issue #218) — the ``snapshot_prose.aria_yaml_to_prose`` compaction wired in
+    ``cli._snapshot_provider``.
+
+    Precedence (mirrors :func:`resolve_model_collapse_dups`): the spec's explicit
+    ``snapshot_prose`` field WINS; else the per-model registry (:func:`model_tool_policy`);
+    else ``config.web_snapshot_prose`` — the legacy GLOBAL default (True) that keeps today's
+    behaviour for an UNCONFIGURED model and remains the A/B test seam (#64/#125). The ACTIVE
+    model's spec drives this: ``cli._snapshot_provider`` re-resolves it on escalation take-over
+    so a swap from qwen3:4b (prose ON) to a capable API model (GLM/DeepSeek, prose OFF) drops
+    the compaction mid-run and hands the escalator the lossless raw ARIA snapshot.
+
+    True  → qwen3:4b: the small local model's 32768-token window (#77/#140) NEEDS the ~2x
+            compaction.
+    False → GLM/DeepSeek (and their family fallbacks): 128K-1M ctx can afford the fuller,
+            lossless raw ARIA snapshot — prose drops alert/status/log node text and they have
+            evaluate() to recover DOM text anyway (#218)."""
+    if spec.snapshot_prose is not None:
+        return spec.snapshot_prose
+    policy = model_tool_policy(spec.model)
+    if policy is not None:
+        return policy.snapshot_prose
+    return config.web_snapshot_prose
 
 
 def resolve_model_tool_omit(config: Config, spec: ModelSpec) -> frozenset[str]:

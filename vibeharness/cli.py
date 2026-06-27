@@ -25,7 +25,7 @@ from .clients import build_client, select_execution_codec
 from .codec import UnknownCodec, available_codecs, get_codec
 from .config import (Config, ModelSpec, model_tool_policy, resolve_model_codec,
                      resolve_model_limit, resolve_model_prompt_augmentation,
-                     resolve_role_spec)
+                     resolve_model_snapshot_prose, resolve_role_spec)
 from .filesystem import FileSystem, FileSystemError
 from .llm import OllamaClient, OllamaUnavailable, ensure_single_runner_env
 from .lock import SingleInstanceLock, VibeAlreadyRunning
@@ -380,6 +380,45 @@ def resolve_run_codec(args: argparse.Namespace, config: Config,
     if base_spec is not None:
         return resolve_model_codec(config, base_spec)
     return config.codec
+
+
+def explicit_snapshot_prose_override(args: argparse.Namespace) -> "bool | None":
+    """Return the user's EXPLICIT snapshot-prose choice, or ``None`` if they did not make one
+    (issue #218).
+
+    An explicit choice always wins over the per-model resolution (mirrors how
+    :func:`resolve_run_codec` honours an explicit ``--codec`` / saved ``codec`` first):
+      * ``--web-snapshot-prose`` is ``store_true`` → its presence forces prose ON (``True``);
+      * a saved ``web_snapshot_prose`` setting (via ``--set``) pins prose ON or OFF
+        explicitly.
+    Returns ``None`` when neither is present → the caller resolves prose per ACTIVE model
+    (:func:`resolve_model_snapshot_prose`)."""
+    if getattr(args, "web_snapshot_prose", False):
+        return True
+    saved = Settings.load()
+    if "web_snapshot_prose" in saved:
+        return bool(saved["web_snapshot_prose"])
+    return None
+
+
+def resolve_run_snapshot_prose(args: argparse.Namespace, config: Config,
+                               spec: "ModelSpec") -> bool:
+    """Resolve whether the live page snapshot is rendered as PROSE for ``spec`` (issue #218).
+
+    Precedence (high to low), mirroring :func:`resolve_run_codec`:
+      1. an EXPLICIT ``--web-snapshot-prose`` flag or saved ``web_snapshot_prose`` setting
+         (an explicit user choice always wins — :func:`explicit_snapshot_prose_override`),
+      2. the per-MODEL policy for ``spec`` (the spec's ``snapshot_prose`` field, else the
+         ``MODEL_TOOL_POLICIES`` registry — :func:`resolve_model_snapshot_prose`),
+      3. the global ``Config.web_snapshot_prose`` default (folded into #2 as its fallback).
+
+    Resolving from the ACTIVE model means qwen3:4b gets the ~2x prose compaction it needs for
+    its 32768-token window while a GLM/DeepSeek base (or escalator) model gets the fuller,
+    lossless raw ARIA snapshot."""
+    explicit = explicit_snapshot_prose_override(args)
+    if explicit is not None:
+        return explicit
+    return resolve_model_snapshot_prose(config, spec)
 
 
 def resolve_config(args: argparse.Namespace) -> Config:
@@ -839,16 +878,34 @@ def _run_locked(args, task, config, registry, codec, names, workdir, logger,
     # actual {ref: value} map from that same raw snapshot, and stamp "ALREADY FILLED WITH
     # '...'" only on controls that genuinely hold a value/checked-state right now. A popup
     # that was merely opened (no commit) stays empty; a cleared field flips back to empty.
+    # ISSUE #218 — the prose decision is now PER-MODEL, resolved from the ACTIVE base model
+    # (qwen3:4b → prose ON for its 32768-ctx; GLM/DeepSeek → OFF for the lossless raw ARIA
+    # snapshot), with an explicit --web-snapshot-prose flag / saved setting still winning
+    # (resolve_run_snapshot_prose). The decision is held in a MUTABLE cell so the agent can
+    # RE-RESOLVE it on escalation take-over (see _snapshot_prose_on_escalate below): the
+    # snapshot provider is built ONCE and shared by the base + escalation system-prompt
+    # providers + the agent's post-turn capture, so flipping this one cell switches them all
+    # in lock-step. This mirrors the active-model re-resolution of #201 (collapse) / #203
+    # (toolset) — escalating qwen3:4b(prose ON) → deepseek(prose OFF) drops the compaction
+    # mid-run so the escalator gets the lossless snapshot (incl. the alert text prose drops,
+    # the #218 motivation). The legacy global config.web_snapshot_prose remains the A/B
+    # fallback for unconfigured models (resolve_model_snapshot_prose).
+    _prose_state = {"on": resolve_run_snapshot_prose(args, config, base_spec)}
     if raw_snapshot_provider is not None:
         _raw_aria_provider = raw_snapshot_provider
-        _prose_on = config.web_snapshot_prose
 
         def _snapshot_provider() -> str:
             raw = _raw_aria_provider()
-            display = aria_yaml_to_prose(raw) if _prose_on else raw
+            display = aria_yaml_to_prose(raw) if _prose_state["on"] else raw
             return annotate_filled_snapshot(display, live_control_values(raw))
 
         raw_snapshot_provider = _snapshot_provider
+
+    def _snapshot_prose_on_escalate(esc_spec: "ModelSpec") -> None:
+        """Re-resolve prose for the escalator model on take-over (#218). An explicit
+        flag/saved setting still wins (resolve_run_snapshot_prose), so a user override is
+        honoured across the swap; otherwise the escalator's per-model policy applies."""
+        _prose_state["on"] = resolve_run_snapshot_prose(args, config, esc_spec)
 
     # NATIVE tool calling active? Already resolved by select_execution_codec above (#163):
     # it is the same predicate the agent uses (opted in, single-phase, codec speaks native
@@ -911,7 +968,8 @@ def _run_locked(args, task, config, registry, codec, names, workdir, logger,
                        raw_snapshot_provider=raw_snapshot_provider,
                        turn_input_logger=logger.dump_turn_input,
                        turn_output_logger=logger.dump_turn_output,
-                       escalation_system_prompt_provider=escalation_system_prompt_provider)
+                       escalation_system_prompt_provider=escalation_system_prompt_provider,
+                       snapshot_prose_on_escalate=_snapshot_prose_on_escalate)
 
     # Advisor advice buffer: the checkpoint populates it after N accumulated tool calls;
     # advice_provider drains it once at the start of the next turn.
