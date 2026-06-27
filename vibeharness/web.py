@@ -1306,9 +1306,9 @@ class ClickTool(_WebTool):
 
     # Hard safety ceiling on `repeat`: a single call clicking more than this many times
     # almost certainly reflects a misparsed count and would wedge the whole turn (each
-    # click carries a 2s settle). Generous enough for real multi-click widgets (a
-    # 12-month date-picker rewind, a stepper) while still bounding a runaway.
-    _MAX_REPEAT = 100
+    # click carries a 2s settle). Covers real multi-click widgets (a stepper, a small
+    # date-picker nudge) while tightly bounding a runaway.
+    _MAX_REPEAT = 9
     # ISSUE #222 — multi-target ceilings (only reachable on the flag-ON `targets` path):
     #   * _MAX_TARGETS  — cap on how many distinct refs one `targets` list may hold, so a
     #     misparsed list can't enumerate the whole page.
@@ -1342,6 +1342,11 @@ class ClickTool(_WebTool):
         },
         "required": ["target"],
     }
+=======
+    # click carries a 2s settle). Covers real multi-click widgets (a stepper, a small
+    # date-picker nudge) while tightly bounding a runaway.
+    _MAX_REPEAT = 9
+>>>>>>> 2ea9959 (chore(click): cap repeat at 9)
 
     @property
     def parameters(self):
