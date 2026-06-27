@@ -1342,11 +1342,6 @@ class ClickTool(_WebTool):
         },
         "required": ["target"],
     }
-=======
-    # click carries a 2s settle). Covers real multi-click widgets (a stepper, a small
-    # date-picker nudge) while tightly bounding a runaway.
-    _MAX_REPEAT = 9
->>>>>>> 2ea9959 (chore(click): cap repeat at 9)
 
     @property
     def parameters(self):
