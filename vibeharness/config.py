@@ -386,6 +386,21 @@ class Config:
     # affordances per #70) is exactly what a small model needs to map field -> correct ref.
     web_snapshot_prose: bool = True
 
+    # --- snapshot visibility filter (issue #223) ---
+    # When True (DEFAULT, for ALL models), the per-turn RAW ARIA snapshot is passed through
+    # a pre-compaction VISIBILITY FILTER (vibeharness.web.filter_hidden_snapshot) that drops
+    # aria-hidden subtrees and zero-size / display:none / visibility:hidden / opacity≈0
+    # elements BEFORE prose compaction AND before live_control_values/annotate — so
+    # honeypot/trap fields (FlashTec's visually-hidden "Company website"/"Home fax" inputs)
+    # never reach the model on EITHER the prose or raw path, and never show a filled marker.
+    # Detection runs in ONE DOM evaluate pass per turn, resolving refs via Playwright's
+    # aria-ref selector engine over the SAME raw capture (no second snapshot). Robust: any
+    # failure falls back to the unfiltered raw (never blanks the page). GLOBAL, not
+    # per-model. Set False (or pass --no-visibility-filter) for a BYTE-IDENTICAL-to-before
+    # snapshot. Scroll-reachable off-screen real content (aria-hidden=false, real size) is
+    # deliberately preserved — position alone is never treated as hidden.
+    web_snapshot_visibility_filter: bool = True
+
     # --- Escalation / API provider ---
     # When the local model gets stuck (same tool call repeated escalation_stuck_threshold
     # times in a row), the run escalates mid-session to an external API model — same

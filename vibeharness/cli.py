@@ -43,7 +43,8 @@ from .toolset import (
 )
 from .validation import LLMValidator
 from .web import (annotate_filled_snapshot, live_control_values,
-                  make_raw_snapshot_provider, resolve_web_session)
+                  make_raw_snapshot_provider, make_visibility_filter,
+                  resolve_web_session)
 from .snapshot_prose import aria_yaml_to_prose
 from .advisor import VibeThinkerAdvisor
 
@@ -171,6 +172,10 @@ current effective defaults: model={effective.model}, codec={effective.codec}, ""
     p.add_argument("--web-snapshot-prose", action="store_true",
                    help="render the live page snapshot as pruned, ref-keyed WebArena-style "
                         "prose instead of raw ARIA-YAML (issue #64; A/B seam)")
+    p.add_argument("--no-visibility-filter", action="store_true",
+                   help="DISABLE the pre-compaction snapshot visibility filter (issue #223; "
+                        "on by default). With this flag the snapshot keeps aria-hidden / "
+                        "zero-size honeypot elements, byte-identical to pre-#223 behaviour.")
 
     # --- advisor ---
     p.add_argument("--advisor", action="store_true",
@@ -445,6 +450,8 @@ def resolve_config(args: argparse.Namespace) -> Config:
         overrides["web_headless"] = True
     if getattr(args, "web_snapshot_prose", False):
         overrides["web_snapshot_prose"] = True
+    if getattr(args, "no_visibility_filter", False):
+        overrides["web_snapshot_visibility_filter"] = False
     if getattr(args, "advisor", False):
         overrides["advisor_enabled"] = True
     # Per-role endpoint overrides (issue #163): fold the convenience flags into
@@ -893,9 +900,21 @@ def _run_locked(args, task, config, registry, codec, names, workdir, logger,
     _prose_state = {"on": resolve_run_snapshot_prose(args, config, base_spec)}
     if raw_snapshot_provider is not None:
         _raw_aria_provider = raw_snapshot_provider
+        # ISSUE #223: pre-compaction VISIBILITY FILTER. Built ONCE (shares the run's web
+        # session) and run on the RAW ARIA snapshot immediately after capture — BEFORE the
+        # prose transform AND before live_control_values/annotate — so aria-hidden / zero-
+        # size honeypot refs are gone from BOTH the prose (qwen3:4b) and raw (DeepSeek/GLM)
+        # paths and never carry a filled marker. GLOBAL flag, default ON for all models;
+        # --no-visibility-filter / web_snapshot_visibility_filter=False makes it a no-op so
+        # the snapshot is byte-identical to today. The filter itself falls back to the
+        # unfiltered raw on any error (never blanks the page).
+        _visibility_filter = (make_visibility_filter(config)
+                              if config.web_snapshot_visibility_filter else None)
 
         def _snapshot_provider() -> str:
             raw = _raw_aria_provider()
+            if _visibility_filter is not None:
+                raw = _visibility_filter(raw)
             display = aria_yaml_to_prose(raw) if _prose_state["on"] else raw
             return annotate_filled_snapshot(display, live_control_values(raw))
 
