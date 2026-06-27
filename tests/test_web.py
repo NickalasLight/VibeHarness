@@ -295,6 +295,23 @@ class ClickRepeatAndBackGuardTest(unittest.TestCase):
         self.assertEqual(len([c for c in cli.calls if c and c[0] == "click"]),
                          ClickTool._MAX_REPEAT)
 
+    # --- _parse_repeat boundary tests (cap = 9) ---
+
+    def test_parse_repeat_above_cap_clamped_to_9(self):
+        """repeat > 9 (e.g. 100) must clamp to exactly 9."""
+        tool, _ = self._click()
+        self.assertEqual(tool._parse_repeat(100), 9)
+
+    def test_parse_repeat_at_cap_unchanged(self):
+        """repeat == 9 must be returned as-is (inclusive ceiling)."""
+        tool, _ = self._click()
+        self.assertEqual(tool._parse_repeat(9), 9)
+
+    def test_parse_repeat_default_none_is_1(self):
+        """None (no repeat arg) must resolve to the default of 1."""
+        tool, _ = self._click()
+        self.assertEqual(tool._parse_repeat(None), 1)
+
     def test_repeat_stops_early_on_failure(self):
         # The first click succeeds, the second fails -> stop, report progress.
         cli = _SnapshotThenResultCli(snapshot=self._PREV_SNAP, result_ok=True,
