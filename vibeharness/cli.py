@@ -23,7 +23,8 @@ from . import providers
 from .agent import RalphAgent, RunResult
 from .clients import build_client, select_execution_codec
 from .codec import UnknownCodec, available_codecs, get_codec
-from .config import (Config, ModelSpec, model_tool_policy, resolve_model_codec,
+from .config import (Config, ModelSpec, model_tool_policy,
+                     resolve_model_click_multi_target, resolve_model_codec,
                      resolve_model_limit, resolve_model_prompt_augmentation,
                      resolve_model_snapshot_prose, resolve_role_spec)
 from .filesystem import FileSystem, FileSystemError
@@ -176,6 +177,10 @@ current effective defaults: model={effective.model}, codec={effective.codec}, ""
                    help="DISABLE the pre-compaction snapshot visibility filter (issue #223; "
                         "on by default). With this flag the snapshot keeps aria-hidden / "
                         "zero-size honeypot elements, byte-identical to pre-#223 behaviour.")
+    p.add_argument("--web-click-multi-target", action="store_true",
+                   help="advertise the click tool's multi-target `targets` array (a list of "
+                        "{target, repeat?} clicked in order) regardless of the per-model "
+                        "policy (issue #222; default ON for GLM/DeepSeek, OFF for qwen3:4b)")
 
     # --- advisor ---
     p.add_argument("--advisor", action="store_true",
@@ -426,6 +431,43 @@ def resolve_run_snapshot_prose(args: argparse.Namespace, config: Config,
     return resolve_model_snapshot_prose(config, spec)
 
 
+def explicit_click_multi_target_override(args: argparse.Namespace) -> "bool | None":
+    """Return the user's EXPLICIT multi-target-click choice, or ``None`` if they made none
+    (issue #222).
+
+    Mirrors :func:`explicit_snapshot_prose_override`: an explicit choice always wins over the
+    per-model resolution. ``--web-click-multi-target`` is ``store_true`` → its presence forces
+    the multi-target schema ON; a saved ``web_click_multi_target`` setting (via ``--set``)
+    pins it ON or OFF. Returns ``None`` when neither is present → resolve per ACTIVE model
+    (:func:`resolve_model_click_multi_target`)."""
+    if getattr(args, "web_click_multi_target", False):
+        return True
+    saved = Settings.load()
+    if "web_click_multi_target" in saved:
+        return bool(saved["web_click_multi_target"])
+    return None
+
+
+def resolve_run_click_multi_target(args: argparse.Namespace, config: Config,
+                                   spec: "ModelSpec") -> bool:
+    """Resolve whether the click tool advertises the multi-target ``targets`` array for
+    ``spec`` (issue #222).
+
+    Precedence (high to low), mirroring :func:`resolve_run_snapshot_prose`:
+      1. an EXPLICIT ``--web-click-multi-target`` flag / saved ``web_click_multi_target``
+         setting (:func:`explicit_click_multi_target_override`),
+      2. the per-MODEL policy for ``spec`` (:func:`resolve_model_click_multi_target`),
+      3. the global ``Config.web_click_multi_target`` default (folded into #2 as its
+         fallback).
+
+    Resolving from the ACTIVE model means the capable API models (GLM/DeepSeek) get the
+    multi-target schema while qwen3:4b keeps the single-target one."""
+    explicit = explicit_click_multi_target_override(args)
+    if explicit is not None:
+        return explicit
+    return resolve_model_click_multi_target(config, spec)
+
+
 def resolve_config(args: argparse.Namespace) -> Config:
     """Config defaults < saved settings < CLI flags (only those provided).
 
@@ -452,6 +494,8 @@ def resolve_config(args: argparse.Namespace) -> Config:
         overrides["web_snapshot_prose"] = True
     if getattr(args, "no_visibility_filter", False):
         overrides["web_snapshot_visibility_filter"] = False
+    if getattr(args, "web_click_multi_target", False):
+        overrides["web_click_multi_target"] = True
     if getattr(args, "advisor", False):
         overrides["advisor_enabled"] = True
     # Per-role endpoint overrides (issue #163): fold the convenience flags into
@@ -818,6 +862,27 @@ def _run_locked(args, task, config, registry, codec, names, workdir, logger,
     # escalation take-over can re-derive the escalator model's own view.
     model_registry = apply_model_toolset(registry, config, base_spec)
 
+    # ISSUE #222 — the click tool's multi-target schema is PER-MODEL. The ClickTool instance
+    # is shared across the full + per-model registry views (apply_model_toolset filters by
+    # reference), so flipping this one flag switches the advertised `targets` array for the
+    # prompt docs, the decode constraint, and the native tools: envelope in lock-step. We set
+    # it from the ACTIVE base model (resolve_run_click_multi_target — an explicit
+    # --web-click-multi-target / saved setting still wins) and RE-RESOLVE it on escalation
+    # take-over via _click_multi_target_on_escalate below (mirrors #218's prose re-resolve), so
+    # a swap qwen3:4b(OFF) → GLM/DeepSeek(ON) turns the multi-target schema on mid-run.
+    def _set_click_multi_target(spec: "ModelSpec") -> None:
+        click_tool = registry.get("click")
+        if click_tool is not None and hasattr(click_tool, "_multi_target"):
+            click_tool._multi_target = resolve_run_click_multi_target(args, config, spec)
+
+    _set_click_multi_target(base_spec)
+
+    def _click_multi_target_on_escalate(esc_spec: "ModelSpec") -> None:
+        """Re-resolve the click multi-target schema for the escalator model on take-over
+        (#222). An explicit flag/saved setting still wins; otherwise the escalator's per-model
+        policy applies (GLM/DeepSeek → ON)."""
+        _set_click_multi_target(esc_spec)
+
     # Capability-driven path selection (#163): if the base client is NON-native (an API
     # client), auto-degrade to the single-shot path and a constrained-JSON codec (swapping
     # a native-only codec like `hermes` for `json`). The chosen codec is then used
@@ -988,7 +1053,8 @@ def _run_locked(args, task, config, registry, codec, names, workdir, logger,
                        turn_input_logger=logger.dump_turn_input,
                        turn_output_logger=logger.dump_turn_output,
                        escalation_system_prompt_provider=escalation_system_prompt_provider,
-                       snapshot_prose_on_escalate=_snapshot_prose_on_escalate)
+                       snapshot_prose_on_escalate=_snapshot_prose_on_escalate,
+                       click_multi_target_on_escalate=_click_multi_target_on_escalate)
 
     # Advisor advice buffer: the checkpoint populates it after N accumulated tool calls;
     # advice_provider drains it once at the start of the next turn.

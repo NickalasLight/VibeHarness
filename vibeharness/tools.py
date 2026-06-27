@@ -15,16 +15,28 @@ from typing import Any
 class Param:
     """One tool parameter, described once and rendered as both docs and schema."""
     name: str
-    type: str                       # JSON Schema scalar type: string | integer | boolean
+    type: str                       # JSON Schema type: string | integer | boolean | array
     description: str
     required: bool = True
     enum: tuple[str, ...] | None = None
     default: Any = None
+    # ISSUE #222 — JSON-Schema ``items`` sub-schema for an ARRAY param (e.g. a list of
+    # ``{target, repeat}`` objects for the multi-target click). ``None`` for every scalar
+    # param (string/integer/boolean), so the emitted schema is byte-identical to before for
+    # them. When set on a ``type="array"`` param it is embedded verbatim as the array's
+    # ``items``, the standard JSON-Schema / OpenAI / Anthropic shape for a list-of-objects
+    # (``{"type":"array","items":{"type":"object","properties":{...},"required":[...]}}``).
+    # The SAME source feeds the json-codec decode constraint, the hermes ``<tools>`` block,
+    # and the native Ollama ``tools:`` envelope (registry.action_schema / tools_block /
+    # codec.tools), so the nested shape can never drift across codecs.
+    items: dict[str, Any] | None = None
 
     def schema(self) -> dict:
         s: dict[str, Any] = {"type": self.type, "description": self.description}
         if self.enum:
             s["enum"] = list(self.enum)
+        if self.items is not None:
+            s["items"] = self.items
         return s
 
     def doc(self) -> str:

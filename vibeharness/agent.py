@@ -161,7 +161,8 @@ class RalphAgent:
                  turn_output_logger: "Callable[[int, str, str], None] | None" = None,
                  escalation_system_prompt_provider: Callable[[str], str] | None = None,
                  full_registry: ToolRegistry | None = None,
-                 snapshot_prose_on_escalate: "Callable[[ModelSpec], None] | None" = None):
+                 snapshot_prose_on_escalate: "Callable[[ModelSpec], None] | None" = None,
+                 click_multi_target_on_escalate: "Callable[[ModelSpec], None] | None" = None):
         self._client = client
         self._registry = registry
         # ISSUE #203 — the FULL run-loaded registry (every tool the selected toolset(s)
@@ -245,6 +246,12 @@ class RalphAgent:
         # prose compaction mid-run and hands the escalator the lossless raw ARIA snapshot
         # (the #218 motivation — prose drops alert text). None on the fs/test path (no-op).
         self._snapshot_prose_on_escalate = snapshot_prose_on_escalate
+        # ISSUE #222 — optional callback to RE-RESOLVE the per-model click multi-target schema
+        # for the escalator model on take-over (``_escalate``). The flag lives on the shared
+        # ClickTool instance (set in cli._run_locked); this callback flips it so a swap
+        # qwen3:4b(single-target) → GLM/DeepSeek(multi-target) advertises the `targets` array
+        # mid-run. None on the fs/test path or when the web toolset is off (no-op).
+        self._click_multi_target_on_escalate = click_multi_target_on_escalate
         # NATIVE stateful tool calling (issue #129/#130/#131). Active only when (a) the
         # run opts in (config.native_tools), (b) the model is single-phase (the native
         # path is for the non-thinking base agent, not VibeThinker's two-phase <think>
@@ -1224,6 +1231,16 @@ class RalphAgent:
                 self._snapshot_prose_on_escalate(spec)
             except Exception:
                 pass  # never block a take-over on the prose re-resolution
+        # ISSUE #222 — re-resolve the per-MODEL click multi-target schema for the NEW active
+        # model: escalating from qwen3:4b (single-target) to a capable API model (GLM/DeepSeek,
+        # multi-target ON) advertises the `targets` array mid-run so the escalator can batch
+        # multi-field-form clicks. The callback (cli._run_locked) honours an explicit
+        # --web-click-multi-target / saved setting across the swap. No-op when unset.
+        if self._click_multi_target_on_escalate is not None:
+            try:
+                self._click_multi_target_on_escalate(spec)
+            except Exception:
+                pass  # never block a take-over on the multi-target re-resolution
         # ISSUE #203 — re-derive the ACTIVE registry from the FULL run-loaded set for the
         # ESCALATOR model's per-model toolset view: escalating from qwen3:4b (nav-history
         # tools omitted) to a capable API model RESTORES those tools (the escalator's omit set
