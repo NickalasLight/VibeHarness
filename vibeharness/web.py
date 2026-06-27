@@ -24,6 +24,8 @@ Install the backend with:  npm install -g @playwright/cli@latest
 """
 from __future__ import annotations
 
+import json
+import logging
 import re
 import shutil
 import subprocess
@@ -31,6 +33,8 @@ import sys
 import time
 import uuid
 from typing import Callable
+
+_log = logging.getLogger(__name__)
 
 from .config import Config
 from .toolset import Toolset
@@ -252,6 +256,260 @@ def parse_snapshot_refs(snapshot: str) -> set[str]:
     simply contribute nothing.
     """
     return {f"e{m.group(1)}" for m in _REF_RE.finditer(snapshot or "")}
+
+
+# ---------------------------------------------------------------------------
+# Pre-compaction VISIBILITY FILTER (issue #223) — drop aria-hidden + zero-size
+# (honeypot/trap) elements from the RAW ARIA snapshot BEFORE prose compaction and
+# before live_control_values/annotate, so the model only ever sees controls a human
+# could see. Split into a PURE text transform (filter_hidden_snapshot_refs) that is
+# unit-testable without a browser, and a single-DOM-pass detector (compute_hidden_refs).
+#
+# DETECTION RULE (an element is HIDDEN if ANY holds), justified:
+#   * aria-hidden semantics — el.closest('[aria-hidden="true"]') is non-null. The classic
+#     visually-hidden honeypot (FlashTec ApplyWizard) wraps the trap inputs in an
+#     aria-hidden="true" subtree; a human never sees them but the a11y tree (hence the
+#     Playwright aria snapshot) still emits them. This single signal catches the whole
+#     trap subtree (wrapper + every descendant) deterministically.
+#   * computed visibility — getComputedStyle display:none | visibility:hidden/collapse |
+#     opacity≈0 (<=0.01). The standard "truly not painted" signals.
+#   * zero-size — getBoundingClientRect() width<=EPS OR height<=EPS (EPS=2px), i.e. the
+#     1px clipped honeypot (width:1px;height:1px;clip:rect(0 0 0 0)).
+# Position-alone (off-screen left:-9999px) and tabIndex<0-alone are deliberately NOT
+# treated as hidden: scroll-reachable / virtualized real content sits off-screen with a
+# real size and aria-hidden=false and MUST be kept. We never test position, so such
+# content is preserved; the honeypot is still caught because it is ALSO aria-hidden and
+# 1px-sized. (Ground-truthed live: the e75 trap wrapper is aria-hidden + 1x1 + at
+# -10000,-10000 while e41/e69/e73 real fields are aria-hidden=false at full size.)
+#
+# REF→ELEMENT RESOLUTION (load-bearing, ground-truthed): playwright-core registers an
+# "aria-ref" selector engine whose queryAll resolves a ref token (e.g. "e77") through the
+# injected script's _lastAriaSnapshotForQuery.elements map — the ref→element map built by
+# the LAST `snapshot`. That map lives in the page's injected world and PERSISTS across
+# separate playwright-cli subprocess invocations within one session (exactly how the
+# EvaluateTool's `eval <expr> <ref>` resolves a ref captured by an earlier snapshot). So
+# we reuse the single per-turn raw capture: ONE `run-code` pass resolves every ref via
+# page.locator('aria-ref=' + ref) and computes the hidden set in a single page.evaluate —
+# no second snapshot. (Verified: @playwright/cli node_modules/playwright-core/lib/
+# coreBundle.js `_createAriaRefEngine` / `aria-ref=${param.target}`.)
+# ---------------------------------------------------------------------------
+
+# A raw-snapshot line carries its element ref as ``[ref=eN]``.
+_REF_ATTR_LINE_RE = re.compile(r"\[ref=(e\d+)\]")
+
+# The single-pass DOM probe. ``__REFS_JSON__`` is replaced with a JSON array of the refs
+# present in the current raw snapshot; it resolves each via the aria-ref selector engine
+# and returns the subset that is hidden by the detection rule above. Robust per-element:
+# a ref that no longer resolves (stale/detached) is simply skipped, never marked hidden.
+# Kept on ONE LINE on purpose: playwright-cli is invoked as a Windows ``.CMD`` shim, whose
+# batch arg-parsing mangles a multi-line argv (newlines -> a JS SyntaxError) — verified.
+_VISIBILITY_PROBE_JS = (
+    "async page => { "
+    "const refs = __REFS_JSON__; const handles = []; const valid = []; "
+    "for (const ref of refs) { try { "
+    "const h = await page.locator('aria-ref=' + ref).elementHandle({ timeout: 250 }); "
+    "if (h) { handles.push(h); valid.push(ref); } } catch (e) {} } "
+    "const flags = await page.evaluate((els) => { const EPS = 2; return els.map(el => { try { "
+    "if (el.closest('[aria-hidden=\"true\"]')) return true; "
+    "const s = getComputedStyle(el); "
+    "if (s.display === 'none' || s.visibility === 'hidden' || s.visibility === 'collapse') return true; "
+    "if (parseFloat(s.opacity) <= 0.01) return true; "
+    "const r = el.getBoundingClientRect(); if (r.width <= EPS || r.height <= EPS) return true; "
+    "return false; } catch (e) { return false; } }); }, handles); "
+    "return valid.filter((ref, i) => flags[i]); }"
+)
+
+
+def _raw_snapshot_refs(raw: str) -> list[str]:
+    """Ordered, de-duplicated list of element refs (``[ref=eN]``) in a raw snapshot."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for m in _REF_ATTR_LINE_RE.finditer(raw or ""):
+        ref = m.group(1)
+        if ref not in seen:
+            seen.add(ref)
+            out.append(ref)
+    return out
+
+
+def _parse_run_code_result(output: str) -> list:
+    """Extract the JSON value playwright-cli emits under its ``### Result`` heading.
+
+    ``run-code`` reports the function's return value as ``### Result\\n<json>\\n###  …``.
+    Returns the parsed JSON (a list of hidden refs here), or ``[]`` if absent/unparseable.
+    """
+    if not output:
+        return []
+    lines = output.splitlines()
+    try:
+        start = next(i for i, ln in enumerate(lines) if ln.strip() == "### Result")
+    except StopIteration:
+        return []
+    body: list[str] = []
+    for ln in lines[start + 1:]:
+        if ln.startswith("### "):
+            break
+        body.append(ln)
+    blob = "\n".join(body).strip()
+    if not blob:
+        return []
+    try:
+        value = json.loads(blob)
+    except (json.JSONDecodeError, ValueError):
+        return []
+    return value if isinstance(value, list) else []
+
+
+def compute_hidden_refs(cli: "PlaywrightCli", raw: str) -> set[str]:
+    """Refs in ``raw`` whose live DOM element is HIDDEN (aria-hidden / zero-size /
+    display:none / visibility:hidden / opacity≈0) — issue #223.
+
+    ONE evaluate pass per turn: extracts the refs already present in the per-turn raw
+    capture and resolves them in a single ``run-code`` invocation via the aria-ref
+    selector engine (see the module note above). Never raises — any failure (no session,
+    CLI error, malformed result) yields an empty set so the caller keeps the unfiltered
+    snapshot. ``cli`` is an injectable seam: tests pass a stand-in whose ``run`` returns a
+    canned ``### Result`` payload.
+    """
+    refs = _raw_snapshot_refs(raw)
+    if not refs:
+        return set()
+    js = _VISIBILITY_PROBE_JS.replace("__REFS_JSON__", json.dumps(refs))
+    try:
+        ok, output = cli.run("run-code", js)
+    except Exception:
+        return set()
+    if not ok:
+        return set()
+    present = set(refs)
+    return {r for r in _parse_run_code_result(output)
+            if isinstance(r, str) and r in present}
+
+
+def _indent_of(line: str) -> int:
+    return len(line) - len(line.lstrip(" "))
+
+
+class _RawLineNode:
+    """One raw-snapshot line plus its indentation-nested children (for the pure filter)."""
+    __slots__ = ("idx", "indent", "ref", "children")
+
+    def __init__(self, idx: int, indent: int, ref: str | None):
+        self.idx = idx
+        self.indent = indent
+        self.ref = ref
+        self.children: list[_RawLineNode] = []
+
+
+def _subtree_has_ref(node: _RawLineNode) -> bool:
+    """True when any DESCENDANT (not the node itself) still carries a ref."""
+    for child in node.children:
+        if child.ref is not None or _subtree_has_ref(child):
+            return True
+    return False
+
+
+def filter_hidden_snapshot_refs(raw: str, hidden_refs: "set[str]") -> str:
+    """PURE: drop the lines for ``hidden_refs`` (and their subtrees) from a raw ARIA
+    snapshot, then prune any wrapper left with NO visible (ref-bearing) descendant —
+    while keeping visible siblings. Issue #223.
+
+    Byte-identical passthrough when ``hidden_refs`` is empty/false. Pruning is SCOPED to
+    ancestors of a removed element: a wrapper is dropped only when it lost a descendant to
+    filtering AND nothing ref-bearing remains beneath it (so an orphaned label like
+    ``text: Company website`` left behind by the removed ``textbox [ref=e77]`` goes too),
+    never an untouched text/disclaimer block. Total: any parse surprise degrades to
+    returning ``raw`` unchanged (mirrors aria_yaml_to_prose's guard) — never blanks.
+    """
+    if not raw or not hidden_refs:
+        return raw
+    try:
+        hidden = set(hidden_refs)
+        lines = raw.split("\n")
+        # Build the indentation forest (parent has strictly smaller indent than child).
+        roots: list[_RawLineNode] = []
+        stack: list[_RawLineNode] = []
+        for i, line in enumerate(lines):
+            m = _REF_ATTR_LINE_RE.search(line)
+            node = _RawLineNode(i, _indent_of(line), m.group(1) if m else None)
+            while stack and stack[-1].indent >= node.indent:
+                stack.pop()
+            (stack[-1].children if stack else roots).append(node)
+            stack.append(node)
+
+        def _keep(node: _RawLineNode) -> "tuple[_RawLineNode | None, bool]":
+            # Returns (kept_node_or_None, removed_something_beneath_or_self).
+            if node.ref is not None and node.ref in hidden:
+                return None, True          # drop this ref's whole subtree
+            removed_below = False
+            kept: list[_RawLineNode] = []
+            for child in node.children:
+                kc, rb = _keep(child)
+                if kc is None:
+                    removed_below = True
+                else:
+                    kept.append(kc)
+                    removed_below = removed_below or rb
+            node.children = kept
+            if removed_below and not _subtree_has_ref(node):
+                # This wrapper lost its actionable content — prune it (and any orphan
+                # label scaffolding it now holds). Untouched blocks (removed_below False)
+                # are always kept, so pure text/disclaimer regions survive.
+                return None, True
+            return node, removed_below
+
+        kept_roots: list[_RawLineNode] = []
+        for root in roots:
+            kr, _ = _keep(root)
+            if kr is not None:
+                kept_roots.append(kr)
+
+        kept_idx: list[int] = []
+
+        def _emit(node: _RawLineNode) -> None:
+            kept_idx.append(node.idx)
+            for child in node.children:
+                _emit(child)
+
+        for root in kept_roots:
+            _emit(root)
+        kept_idx.sort()
+        return "\n".join(lines[i] for i in kept_idx)
+    except Exception:
+        return raw
+
+
+def filter_hidden_snapshot(raw: str, cli: "PlaywrightCli") -> str:
+    """Drop hidden (aria-hidden / zero-size) elements from a raw ARIA snapshot — the
+    wired entry point for the #223 pre-compaction stage. Computes the hidden set in ONE
+    DOM pass (:func:`compute_hidden_refs`) and applies the pure text filter
+    (:func:`filter_hidden_snapshot_refs`). Robust: on ANY error, or when nothing is
+    hidden, returns the UNFILTERED ``raw`` (never blanks the snapshot). Logs the
+    dropped-ref count into the run log for #37 diagnostic observability.
+    """
+    if not raw or not raw.strip():
+        return raw
+    try:
+        hidden = compute_hidden_refs(cli, raw)
+        if not hidden:
+            return raw
+        filtered = filter_hidden_snapshot_refs(raw, hidden)
+        _log.info("visibility filter (#223) dropped %d hidden ref(s): %s",
+                  len(hidden), ",".join(sorted(hidden)))
+        return filtered
+    except Exception:
+        return raw
+
+
+def make_visibility_filter(config: Config) -> Callable[[str], str]:
+    """Build the per-turn ``raw -> filtered_raw`` visibility filter bound to the run's web
+    session (issue #223). Reuses the run's shared :class:`SessionState` (same session name)
+    so the ``run-code`` aria-ref resolution targets the SAME live page / snapshot map the
+    per-turn raw capture produced — no second browser, no second snapshot."""
+    cli = PlaywrightCli(config.web_session, config.web_cli_timeout,
+                        open_flags=open_flags_for(config),
+                        state=shared_session_state(config.web_session, open_flags_for(config)))
+    return lambda raw: filter_hidden_snapshot(raw, cli)
 
 
 def normalize_ref(target: str) -> str | None:

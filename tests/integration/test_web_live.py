@@ -25,7 +25,8 @@ import unittest
 import pytest
 
 from vibeharness.web import (PlaywrightCli, WebToolset, capture_page_snapshot_raw,
-                             GotoTool, ClickTool, FillTool)
+                             GotoTool, ClickTool, FillTool,
+                             compute_hidden_refs, filter_hidden_snapshot)
 from vibeharness.config import Config
 
 BASE = "http://localhost:3000"
@@ -121,6 +122,38 @@ class WebLiveTest(unittest.TestCase):
         res = self.goto.run({})  # no url
         self.assertFalse(res.ok)
         self.assertIn("url", res.observation)
+
+    # ---- issue #223: live visibility filter drops the honeypots ----
+    def _goto_apply_form(self):
+        res = self.goto.run({"url": CAREERS + "/apply"})
+        self.assertTrue(res.ok, res.observation)
+        return self._snapshot()
+
+    def test_visibility_filter_drops_honeypots_keeps_real_fields(self):
+        # The FlashTec apply form hides "Company website" / "Home fax" honeypot inputs in
+        # an aria-hidden, 1px-clipped, off-screen wrapper. compute_hidden_refs must detect
+        # them (ONE run-code pass over the SAME capture), and the filter must remove them
+        # while keeping every visible real field. Ground-truthed live in #223.
+        raw = self._goto_apply_form()
+        # Pre-filter: the trap labels ARE present (proving the pipeline would leak them).
+        self.assertIn("Company website", raw)
+        self.assertIn("Home fax", raw)
+        hidden = compute_hidden_refs(self.cli, raw)
+        self.assertTrue(hidden, "no hidden refs detected — honeypot not found")
+        # The trap inputs' refs are flagged hidden.
+        m77 = re.search(r"Company website[\s\S]{0,60}?\[ref=(e\d+)\]", raw)
+        m79 = re.search(r"Home fax[\s\S]{0,60}?\[ref=(e\d+)\]", raw)
+        if m77:
+            self.assertIn(m77.group(1), hidden)
+        if m79:
+            self.assertIn(m79.group(1), hidden)
+        filtered = filter_hidden_snapshot(raw, self.cli)
+        self.assertNotIn("Company website", filtered)
+        self.assertNotIn("Home fax", filtered)
+        # Real visible fields survive (no over-filtering).
+        for label in ("First name", "ZIP code", "Continue"):
+            self.assertIn(label, filtered)
+        self.assertRegex(filtered, r"ref=e\d+")
 
 
 @unittest.skipUnless(shutil.which("playwright-cli") is not None,

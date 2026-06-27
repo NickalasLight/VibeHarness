@@ -44,6 +44,17 @@ def _csv_set(raw: str) -> list:
     return seen
 
 
+def _bool(raw: str) -> bool:
+    """Parse a human boolean ('true/false', '1/0', 'yes/no', 'on/off') for a bool field.
+    Raises ``ValueError`` on anything unrecognised so ``--set`` reports a clear error."""
+    val = raw.strip().lower()
+    if val in ("true", "1", "yes", "on", "y", "t"):
+        return True
+    if val in ("false", "0", "no", "off", "n", "f"):
+        return False
+    raise ValueError(f"expected a boolean (true/false), got {raw!r}")
+
+
 # Friendly CLI key -> (Config field name, value parser). Only these are settable.
 _SETTABLE: dict[str, tuple[str, object]] = {
     "temp": ("temperature", float),
@@ -65,6 +76,9 @@ _SETTABLE: dict[str, tuple[str, object]] = {
     # #162: comma-separated web tool names that opt into same-turn duplicate suppression.
     "web-dedup-same-turn-tools": ("web_dedup_same_turn_tools", _csv_set),
     "web_dedup_same_turn_tools": ("web_dedup_same_turn_tools", _csv_set),
+    # #223: toggle the pre-compaction snapshot visibility filter (on by default).
+    "web-snapshot-visibility-filter": ("web_snapshot_visibility_filter", _bool),
+    "web_snapshot_visibility_filter": ("web_snapshot_visibility_filter", _bool),
 }
 
 
@@ -77,6 +91,7 @@ def settable_keys() -> list[str]:
     return ["temp", "model", "codec", "max-steps", "max-actions-per-turn", "top-p",
             "top_k", "num-ctx", "reason-tokens", "action-tokens",
             "web-dedup-same-turn-tools",
+            "web-snapshot-visibility-filter",
             "models.<role>.<field>"]
 
 
