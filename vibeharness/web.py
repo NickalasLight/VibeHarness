@@ -141,26 +141,29 @@ _NO_MATCH_MARKERS: tuple[str, ...] = (
 )
 
 
-def annotate_filled_snapshot(snapshot: str, filled: dict[str, str]) -> str:
-    """Append filled-value markers to snapshot lines whose ref is in ``filled``.
+def annotate_filled_snapshot(snapshot: str, fill_map: "dict[str, int]") -> str:
+    """Append agent-fill markers to snapshot lines whose ref is in ``fill_map``.
 
-    Each matching line gets:  ``  [ALREADY FILLED WITH 'value' — DO NOT FILL AGAIN]``
-    appended, so the model knows which elements are already handled.
+    Each matching line gets:  ``  [already filled on turn X]``  appended (X is the turn
+    the agent successfully called fill/type/select_option/check on that ref with a
+    non-empty value). Only committed agent fills appear — prefilled/placeholder DOM
+    values are NOT in ``fill_map`` and are never annotated (issue #227). The wording is
+    factual (no "DO NOT FILL AGAIN") so the model can decide whether to act.
 
-    ``filled`` MUST be the live per-snapshot control-value map from
-    :func:`live_control_values` (issue #205) — i.e. derived from the page's ACTUAL current
-    DOM values this turn, never a cache of intended action args. A control that holds no
-    committed value is simply absent from ``filled`` and gets no marker.
+    ``fill_map`` is ``{ref: turn_index}`` maintained by :class:`~vibeharness.agent.RalphAgent`
+    and threaded through ``cli.py`` ``_snapshot_provider`` — never derived from live DOM
+    values (which would flag placeholder/default values as "filled"). The empty-value guard
+    is enforced at recording time: a fill with ``''`` never enters the map.
     """
-    if not snapshot or not filled:
+    if not snapshot or not fill_map:
         return snapshot
     lines = []
     for line in snapshot.splitlines():
         m = _REF_RE.search(line)
         if m:
             ref = f"e{m.group(1)}"
-            if ref in filled:
-                line = f"{line}  [ALREADY FILLED WITH '{filled[ref]}' — DO NOT FILL AGAIN]"
+            if ref in fill_map:
+                line = f"{line}  [already filled on turn {fill_map[ref]}]"
         lines.append(line)
     return "\n".join(lines)
 
