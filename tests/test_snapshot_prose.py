@@ -317,5 +317,74 @@ class TestInteractableLabelingFixtures(unittest.TestCase):
         self.assertIn("fill", line)
 
 
+class TestLiveRegionMessages(unittest.TestCase):
+    """#219: alert/status/log inline scalar is a MESSAGE and must be rendered inline.
+
+    Before the fix, ``- alert [ref=e89]: Enter a valid ZIP code`` rendered as a bare
+    ``[e89] alert`` — the validation message was dropped and never reached the model.
+    """
+
+    def _line_with(self, prose, needle):
+        return next(l for l in prose.splitlines() if needle in l)
+
+    def test_alert_text_rendered_inline(self):
+        raw = '```yaml\n- alert [ref=e89]: Enter a valid ZIP code\n```'
+        prose = aria_yaml_to_prose(raw)
+        line = self._line_with(prose, "e89")
+        self.assertEqual(line.strip(), '[e89] alert: "Enter a valid ZIP code"')
+
+    def test_status_text_rendered_inline(self):
+        raw = '```yaml\n- status [ref=e5]: Saved successfully\n```'
+        prose = aria_yaml_to_prose(raw)
+        self.assertIn('[e5] status: "Saved successfully"', prose)
+
+    def test_log_text_rendered_inline(self):
+        raw = '```yaml\n- log [ref=e7]: 3 new messages\n```'
+        prose = aria_yaml_to_prose(raw)
+        self.assertIn('[e7] log: "3 new messages"', prose)
+
+    def test_textless_live_region_renders_bare_role(self):
+        # An alert WITHOUT text keeps a bare role line (it has a ref so it is kept).
+        raw = '```yaml\n- alert [ref=e9]\n```'
+        prose = aria_yaml_to_prose(raw)
+        line = self._line_with(prose, "e9")
+        self.assertEqual(line.strip(), "[e9] alert")
+        self.assertNotIn(':', line)
+
+    def test_input_value_roles_unaffected(self):
+        # The 5 input-value roles must still use the "(current value: ...)" form, NOT the
+        # message-role ': "..."' form.
+        raw = (
+            '```yaml\n'
+            '- textbox "ZIP code" [ref=e69]: "75201"\n'
+            '- searchbox "Find" [ref=e2]: cats\n'
+            '- spinbutton "Qty" [ref=e3]: "4"\n'
+            '```'
+        )
+        prose = aria_yaml_to_prose(raw)
+        self.assertIn('(current value: "75201")', prose)
+        self.assertIn('(current value: "cats")', prose)
+        self.assertIn('(current value: "4")', prose)
+        # None of them should use the message-role inline form.
+        self.assertNotIn('textbox "ZIP code" [ref=e69]: "75201"', prose)
+
+    def test_message_survives_end_to_end(self):
+        # Feed a small raw YAML through the public function and assert the message string
+        # survives (it would be dropped by the pre-#219 renderer).
+        raw = (
+            '- Page URL: http://localhost:3000/apply\n'
+            '- Page Title: Apply\n\n'
+            '```yaml\n'
+            '- generic [ref=e67]:\n'
+            '  - generic [ref=e68]: ZIP code*\n'
+            '  - textbox "ZIP code" [ref=e69]: "75201"\n'
+            '  - alert [ref=e89]: Enter a valid ZIP code\n'
+            '```\n'
+        )
+        prose = aria_yaml_to_prose(raw)
+        self.assertIn("Enter a valid ZIP code", prose)
+        self.assertIn('[e89] alert: "Enter a valid ZIP code"', prose)
+
+
 if __name__ == "__main__":
     unittest.main()
