@@ -336,6 +336,14 @@ _VALUE_DISPLAY_ROLES = frozenset({
     "textbox", "searchbox", "combobox", "spinbutton", "slider",
 })
 
+# Live-region roles whose inline scalar is a MESSAGE (e.g. a form-validation error
+# ``- alert [ref=e89]: Enter a valid ZIP code``), not a control value (#219). Without
+# this, ``_render_node_line`` dropped the text and emitted a bare ``[e89] alert``, so the
+# model never saw the validation message that explains why a step failed. The message is
+# rendered INLINE on the node line (not as a child text leaf) so the ``_walk`` text-dedup
+# can never strip it.
+_MESSAGE_ROLES = frozenset({"alert", "status", "log"})
+
 
 def _role_info(role: str) -> tuple[str, str | None]:
     """(label, affordance) for a role, falling back to the raw role + no affordance."""
@@ -381,7 +389,11 @@ def _render_node_line(node: _Node, depth: int) -> str:
         line += " " + " ".join(f"[{p}]" for p in node.props)
     # Surface the live committed value of an input control (#205) so the model sees the
     # REAL current value (which may differ from / be empty vs. what was attempted).
-    if node.value and role_l in _VALUE_DISPLAY_ROLES:
+    if node.value and role_l in _MESSAGE_ROLES:
+        # live-region message (alert/status/log): surface it inline so the model can read
+        # validation errors etc. (#219). Inline => dedup-proof in _walk.
+        line += f': "{node.value}"'
+    elif node.value and role_l in _VALUE_DISPLAY_ROLES:
         line += f' (current value: "{node.value}")'
     if node.url and role_l == "link":
         line += f" -> {node.url}"
